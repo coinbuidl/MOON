@@ -11,11 +11,13 @@ pub struct MoonState {
     pub schema_version: u32,
     pub last_heartbeat_epoch_secs: u64,
     pub last_archive_trigger_epoch_secs: Option<u64>,
-    pub last_prune_trigger_epoch_secs: Option<u64>,
+    #[serde(alias = "last_prune_trigger_epoch_secs")]
+    pub last_compaction_trigger_epoch_secs: Option<u64>,
     pub last_distill_trigger_epoch_secs: Option<u64>,
     pub last_session_id: Option<String>,
     pub last_usage_ratio: Option<f64>,
     pub last_provider: Option<String>,
+    pub distilled_archives: BTreeMap<String, u64>,
     pub inbound_seen_files: BTreeMap<String, u64>,
 }
 
@@ -25,11 +27,12 @@ impl Default for MoonState {
             schema_version: 1,
             last_heartbeat_epoch_secs: 0,
             last_archive_trigger_epoch_secs: None,
-            last_prune_trigger_epoch_secs: None,
+            last_compaction_trigger_epoch_secs: None,
             last_distill_trigger_epoch_secs: None,
             last_session_id: None,
             last_usage_ratio: None,
             last_provider: None,
+            distilled_archives: BTreeMap::new(),
             inbound_seen_files: BTreeMap::new(),
         }
     }

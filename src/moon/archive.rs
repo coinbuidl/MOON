@@ -4,6 +4,7 @@ use crate::moon::snapshot::write_snapshot;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,6 +64,10 @@ fn read_ledger(path: &Path) -> Result<Vec<ArchiveRecord>> {
     Ok(out)
 }
 
+pub fn read_ledger_records(paths: &MoonPaths) -> Result<Vec<ArchiveRecord>> {
+    read_ledger(&ledger_path(paths))
+}
+
 fn append_ledger(path: &Path, record: &ArchiveRecord) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -76,6 +81,36 @@ fn append_ledger(path: &Path, record: &ArchiveRecord) -> Result<()> {
         .open(path)?;
     file.write_all(line.as_bytes())?;
     Ok(())
+}
+
+pub fn remove_ledger_records(paths: &MoonPaths, archive_paths: &BTreeSet<String>) -> Result<usize> {
+    if archive_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let ledger = ledger_path(paths);
+    if !ledger.exists() {
+        return Ok(0);
+    }
+
+    let existing = read_ledger(&ledger)?;
+    let existing_len = existing.len();
+    let kept = existing
+        .into_iter()
+        .filter(|r| !archive_paths.contains(&r.archive_path))
+        .collect::<Vec<_>>();
+    let removed = existing_len.saturating_sub(kept.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    let mut out = String::new();
+    for record in kept {
+        out.push_str(&serde_json::to_string(&record)?);
+        out.push('\n');
+    }
+    fs::write(&ledger, out).with_context(|| format!("failed to write {}", ledger.display()))?;
+    Ok(removed)
 }
 
 pub fn archive_and_index(

@@ -35,8 +35,7 @@ cargo run -- moon-recall --query "keyword" --name history
 ## Troubleshooting
 
 1. No usage data:
-- verify `openclaw` in PATH or set `OPENCLAW_BIN`
-- watcher falls back to latest session file estimator
+- verify `OPENCLAW_BIN` is set to a valid `openclaw` binary path
 2. QMD indexing/search fails:
 - set `QMD_BIN`
 - verify `qmd collection add` and `qmd search` work manually

@@ -1,11 +1,17 @@
 [thresholds]
 archive_ratio = 0.80
-prune_ratio = 0.85
-distill_ratio = 0.90
+archive_ratio_trigger_enabled = true
+compaction_ratio = 0.85
 
 [watcher]
 poll_interval_secs = 30
 cooldown_secs = 300
+
+[distill]
+mode = "idle"
+idle_secs = 21600
+max_per_cycle = 1
+archive_grace_hours = 60
 
 [inbound_watch]
 enabled = false

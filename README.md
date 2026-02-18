@@ -1,21 +1,23 @@
-# moon-system
+# 🌙 Moon System
 
-Rust CLI for managing the `oc-token-optim` OpenClaw plugin and Moon archive/recall workflows.
+A high-performance Rust CLI designed to orchestrate **OpenClaw** session contexts. It optimizes the context window by minimizing token usage while ensuring the agent retains seamless retrieval of historical knowledge.
 
-## What this repo does
+## Core Features
 
-1. OpenClaw plugin lifecycle: install, verify, repair, status, post-upgrade checks
-2. Moon memory workflows: snapshot, index, recall, distill
-3. Optional watcher: monitors inbound folders and triggers archive/index/prune/distill pipeline
+1.  **Automated Lifecycle Watcher**: Monitors OpenClaw session and context size in real-time. Upon reaching defined thresholds, it triggers archiving, indexing, and compaction to prevent prompt overflow and minimize API costs.
+2.  **Semantic Context Retrieval**: Provides the agent with a dedicated search interface to retrieve original, uncompacted context from archives whenever high-fidelity recall is required.
+3.  **Tiered Distillation Pipeline**: 
+    *   **Phase 1 (Raw Distillation)**: Automatically distills archived sessions into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
+    *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
 
 ## Recommended Agent Integration
 
-To ensure reliable long-term memory and token hygiene, it is recommended to explicitly define the boundary between the **Moon System** (automated) and the **Agent** (strategic) in your workspace rules (e.g., `AGENTS.md`):
+To ensure reliable long-term memory and optimal token hygiene, it is recommended to explicitly define the boundary between the **Moon System** (automated) and the **Agent** (strategic) within your workspace rules (e.g., `AGENTS.md`):
 
-- **Moon System (Automated Lifecycle)**: Handles token compaction, short-term session state, and daily raw context distillation (writes to `memory/YYYY-MM-DD.md`).
-- **Agent (Final Distillation)**: Responsible for the high-level review of daily logs and migrating key strategic insights into the long-term `MEMORY.md`.
+*   **Moon System (Automated Lifecycle)**: Handles technical execution—token compaction, short-term session state maintenance, and daily raw context distillation (writes to `memory/YYYY-MM-DD.md`).
+*   **Agent (Strategic Distillation)**: Responsible for high-level cognitive review—auditing daily logs and migrating key strategic insights into the long-term `MEMORY.md`.
 
-This boundary prevents the Agent from being overwhelmed by raw session data while ensuring that distilled knowledge is persisted correctly.
+This modular architecture prevents the Agent from being overwhelmed by raw session data while ensuring that distilled knowledge is persisted with high signal-to-noise ratios.
 
 ## Quick start
 

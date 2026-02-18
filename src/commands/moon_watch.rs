@@ -32,8 +32,24 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
     ));
     report.detail(format!("poll_interval_secs={}", cycle.poll_interval_secs));
     report.detail(format!("threshold.archive={}", cycle.archive_threshold));
-    report.detail(format!("threshold.prune={}", cycle.prune_threshold));
-    report.detail(format!("threshold.distill={}", cycle.distill_threshold));
+    report.detail(format!(
+        "threshold.archive_trigger_enabled={}",
+        cycle.archive_trigger_enabled
+    ));
+    report.detail(format!(
+        "threshold.compaction={}",
+        cycle.compaction_threshold
+    ));
+    report.detail(format!("distill.mode={}", cycle.distill_mode));
+    report.detail(format!("distill.idle_secs={}", cycle.distill_idle_secs));
+    report.detail(format!(
+        "distill.max_per_cycle={}",
+        cycle.distill_max_per_cycle
+    ));
+    report.detail(format!(
+        "distill.archive_grace_hours={}",
+        cycle.distill_archive_grace_hours
+    ));
     report.detail(format!("usage.session_id={}", cycle.usage.session_id));
     report.detail(format!("usage.provider={}", cycle.usage.provider));
     report.detail(format!("usage.used_tokens={}", cycle.usage.used_tokens));
@@ -76,12 +92,15 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
             archive.ledger_path.display()
         ));
     }
-    if let Some(path) = cycle.prune_config_path {
-        report.detail(format!("prune.config_path={path}"));
+    if let Some(result) = cycle.compaction_result {
+        report.detail(format!("compaction.result={result}"));
     }
     if let Some(distill) = cycle.distill {
         report.detail(format!("distill.provider={}", distill.provider));
         report.detail(format!("distill.summary_path={}", distill.summary_path));
+    }
+    if let Some(result) = cycle.archive_retention_result {
+        report.detail(format!("archive_retention.result={result}"));
     }
     if let Some(continuity) = cycle.continuity {
         report.detail(format!("continuity.map_path={}", continuity.map_path));

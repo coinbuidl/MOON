@@ -45,11 +45,14 @@ fn set_path_u64_floor(root: &mut Value, path: &[&str], floor: u64) -> bool {
 }
 
 pub fn apply_aggressive_profile(_paths: &MoonPaths, plugin_id: &str) -> Result<String> {
-    let enabled = std::env::var("MOON_ENABLE_PRUNE_WRITE")
+    let enabled = std::env::var("MOON_ENABLE_COMPACTION_WRITE")
+        .or_else(|_| std::env::var("MOON_ENABLE_PRUNE_WRITE"))
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if !enabled {
-        return Ok("skipped (set MOON_ENABLE_PRUNE_WRITE=true to enable writes)".to_string());
+        return Ok(
+            "skipped (set MOON_ENABLE_COMPACTION_WRITE=true to enable writes)".to_string(),
+        );
     }
 
     let oc_paths = resolve_paths()?;

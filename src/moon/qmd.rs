@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const ARCHIVE_COLLECTION_MASK: &str = "**/*.jsonl";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionSyncResult {
     Added,
@@ -33,6 +35,8 @@ pub fn collection_add_or_update(
         .arg(archives_dir)
         .arg("--name")
         .arg(collection_name)
+        .arg("--mask")
+        .arg(ARCHIVE_COLLECTION_MASK)
         .output()
         .with_context(|| format!("failed to run `{}`", bin.display()))?;
 
@@ -82,6 +86,24 @@ pub fn search(qmd_bin: &Path, collection_name: &str, query: &str) -> Result<Stri
 
     anyhow::bail!(
         "qmd search failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+pub fn update(qmd_bin: &Path) -> Result<()> {
+    let bin = resolve_qmd_bin(qmd_bin)?;
+    let output = Command::new(&bin)
+        .arg("update")
+        .output()
+        .with_context(|| format!("failed to run `{}`", bin.display()))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "qmd update failed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )

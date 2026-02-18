@@ -1,8 +1,12 @@
+use crate::moon::channel_archive_map;
 use crate::moon::paths::MoonPaths;
 use crate::moon::qmd;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::json;
+use std::collections::BTreeSet;
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,12 +71,73 @@ fn parse_matches(raw: &str) -> Vec<RecallMatch> {
     out
 }
 
-pub fn recall(paths: &MoonPaths, query: &str, collection_name: &str) -> Result<RecallResult> {
+fn snippet_from_archive(path: &str) -> String {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return String::new();
+    };
+
+    raw.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(280)
+        .collect()
+}
+
+pub fn recall(
+    paths: &MoonPaths,
+    query: &str,
+    collection_name: &str,
+    channel_key: Option<&str>,
+) -> Result<RecallResult> {
+    let mut matches = Vec::new();
+
+    let key_hint = channel_key.or_else(|| {
+        let trimmed = query.trim();
+        if trimmed.starts_with("agent:") {
+            Some(trimmed)
+        } else {
+            None
+        }
+    });
+
+    if let Some(key) = key_hint
+        && let Some(record) = channel_archive_map::get(paths, key)?
+    {
+        matches.push(RecallMatch {
+            archive_path: record.archive_path.clone(),
+            snippet: snippet_from_archive(&record.archive_path),
+            score: 1_000_000.0,
+            metadata: json!({
+                "deterministic": true,
+                "channelKey": record.channel_key,
+                "sourcePath": record.source_path,
+                "updatedAtEpochSecs": record.updated_at_epoch_secs,
+            }),
+        });
+    }
+
     let raw = qmd::search(&paths.qmd_bin, collection_name, query)?;
-    let matches = parse_matches(&raw);
+    matches.extend(parse_matches(&raw));
+
+    let mut deduped = Vec::with_capacity(matches.len());
+    let mut seen_paths = BTreeSet::new();
+    for item in matches {
+        if item.archive_path.trim().is_empty() {
+            deduped.push(item);
+            continue;
+        }
+        if seen_paths.insert(item.archive_path.clone()) {
+            deduped.push(item);
+        }
+    }
+
+    deduped.sort_by(|a, b| b.score.total_cmp(&a.score));
+
     Ok(RecallResult {
         query: query.to_string(),
-        matches,
+        matches: deduped,
         generated_at_epoch_secs: now_secs()?,
     })
 }

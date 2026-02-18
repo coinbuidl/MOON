@@ -8,6 +8,7 @@ use crate::moon::recall;
 pub struct MoonRecallOptions {
     pub query: String,
     pub collection_name: String,
+    pub channel_key: Option<String>,
 }
 
 pub fn run(opts: &MoonRecallOptions) -> Result<CommandReport> {
@@ -19,9 +20,17 @@ pub fn run(opts: &MoonRecallOptions) -> Result<CommandReport> {
         return Ok(report);
     }
 
-    let result = recall::recall(&paths, &opts.query, &opts.collection_name)?;
+    let result = recall::recall(
+        &paths,
+        &opts.query,
+        &opts.collection_name,
+        opts.channel_key.as_deref(),
+    )?;
     report.detail(format!("query={}", result.query));
     report.detail(format!("collection={}", opts.collection_name));
+    if let Some(key) = &opts.channel_key {
+        report.detail(format!("channel_key={key}"));
+    }
     report.detail(format!("match_count={}", result.matches.len()));
     for (idx, m) in result.matches.iter().take(5).enumerate() {
         report.detail(format!("match[{idx}].score={:.4}", m.score));

@@ -64,6 +64,7 @@ fn moon_index_registers_history_collection() {
     let log = fs::read_to_string(&log_path).expect("read log");
     assert!(log.contains("collection add"));
     assert!(log.contains("--name history"));
+    assert!(log.contains("--mask **/*.jsonl"));
 }
 
 #[test]
@@ -88,5 +89,6 @@ fn moon_index_updates_when_collection_already_exists() {
 
     let log = fs::read_to_string(&log_path).expect("read log");
     assert!(log.contains("collection add"));
+    assert!(log.contains("--mask **/*.jsonl"));
     assert!(log.contains("update"));
 }

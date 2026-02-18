@@ -1,11 +1,11 @@
 pub mod archive;
 pub mod audit;
+pub mod channel_archive_map;
 pub mod config;
 pub mod continuity;
 pub mod distill;
 pub mod inbound_watch;
 pub mod paths;
-pub mod prune;
 pub mod qmd;
 pub mod recall;
 pub mod session_usage;

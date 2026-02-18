@@ -24,8 +24,8 @@ Failure:
 1. OpenClaw metrics unavailable.
 
 Policy:
-1. Fallback to session-file estimator.
-2. If both fail, skip threshold actions for this cycle and log issue.
+1. Fail the cycle and surface a clear error (`OPENCLAW_BIN` required and executable).
+2. Retry next cycle in daemon mode after normal poll interval.
 
 ## Archive Stage
 
@@ -34,7 +34,7 @@ Failure:
 2. Archive write failure.
 
 Policy:
-1. Hard stop downstream prune/distill for this cycle.
+1. Hard stop downstream compaction/distill for this cycle.
 2. Retry next cycle after cooldown.
 
 ## QMD Index Stage
@@ -48,7 +48,7 @@ Policy:
 2. Allow retry queue in later cycles.
 3. Do not continue to destructive stages if no archive reference is available.
 
-## Prune Stage
+## Compaction Stage
 
 Failure:
 1. Plugin action fails.

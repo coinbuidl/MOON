@@ -18,7 +18,7 @@ fn verify_fails_when_openclaw_binary_missing() {
         .arg("verify")
         .assert()
         .failure()
-        .stdout(contains("openclaw binary unavailable"));
+        .stdout(contains("OPENCLAW_BIN is required"));
 }
 
 #[test]

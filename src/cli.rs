@@ -82,6 +82,8 @@ pub struct MoonRecallArgs {
     pub query: String,
     #[arg(long, default_value = "history")]
     pub name: String,
+    #[arg(long)]
+    pub channel_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -155,6 +157,7 @@ pub fn run() -> Result<()> {
             commands::moon_recall::run(&commands::moon_recall::MoonRecallOptions {
                 query: args.query.clone(),
                 collection_name: args.name.clone(),
+                channel_key: args.channel_key.clone(),
             })?
         }
         Command::MoonDistill(args) => {

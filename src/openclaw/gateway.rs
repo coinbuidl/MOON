@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn ensure_executable_path(path: &Path) -> Result<()> {
     let meta = fs::metadata(path)
@@ -16,16 +18,14 @@ fn ensure_executable_path(path: &Path) -> Result<()> {
 }
 
 fn resolve_openclaw_bin() -> Result<String> {
-    if let Ok(custom) = env::var("OPENCLAW_BIN") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            ensure_executable_path(Path::new(trimmed))?;
-            return Ok(trimmed.to_string());
-        }
+    let custom =
+        env::var("OPENCLAW_BIN").context("OPENCLAW_BIN is required and must point to openclaw")?;
+    let trimmed = custom.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("OPENCLAW_BIN is required and cannot be empty");
     }
-
-    let found = which::which("openclaw").context("openclaw not in PATH")?;
-    Ok(found.to_string_lossy().to_string())
+    ensure_executable_path(Path::new(trimmed))?;
+    Ok(trimmed.to_string())
 }
 
 fn run_openclaw(args: &[&str]) -> Result<Output> {
@@ -112,6 +112,71 @@ pub fn plugins_list_json() -> Result<String> {
 pub fn run_system_event(text: &str, mode: &str) -> Result<()> {
     run_openclaw_retry(&["system", "event", "--text", text, "--mode", mode], 1)?;
     Ok(())
+}
+
+pub fn run_sessions_compact(key: &str) -> Result<String> {
+    let normalized_key = key.trim();
+    if normalized_key.is_empty() {
+        anyhow::bail!("chat.send /compact requires a non-empty session key");
+    }
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?
+        .as_millis();
+    let idempotency_key = format!("moon-system-compact-{}-{now_ms}", std::process::id());
+    let params = serde_json::json!({
+        "sessionKey": normalized_key,
+        "message": "/compact",
+        "deliver": false,
+        "idempotencyKey": idempotency_key,
+    });
+    let params_str = serde_json::to_string(&params)?;
+
+    let out = run_openclaw_retry(
+        &[
+            "gateway",
+            "call",
+            "chat.send",
+            "--json",
+            "--params",
+            &params_str,
+        ],
+        1,
+    )?;
+
+    let parsed: Value =
+        serde_json::from_slice(&out.stdout).context("invalid JSON from chat.send")?;
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let run_id = parsed
+        .get("runId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if status == "started" && !run_id.is_empty() {
+        return Ok(format!(
+            "requested key={} mode=chat.send:/compact run_id={}",
+            normalized_key, run_id
+        ));
+    }
+
+    if let Some(ok) = parsed.get("ok").and_then(Value::as_bool) {
+        if ok {
+            return Ok(format!(
+                "requested key={} mode=chat.send:/compact status={}",
+                normalized_key, status
+            ));
+        }
+    }
+
+    anyhow::bail!(
+        "chat.send /compact returned unexpected response for key {}: {}",
+        normalized_key,
+        String::from_utf8_lossy(&out.stdout)
+    )
 }
 
 pub fn openclaw_available() -> bool {

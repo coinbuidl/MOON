@@ -7,16 +7,22 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoonThresholds {
     pub archive_ratio: f64,
-    pub prune_ratio: f64,
-    pub distill_ratio: f64,
+    #[serde(default = "default_archive_ratio_trigger_enabled")]
+    pub archive_ratio_trigger_enabled: bool,
+    #[serde(alias = "prune_ratio")]
+    pub compaction_ratio: f64,
+}
+
+fn default_archive_ratio_trigger_enabled() -> bool {
+    true
 }
 
 impl Default for MoonThresholds {
     fn default() -> Self {
         Self {
             archive_ratio: 0.80,
-            prune_ratio: 0.85,
-            distill_ratio: 0.90,
+            archive_ratio_trigger_enabled: true,
+            compaction_ratio: 0.85,
         }
     }
 }
@@ -55,11 +61,31 @@ impl Default for MoonInboundWatchConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoonDistillConfig {
+    pub mode: String,
+    pub idle_secs: u64,
+    pub max_per_cycle: u64,
+    pub archive_grace_hours: u64,
+}
+
+impl Default for MoonDistillConfig {
+    fn default() -> Self {
+        Self {
+            mode: "manual".to_string(),
+            idle_secs: 21_600,
+            max_per_cycle: 1,
+            archive_grace_hours: 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MoonConfig {
     pub thresholds: MoonThresholds,
     pub watcher: MoonWatcherConfig,
     pub inbound_watch: MoonInboundWatchConfig,
+    pub distill: MoonDistillConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -67,6 +93,7 @@ struct PartialMoonConfig {
     thresholds: Option<MoonThresholds>,
     watcher: Option<MoonWatcherConfig>,
     inbound_watch: Option<MoonInboundWatchConfig>,
+    distill: Option<MoonDistillConfig>,
 }
 
 fn env_or_f64(var: &str, fallback: f64) -> f64 {
@@ -74,6 +101,21 @@ fn env_or_f64(var: &str, fallback: f64) -> f64 {
         Ok(v) => v.trim().parse::<f64>().ok().unwrap_or(fallback),
         Err(_) => fallback,
     }
+}
+
+fn env_or_f64_first(vars: &[&str], fallback: f64) -> f64 {
+    for var in vars {
+        if let Ok(v) = env::var(var) {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = trimmed.parse::<f64>() {
+                return parsed;
+            }
+        }
+    }
+    fallback
 }
 
 fn env_or_u64(var: &str, fallback: u64) -> u64 {
@@ -125,11 +167,18 @@ fn env_or_csv_paths(var: &str, fallback: &[String]) -> Vec<String> {
 
 fn validate(cfg: &MoonConfig) -> Result<()> {
     let a = cfg.thresholds.archive_ratio;
-    let p = cfg.thresholds.prune_ratio;
-    let d = cfg.thresholds.distill_ratio;
-    if !(a > 0.0 && p > a && d > p && d <= 1.0) {
+    let c = cfg.thresholds.compaction_ratio;
+    if !(c > 0.0 && c <= 1.0) {
         return Err(anyhow!(
-            "invalid moon thresholds: require 0 < archive < prune < distill <= 1.0"
+            "invalid compaction ratio: require 0 < compaction <= 1.0"
+        ));
+    }
+    if !(a > 0.0 && a <= 1.0) {
+        return Err(anyhow!("invalid archive ratio: require 0 < archive <= 1.0"));
+    }
+    if cfg.thresholds.archive_ratio_trigger_enabled && c <= a {
+        return Err(anyhow!(
+            "invalid moon thresholds: require 0 < archive < compaction <= 1.0"
         ));
     }
     if cfg.watcher.poll_interval_secs == 0 {
@@ -139,6 +188,18 @@ fn validate(cfg: &MoonConfig) -> Result<()> {
     }
     if cfg.inbound_watch.event_mode.trim().is_empty() {
         return Err(anyhow!("invalid inbound event mode: cannot be empty"));
+    }
+    if cfg.distill.mode != "manual" && cfg.distill.mode != "idle" {
+        return Err(anyhow!("invalid distill mode: use `manual` or `idle`"));
+    }
+    if cfg.distill.max_per_cycle == 0 {
+        return Err(anyhow!("invalid distill max per cycle: must be >= 1"));
+    }
+    if cfg.distill.idle_secs == 0 {
+        return Err(anyhow!("invalid distill idle secs: must be >= 1"));
+    }
+    if cfg.distill.archive_grace_hours == 0 {
+        return Err(anyhow!("invalid distill archive grace hours: must be >= 1"));
     }
     Ok(())
 }
@@ -175,6 +236,9 @@ fn merge_file_config(base: &mut MoonConfig) -> Result<()> {
     if let Some(inbound_watch) = parsed.inbound_watch {
         base.inbound_watch = inbound_watch;
     }
+    if let Some(distill) = parsed.distill {
+        base.distill = distill;
+    }
     Ok(())
 }
 
@@ -184,10 +248,17 @@ pub fn load_config() -> Result<MoonConfig> {
 
     cfg.thresholds.archive_ratio =
         env_or_f64("MOON_THRESHOLD_ARCHIVE_RATIO", cfg.thresholds.archive_ratio);
-    cfg.thresholds.prune_ratio =
-        env_or_f64("MOON_THRESHOLD_PRUNE_RATIO", cfg.thresholds.prune_ratio);
-    cfg.thresholds.distill_ratio =
-        env_or_f64("MOON_THRESHOLD_DISTILL_RATIO", cfg.thresholds.distill_ratio);
+    cfg.thresholds.archive_ratio_trigger_enabled = env_or_bool(
+        "MOON_ENABLE_ARCHIVE_RATIO_TRIGGER",
+        cfg.thresholds.archive_ratio_trigger_enabled,
+    );
+    cfg.thresholds.compaction_ratio = env_or_f64_first(
+        &[
+            "MOON_THRESHOLD_COMPACTION_RATIO",
+            "MOON_THRESHOLD_PRUNE_RATIO",
+        ],
+        cfg.thresholds.compaction_ratio,
+    );
     cfg.watcher.poll_interval_secs =
         env_or_u64("MOON_POLL_INTERVAL_SECS", cfg.watcher.poll_interval_secs);
     cfg.watcher.cooldown_secs = env_or_u64("MOON_COOLDOWN_SECS", cfg.watcher.cooldown_secs);
@@ -199,6 +270,13 @@ pub fn load_config() -> Result<MoonConfig> {
         env_or_string("MOON_INBOUND_EVENT_MODE", &cfg.inbound_watch.event_mode);
     cfg.inbound_watch.watch_paths =
         env_or_csv_paths("MOON_INBOUND_WATCH_PATHS", &cfg.inbound_watch.watch_paths);
+    cfg.distill.mode = env_or_string("MOON_DISTILL_MODE", &cfg.distill.mode);
+    cfg.distill.idle_secs = env_or_u64("MOON_DISTILL_IDLE_SECS", cfg.distill.idle_secs);
+    cfg.distill.max_per_cycle = env_or_u64("MOON_DISTILL_MAX_PER_CYCLE", cfg.distill.max_per_cycle);
+    cfg.distill.archive_grace_hours = env_or_u64(
+        "MOON_DISTILL_ARCHIVE_GRACE_HOURS",
+        cfg.distill.archive_grace_hours,
+    );
 
     validate(&cfg)?;
     Ok(cfg)

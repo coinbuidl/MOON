@@ -1,11 +1,9 @@
 use crate::moon::paths::MoonPaths;
-use crate::moon::snapshot::latest_session_file;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,7 +23,6 @@ pub trait SessionUsageProvider {
 }
 
 pub struct OpenClawUsageProvider;
-pub struct SessionFileUsageProvider;
 
 fn epoch_now() -> Result<u64> {
     Ok(SystemTime::now()
@@ -80,26 +77,24 @@ fn find_u64(root: &Value, paths: &[&[&str]]) -> Option<u64> {
     None
 }
 
-fn session_id_from_path(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("session")
-        .to_string()
-}
-
-fn estimate_tokens_from_text(raw: &str) -> u64 {
-    // Keep estimator consistent with plugin's rough budget logic (chars/4 baseline).
-    ((raw.chars().count() as u64) / 4).max(1)
-}
-
 fn resolve_openclaw_bin() -> Result<PathBuf> {
-    if let Ok(custom) = env::var("OPENCLAW_BIN") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
+    let custom =
+        env::var("OPENCLAW_BIN").context("OPENCLAW_BIN is required and must point to openclaw")?;
+    let trimmed = custom.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("OPENCLAW_BIN is required and cannot be empty");
     }
-    which::which("openclaw").context("openclaw not in PATH")
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        anyhow::bail!(
+            "OPENCLAW_BIN is set but path does not exist: {}",
+            path.display()
+        );
+    }
+    if !path.is_file() {
+        anyhow::bail!("OPENCLAW_BIN is set but is not a file: {}", path.display());
+    }
+    Ok(path)
 }
 
 fn openclaw_usage_args() -> Vec<String> {
@@ -116,8 +111,38 @@ fn openclaw_usage_args() -> Vec<String> {
     vec!["sessions".into(), "current".into(), "--json".into()]
 }
 
+fn openclaw_sessions_args() -> Vec<String> {
+    vec!["sessions".into(), "--json".into()]
+}
+
 fn parse_openclaw_usage(raw: &str) -> Result<(String, u64, u64)> {
     let parsed: Value = serde_json::from_str(raw).context("invalid OpenClaw usage JSON")?;
+
+    if let Some(sessions) = parsed.get("sessions").and_then(Value::as_array) {
+        let latest = sessions
+            .iter()
+            .filter_map(|entry| {
+                let used = find_u64(entry, &[&["totalTokens"], &["inputTokens"]])?;
+                let updated = entry.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
+                Some((updated, entry, used))
+            })
+            .max_by_key(|(updated, _, _)| *updated)
+            .context("OpenClaw sessions payload missing used token fields")?;
+
+        let session_id = latest
+            .1
+            .get("key")
+            .and_then(Value::as_str)
+            .or_else(|| latest.1.get("sessionId").and_then(Value::as_str))
+            .or_else(|| latest.1.get("id").and_then(Value::as_str))
+            .unwrap_or("current")
+            .to_string();
+
+        let used = latest.2;
+        let max = find_u64(latest.1, &[&["contextTokens"], &["maxTokens"]]).unwrap_or(200_000);
+
+        return Ok((session_id, used, max));
+    }
 
     let session_id = parsed
         .get("sessionId")
@@ -152,6 +177,51 @@ fn parse_openclaw_usage(raw: &str) -> Result<(String, u64, u64)> {
     Ok((session_id, used, max))
 }
 
+fn parse_openclaw_sessions(raw: &str) -> Result<Vec<(String, u64, u64)>> {
+    let parsed: Value = serde_json::from_str(raw).context("invalid OpenClaw sessions JSON")?;
+    let sessions = parsed
+        .get("sessions")
+        .and_then(Value::as_array)
+        .context("OpenClaw sessions payload missing sessions array")?;
+
+    let mut out = Vec::with_capacity(sessions.len());
+    for entry in sessions {
+        let Some(used) = find_u64(
+            entry,
+            &[
+                &["totalTokens"],
+                &["inputTokens"],
+                &["usage", "totalTokens"],
+                &["usage", "inputTokens"],
+            ],
+        ) else {
+            continue;
+        };
+
+        let session_id = entry
+            .get("key")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("sessionId").and_then(Value::as_str))
+            .or_else(|| entry.get("id").and_then(Value::as_str))
+            .unwrap_or("current")
+            .to_string();
+
+        let max = find_u64(
+            entry,
+            &[&["contextTokens"], &["maxTokens"], &["limits", "maxTokens"]],
+        )
+        .unwrap_or(200_000);
+
+        out.push((session_id, used, max));
+    }
+
+    if out.is_empty() {
+        anyhow::bail!("OpenClaw sessions payload missing used token fields");
+    }
+
+    Ok(out)
+}
+
 impl SessionUsageProvider for OpenClawUsageProvider {
     fn name(&self) -> &'static str {
         "openclaw"
@@ -178,38 +248,49 @@ impl SessionUsageProvider for OpenClawUsageProvider {
     }
 }
 
-impl SessionUsageProvider for SessionFileUsageProvider {
-    fn name(&self) -> &'static str {
-        "session-file"
-    }
-
-    fn collect(&self, paths: &MoonPaths) -> Result<SessionUsageSnapshot> {
-        let Some(source) = latest_session_file(&paths.openclaw_sessions_dir)? else {
-            anyhow::bail!("no source session file found in openclaw sessions dir");
-        };
-
-        let raw = fs::read_to_string(&source)
-            .with_context(|| format!("failed to read {}", source.display()))?;
-        let estimated = estimate_tokens_from_text(&raw);
-        let session_id = session_id_from_path(&source);
-
-        to_snapshot(session_id, estimated, 200_000, self.name())
-    }
-}
-
 pub fn collect_usage(paths: &MoonPaths) -> Result<SessionUsageSnapshot> {
     let primary = OpenClawUsageProvider;
-    if let Ok(snapshot) = primary.collect(paths) {
-        return Ok(snapshot);
+    primary.collect(paths)
+}
+
+pub fn collect_openclaw_usages() -> Result<Vec<SessionUsageSnapshot>> {
+    let bin = resolve_openclaw_bin()?;
+    let args = openclaw_sessions_args();
+    let output = Command::new(&bin)
+        .args(&args)
+        .output()
+        .with_context(|| format!("failed to run `{}`", bin.display()))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "OpenClaw sessions command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
-    let fallback = SessionFileUsageProvider;
-    fallback.collect(paths)
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let snapshots = parse_openclaw_sessions(&raw)?;
+    let captured_at_epoch_secs = epoch_now()?;
+
+    Ok(snapshots
+        .into_iter()
+        .map(|(session_id, used_tokens, max_tokens)| {
+            let max = if max_tokens == 0 { 1 } else { max_tokens };
+            SessionUsageSnapshot {
+                session_id,
+                used_tokens,
+                max_tokens: max,
+                usage_ratio: usage_ratio(used_tokens, max),
+                captured_at_epoch_secs,
+                provider: "openclaw".to_string(),
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_openclaw_usage;
+    use super::{parse_openclaw_sessions, parse_openclaw_usage};
 
     #[test]
     fn parse_openclaw_usage_accepts_nested_payload() {
@@ -218,5 +299,70 @@ mod tests {
         assert_eq!(parsed.0, "abc");
         assert_eq!(parsed.1, 4200);
         assert_eq!(parsed.2, 10000);
+    }
+
+    #[test]
+    fn parse_openclaw_usage_accepts_sessions_payload() {
+        let raw = r#"{
+            "path":"x",
+            "sessions":[
+                {"key":"older","updatedAt":1000,"totalTokens":1200,"contextTokens":32000},
+                {"key":"newer","updatedAt":2000,"totalTokens":86000,"contextTokens":64000}
+            ]
+        }"#;
+        let parsed = parse_openclaw_usage(raw).expect("parse should succeed");
+        assert_eq!(parsed.0, "newer");
+        assert_eq!(parsed.1, 86000);
+        assert_eq!(parsed.2, 64000);
+    }
+
+    #[test]
+    fn parse_openclaw_sessions_returns_all_entries() {
+        let raw = r#"{
+            "path":"x",
+            "sessions":[
+                {"key":"agent:main:discord:channel:1","updatedAt":1000,"totalTokens":1200,"contextTokens":32000},
+                {"key":"agent:main:whatsapp:+614","updatedAt":2000,"totalTokens":86000,"contextTokens":64000}
+            ]
+        }"#;
+        let parsed = parse_openclaw_sessions(raw).expect("parse should succeed");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "agent:main:discord:channel:1");
+        assert_eq!(parsed[0].1, 1200);
+        assert_eq!(parsed[0].2, 32000);
+        assert_eq!(parsed[1].0, "agent:main:whatsapp:+614");
+        assert_eq!(parsed[1].1, 86000);
+        assert_eq!(parsed[1].2, 64000);
+    }
+
+    #[test]
+    fn parse_openclaw_usage_skips_sessions_without_token_fields() {
+        let raw = r#"{
+            "path":"x",
+            "sessions":[
+                {"key":"missing","updatedAt":2000},
+                {"key":"good","updatedAt":1000,"totalTokens":86000,"contextTokens":64000}
+            ]
+        }"#;
+        let parsed = parse_openclaw_usage(raw).expect("parse should succeed");
+        assert_eq!(parsed.0, "good");
+        assert_eq!(parsed.1, 86000);
+        assert_eq!(parsed.2, 64000);
+    }
+
+    #[test]
+    fn parse_openclaw_sessions_skips_entries_without_token_fields() {
+        let raw = r#"{
+            "path":"x",
+            "sessions":[
+                {"key":"missing"},
+                {"key":"good","totalTokens":2000,"contextTokens":32000}
+            ]
+        }"#;
+        let parsed = parse_openclaw_sessions(raw).expect("parse should succeed");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "good");
+        assert_eq!(parsed[0].1, 2000);
+        assert_eq!(parsed[0].2, 32000);
     }
 }

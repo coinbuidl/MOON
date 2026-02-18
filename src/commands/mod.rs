@@ -51,7 +51,7 @@ pub fn ensure_openclaw_available(report: &mut CommandReport) -> bool {
         return true;
     }
 
-    report.issue("openclaw binary unavailable in PATH/OPENCLAW_BIN");
+    report.issue("OPENCLAW_BIN is required and must point to a valid openclaw binary");
     false
 }
 
