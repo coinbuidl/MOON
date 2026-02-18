@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 use crate::commands;
 
@@ -21,6 +22,12 @@ pub enum Command {
     Repair(RepairArgs),
     PostUpgrade,
     Status,
+    MoonStatus,
+    MoonSnapshot(MoonSnapshotArgs),
+    MoonIndex(MoonIndexArgs),
+    MoonWatch(MoonWatchArgs),
+    MoonRecall(MoonRecallArgs),
+    MoonDistill(MoonDistillArgs),
 }
 
 #[derive(Debug, Args)]
@@ -43,6 +50,46 @@ pub struct VerifyArgs {
 pub struct RepairArgs {
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct MoonSnapshotArgs {
+    #[arg(long)]
+    pub source: Option<PathBuf>,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MoonIndexArgs {
+    #[arg(long, default_value = "history")]
+    pub name: String,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct MoonWatchArgs {
+    #[arg(long)]
+    pub once: bool,
+    #[arg(long)]
+    pub daemon: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct MoonRecallArgs {
+    #[arg(long)]
+    pub query: String,
+    #[arg(long, default_value = "history")]
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct MoonDistillArgs {
+    #[arg(long)]
+    pub archive: String,
+    #[arg(long)]
+    pub session_id: Option<String>,
 }
 
 fn print_report(report: &commands::CommandReport, as_json: bool) -> Result<()> {
@@ -85,6 +132,37 @@ pub fn run() -> Result<()> {
         }
         Command::PostUpgrade => commands::post_upgrade::run()?,
         Command::Status => commands::status::run()?,
+        Command::MoonStatus => commands::moon_status::run()?,
+        Command::MoonSnapshot(args) => {
+            commands::moon_snapshot::run(&commands::moon_snapshot::MoonSnapshotOptions {
+                source: args.source.clone(),
+                dry_run: args.dry_run,
+            })?
+        }
+        Command::MoonIndex(args) => {
+            commands::moon_index::run(&commands::moon_index::MoonIndexOptions {
+                collection_name: args.name.clone(),
+                dry_run: args.dry_run,
+            })?
+        }
+        Command::MoonWatch(args) => {
+            commands::moon_watch::run(&commands::moon_watch::MoonWatchOptions {
+                once: args.once,
+                daemon: args.daemon,
+            })?
+        }
+        Command::MoonRecall(args) => {
+            commands::moon_recall::run(&commands::moon_recall::MoonRecallOptions {
+                query: args.query.clone(),
+                collection_name: args.name.clone(),
+            })?
+        }
+        Command::MoonDistill(args) => {
+            commands::moon_distill::run(&commands::moon_distill::MoonDistillOptions {
+                archive_path: args.archive.clone(),
+                session_id: args.session_id.clone(),
+            })?
+        }
     };
 
     print_report(&report, cli.json)?;

@@ -1,4 +1,3 @@
-use assert_cmd::Command;
 use predicates::str::contains;
 use std::fs;
 use tempfile::tempdir;
@@ -11,8 +10,7 @@ fn verify_fails_when_openclaw_binary_missing() {
     let config_path = state_dir.join("openclaw.json");
     fs::write(&config_path, "{}\n").expect("write config");
 
-    Command::cargo_bin("oc-token-optim")
-        .expect("bin")
+    assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
         .current_dir(tmp.path())
         .env("OPENCLAW_STATE_DIR", &state_dir)
         .env("OPENCLAW_CONFIG_PATH", &config_path)
@@ -31,8 +29,7 @@ fn install_fails_when_config_invalid() {
     let config_path = state_dir.join("openclaw.json");
     fs::write(&config_path, "{not valid json5 :::").expect("write config");
 
-    Command::cargo_bin("oc-token-optim")
-        .expect("bin")
+    assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
         .current_dir(tmp.path())
         .env("OPENCLAW_STATE_DIR", &state_dir)
         .env("OPENCLAW_CONFIG_PATH", &config_path)

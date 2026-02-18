@@ -1,4 +1,3 @@
-use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
@@ -31,8 +30,7 @@ fn install_creates_plugin_and_stage2_config_entries() {
     let log_path = tmp.path().join("openclaw.log");
     write_fake_openclaw(&fake_openclaw, &log_path);
 
-    Command::cargo_bin("oc-token-optim")
-        .expect("bin")
+    assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
         .current_dir(tmp.path())
         .env("OPENCLAW_STATE_DIR", &state_dir)
         .env("OPENCLAW_CONFIG_PATH", &config_path)

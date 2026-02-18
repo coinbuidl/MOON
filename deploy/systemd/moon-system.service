@@ -1,0 +1,14 @@
+[Unit]
+Description=Moon System Watcher
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/Users/lilac/gh/moon-system
+ExecStart=/usr/bin/env cargo run -- moon-watch --daemon
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

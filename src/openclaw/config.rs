@@ -104,40 +104,39 @@ fn patch_channel_limits(root: &mut Value, force: bool, outcome: &mut ConfigPatch
             continue;
         };
 
-        if !provider_map.contains_key("historyLimit") || force {
-            let existing = provider_map.get("historyLimit").cloned();
-            if existing.is_none() {
-                provider_map.insert("historyLimit".to_string(), Value::from(50));
-                outcome.changed = true;
-                outcome
-                    .inserted_paths
-                    .push(format!("channels.{provider}.historyLimit"));
-            } else if force && existing != Some(Value::from(50)) {
-                provider_map.insert("historyLimit".to_string(), Value::from(50));
-                outcome.changed = true;
-                outcome
-                    .forced_paths
-                    .push(format!("channels.{provider}.historyLimit"));
-            }
-        }
-
-        if !provider_map.contains_key("dmHistoryLimit") || force {
-            let existing = provider_map.get("dmHistoryLimit").cloned();
-            if existing.is_none() {
-                provider_map.insert("dmHistoryLimit".to_string(), Value::from(30));
-                outcome.changed = true;
-                outcome
-                    .inserted_paths
-                    .push(format!("channels.{provider}.dmHistoryLimit"));
-            } else if force && existing != Some(Value::from(30)) {
-                provider_map.insert("dmHistoryLimit".to_string(), Value::from(30));
-                outcome.changed = true;
-                outcome
-                    .forced_paths
-                    .push(format!("channels.{provider}.dmHistoryLimit"));
+        for (key, default_value) in [("historyLimit", 50), ("dmHistoryLimit", 30)] {
+            if !provider_map.contains_key(key) || force {
+                let existing = provider_map.get(key).cloned();
+                if existing.is_none() {
+                    provider_map.insert(key.to_string(), Value::from(default_value));
+                    outcome.changed = true;
+                    outcome
+                        .inserted_paths
+                        .push(format!("channels.{provider}.{key}"));
+                } else if force && existing != Some(Value::from(default_value)) {
+                    provider_map.insert(key.to_string(), Value::from(default_value));
+                    outcome.changed = true;
+                    outcome
+                        .forced_paths
+                        .push(format!("channels.{provider}.{key}"));
+                }
             }
         }
     }
+}
+
+fn set_path_with_prefix(
+    root: &mut Value,
+    prefix: &[&str],
+    suffix: &[&str],
+    value: Value,
+    force: bool,
+    outcome: &mut ConfigPatchOutcome,
+) {
+    let mut path = Vec::with_capacity(prefix.len() + suffix.len());
+    path.extend_from_slice(prefix);
+    path.extend_from_slice(suffix);
+    set_path_if_absent_or_forced(root, &path, value, force, outcome);
 }
 
 fn patch_plugin_token_defaults(
@@ -146,184 +145,39 @@ fn patch_plugin_token_defaults(
     force: bool,
     outcome: &mut ConfigPatchOutcome,
 ) {
-    set_path_if_absent_or_forced(
-        root,
-        &["plugins", "entries", plugin_id, "config", "maxTokens"],
-        Value::from(12_000),
-        force,
-        outcome,
-    );
+    let prefix = ["plugins", "entries", plugin_id, "config"];
+    for (key, value) in [
+        ("maxTokens", 12_000),
+        ("maxChars", 60_000),
+        ("maxRetainedBytes", 250_000),
+    ] {
+        set_path_with_prefix(root, &prefix, &[key], Value::from(value), force, outcome);
+    }
 
-    set_path_if_absent_or_forced(
-        root,
-        &["plugins", "entries", plugin_id, "config", "maxChars"],
-        Value::from(60_000),
-        force,
-        outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "maxRetainedBytes",
-        ],
-        Value::from(250_000),
-        force,
-        outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "read",
-            "maxTokens",
-        ],
-        Value::from(6_000),
-        force,
-        outcome,
-    );
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins", "entries", plugin_id, "config", "tools", "read", "maxChars",
-        ],
-        Value::from(32_000),
-        force,
-        outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "message/readMessages",
-            "maxTokens",
-        ],
-        Value::from(5_000),
-        force,
-        outcome,
-    );
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "message/readMessages",
-            "maxChars",
-        ],
-        Value::from(28_000),
-        force,
-        outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "message/searchMessages",
-            "maxTokens",
-        ],
-        Value::from(5_000),
-        force,
-        outcome,
-    );
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "message/searchMessages",
-            "maxChars",
-        ],
-        Value::from(28_000),
-        force,
-        outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "web_fetch",
-            "maxTokens",
-        ],
-        Value::from(7_000),
-        force,
-        outcome,
-    );
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "web_fetch",
-            "maxChars",
-        ],
-        Value::from(35_000),
-        force,
-        outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "web.fetch",
-            "maxTokens",
-        ],
-        Value::from(7_000),
-        force,
-        outcome,
-    );
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "plugins",
-            "entries",
-            plugin_id,
-            "config",
-            "tools",
-            "web.fetch",
-            "maxChars",
-        ],
-        Value::from(35_000),
-        force,
-        outcome,
-    );
+    for (tool, max_tokens, max_chars) in [
+        ("read", 6_000, 32_000),
+        ("message/readMessages", 5_000, 28_000),
+        ("message/searchMessages", 5_000, 28_000),
+        ("web_fetch", 7_000, 35_000),
+        ("web.fetch", 7_000, 35_000),
+    ] {
+        set_path_with_prefix(
+            root,
+            &prefix,
+            &["tools", tool, "maxTokens"],
+            Value::from(max_tokens),
+            force,
+            outcome,
+        );
+        set_path_with_prefix(
+            root,
+            &prefix,
+            &["tools", tool, "maxChars"],
+            Value::from(max_chars),
+            force,
+            outcome,
+        );
+    }
 }
 
 pub fn apply_config_patches(
@@ -337,71 +191,36 @@ pub fn apply_config_patches(
 
     let mut outcome = ConfigPatchOutcome::default();
 
-    set_path_if_absent_or_forced(
-        root,
-        &["agents", "defaults", "compaction", "reserveTokensFloor"],
-        Value::from(24_000),
-        opts.force,
-        &mut outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &["agents", "defaults", "compaction", "maxHistoryShare"],
-        Value::from(0.6),
-        opts.force,
-        &mut outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &["agents", "defaults", "contextPruning", "mode"],
-        Value::from("cache-ttl"),
-        opts.force,
-        &mut outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "agents",
-            "defaults",
-            "contextPruning",
-            "softTrim",
-            "maxChars",
-        ],
-        Value::from(4000),
-        opts.force,
-        &mut outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "agents",
-            "defaults",
-            "contextPruning",
-            "softTrim",
-            "headChars",
-        ],
-        Value::from(1500),
-        opts.force,
-        &mut outcome,
-    );
-
-    set_path_if_absent_or_forced(
-        root,
-        &[
-            "agents",
-            "defaults",
-            "contextPruning",
-            "softTrim",
-            "tailChars",
-        ],
-        Value::from(1500),
-        opts.force,
-        &mut outcome,
-    );
+    let defaults_prefix = ["agents", "defaults"];
+    for (suffix, value) in [
+        (
+            &["compaction", "reserveTokensFloor"][..],
+            Value::from(24_000),
+        ),
+        (&["compaction", "maxHistoryShare"][..], Value::from(0.6)),
+        (&["contextPruning", "mode"][..], Value::from("cache-ttl")),
+        (
+            &["contextPruning", "softTrim", "maxChars"][..],
+            Value::from(4000),
+        ),
+        (
+            &["contextPruning", "softTrim", "headChars"][..],
+            Value::from(1500),
+        ),
+        (
+            &["contextPruning", "softTrim", "tailChars"][..],
+            Value::from(1500),
+        ),
+    ] {
+        set_path_with_prefix(
+            root,
+            &defaults_prefix,
+            suffix,
+            value,
+            opts.force,
+            &mut outcome,
+        );
+    }
 
     patch_channel_limits(root, opts.force, &mut outcome);
     patch_plugin_token_defaults(root, plugin_id, opts.force, &mut outcome);
