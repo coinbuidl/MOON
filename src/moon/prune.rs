@@ -1,5 +1,5 @@
 use crate::moon::paths::MoonPaths;
-use crate::openclaw::config::{read_config_value, write_config_atomic};
+use crate::openclaw::config::{MIN_AGENT_CONTEXT_TOKENS, read_config_value, write_config_atomic};
 use crate::openclaw::paths::resolve_paths;
 use anyhow::Result;
 use serde_json::Value;
@@ -27,6 +27,23 @@ fn set_path(root: &mut Value, path: &[&str], value: Value) {
     obj.insert(path[path.len() - 1].to_string(), value);
 }
 
+fn path_u64(root: &Value, path: &[&str]) -> Option<u64> {
+    let mut cursor = root;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    cursor.as_u64()
+}
+
+fn set_path_u64_floor(root: &mut Value, path: &[&str], floor: u64) -> bool {
+    let current = path_u64(root, path);
+    if current.is_some_and(|v| v >= floor) {
+        return false;
+    }
+    set_path(root, path, Value::from(floor));
+    true
+}
+
 pub fn apply_aggressive_profile(_paths: &MoonPaths, plugin_id: &str) -> Result<String> {
     let enabled = std::env::var("MOON_ENABLE_PRUNE_WRITE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -37,18 +54,28 @@ pub fn apply_aggressive_profile(_paths: &MoonPaths, plugin_id: &str) -> Result<S
 
     let oc_paths = resolve_paths()?;
     let mut cfg = read_config_value(&oc_paths)?;
+    let mut changed = false;
 
-    set_path(
+    let reserve_floor = path_u64(&cfg, &["agents", "defaults", "contextTokens"])
+        .unwrap_or(MIN_AGENT_CONTEXT_TOKENS)
+        .max(MIN_AGENT_CONTEXT_TOKENS);
+    changed |= set_path_u64_floor(
+        &mut cfg,
+        &["agents", "defaults", "contextTokens"],
+        reserve_floor,
+    );
+
+    changed |= set_path_u64_floor(
         &mut cfg,
         &["plugins", "entries", plugin_id, "config", "maxTokens"],
-        Value::from(8000),
+        12_000,
     );
-    set_path(
+    changed |= set_path_u64_floor(
         &mut cfg,
         &["plugins", "entries", plugin_id, "config", "maxChars"],
-        Value::from(40000),
+        60_000,
     );
-    set_path(
+    changed |= set_path_u64_floor(
         &mut cfg,
         &[
             "plugins",
@@ -57,8 +84,15 @@ pub fn apply_aggressive_profile(_paths: &MoonPaths, plugin_id: &str) -> Result<S
             "config",
             "maxRetainedBytes",
         ],
-        Value::from(100000),
+        250_000,
     );
+
+    if !changed {
+        return Ok(format!(
+            "unchanged (safety floors already satisfied): {}",
+            oc_paths.config_path.display()
+        ));
+    }
 
     write_config_atomic(&oc_paths, &cfg)
 }

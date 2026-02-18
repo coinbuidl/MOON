@@ -10,18 +10,18 @@ pub struct VerifyOptions {
 }
 
 pub fn run(opts: &VerifyOptions) -> Result<CommandReport> {
-    let mut report = status::run()?;
-    report.command = "verify".to_string();
+    let mut report = CommandReport::new("verify");
 
-    if !ensure_openclaw_available(&mut report) {
-        return Ok(report);
+    let openclaw_ready = ensure_openclaw_available(&mut report);
+    if openclaw_ready {
+        if let Err(err) = doctor::run_full_doctor() {
+            report.issue(format!("doctor failed: {err}"));
+        } else {
+            report.detail("doctor: ok".to_string());
+        }
     }
 
-    if let Err(err) = doctor::run_full_doctor() {
-        report.issue(format!("doctor failed: {err}"));
-    } else {
-        report.detail("doctor: ok".to_string());
-    }
+    report.merge(status::run()?);
 
     if opts.strict && !report.ok {
         report.issue("strict verify failed");

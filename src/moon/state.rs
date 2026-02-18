@@ -1,6 +1,7 @@
 use crate::moon::paths::MoonPaths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -15,6 +16,7 @@ pub struct MoonState {
     pub last_session_id: Option<String>,
     pub last_usage_ratio: Option<f64>,
     pub last_provider: Option<String>,
+    pub inbound_seen_files: BTreeMap<String, u64>,
 }
 
 impl Default for MoonState {
@@ -28,6 +30,7 @@ impl Default for MoonState {
             last_session_id: None,
             last_usage_ratio: None,
             last_provider: None,
+            inbound_seen_files: BTreeMap::new(),
         }
     }
 }

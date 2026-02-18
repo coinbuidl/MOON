@@ -6,6 +6,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
+pub const MIN_AGENT_CONTEXT_TOKENS: u64 = 16_000;
+
 #[derive(Debug, Clone, Default)]
 pub struct ConfigPatchOutcome {
     pub changed: bool,
@@ -89,6 +91,57 @@ fn set_path_if_absent_or_forced(
     map.insert(leaf.to_string(), value);
     outcome.changed = true;
     outcome.inserted_paths.push(path.join("."));
+}
+
+fn read_path_u64(root: &Value, path: &[&str]) -> Option<u64> {
+    let mut cursor = root;
+    for key in path {
+        cursor = cursor.get(*key)?;
+    }
+    cursor.as_u64()
+}
+
+fn set_path_u64_floor(
+    root: &mut Value,
+    path: &[&str],
+    min_value: u64,
+    outcome: &mut ConfigPatchOutcome,
+) {
+    if path.is_empty() {
+        return;
+    }
+
+    let mut cursor = root;
+    for key in &path[..path.len() - 1] {
+        if !cursor.is_object() {
+            *cursor = Value::Object(Map::new());
+        }
+        let Some(map) = as_object_mut(cursor) else {
+            return;
+        };
+        cursor = map
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+
+    if !cursor.is_object() {
+        *cursor = Value::Object(Map::new());
+    }
+    let Some(map) = as_object_mut(cursor) else {
+        return;
+    };
+
+    let leaf = path[path.len() - 1];
+    let should_update = match map.get(leaf) {
+        None => true,
+        Some(existing) => existing.as_u64().map(|v| v < min_value).unwrap_or(true),
+    };
+
+    if should_update {
+        map.insert(leaf.to_string(), Value::from(min_value));
+        outcome.changed = true;
+        outcome.forced_paths.push(path.join("."));
+    }
 }
 
 fn patch_channel_limits(root: &mut Value, force: bool, outcome: &mut ConfigPatchOutcome) {
@@ -193,11 +246,6 @@ pub fn apply_config_patches(
 
     let defaults_prefix = ["agents", "defaults"];
     for (suffix, value) in [
-        (
-            &["compaction", "reserveTokensFloor"][..],
-            Value::from(24_000),
-        ),
-        (&["compaction", "maxHistoryShare"][..], Value::from(0.6)),
         (&["contextPruning", "mode"][..], Value::from("cache-ttl")),
         (
             &["contextPruning", "softTrim", "maxChars"][..],
@@ -221,6 +269,14 @@ pub fn apply_config_patches(
             &mut outcome,
         );
     }
+
+    let context_floor = read_path_u64(root, &["agents", "defaults", "contextTokens"]).unwrap_or(0);
+    set_path_u64_floor(
+        root,
+        &["agents", "defaults", "contextTokens"],
+        context_floor.max(MIN_AGENT_CONTEXT_TOKENS),
+        &mut outcome,
+    );
 
     patch_channel_limits(root, opts.force, &mut outcome);
     patch_plugin_token_defaults(root, plugin_id, opts.force, &mut outcome);

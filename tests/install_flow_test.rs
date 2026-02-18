@@ -85,4 +85,11 @@ fn install_creates_plugin_and_stage2_config_entries() {
             .and_then(|v| v.get("maxChars"))
             .is_some()
     );
+    assert_eq!(
+        cfg.get("agents")
+            .and_then(|v| v.get("defaults"))
+            .and_then(|v| v.get("contextTokens"))
+            .and_then(Value::as_i64),
+        Some(16_000)
+    );
 }

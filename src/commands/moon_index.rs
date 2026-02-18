@@ -3,6 +3,7 @@ use anyhow::Result;
 use crate::commands::CommandReport;
 use crate::moon::paths::resolve_paths;
 use crate::moon::qmd;
+use crate::moon::qmd::CollectionSyncResult;
 
 #[derive(Debug, Clone)]
 pub struct MoonIndexOptions {
@@ -24,12 +25,20 @@ pub fn run(opts: &MoonIndexOptions) -> Result<CommandReport> {
     }
 
     if opts.dry_run {
-        report.detail("dry-run: qmd collection add planned but not executed".to_string());
+        report.detail(
+            "dry-run: qmd collection add planned (with update fallback on existing collection)"
+                .to_string(),
+        );
         return Ok(report);
     }
 
-    qmd::collection_add(&paths.qmd_bin, &paths.archives_dir, &opts.collection_name)?;
-    report.detail("qmd collection add completed".to_string());
+    match qmd::collection_add_or_update(&paths.qmd_bin, &paths.archives_dir, &opts.collection_name)?
+    {
+        CollectionSyncResult::Added => report.detail("qmd collection add completed".to_string()),
+        CollectionSyncResult::Updated => {
+            report.detail("qmd update completed (collection already existed)".to_string())
+        }
+    }
 
     Ok(report)
 }

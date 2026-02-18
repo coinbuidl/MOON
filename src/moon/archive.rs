@@ -105,7 +105,9 @@ pub fn archive_and_index(
     let archive_hash = file_hash(&write.archive_path)?;
 
     let mut indexed = true;
-    if let Err(err) = qmd::collection_add(&paths.qmd_bin, &paths.archives_dir, collection_name) {
+    if let Err(err) =
+        qmd::collection_add_or_update(&paths.qmd_bin, &paths.archives_dir, collection_name)
+    {
         indexed = false;
         eprintln!("moon archive index warning: {err}");
     }

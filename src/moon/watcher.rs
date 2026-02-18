@@ -3,6 +3,7 @@ use crate::moon::audit;
 use crate::moon::config::load_config;
 use crate::moon::continuity::{ContinuityOutcome, build_continuity};
 use crate::moon::distill::{DistillInput, DistillOutput, run_distillation};
+use crate::moon::inbound_watch::{self, InboundWatchOutcome};
 use crate::moon::paths::resolve_paths;
 use crate::moon::prune;
 use crate::moon::session_usage::{SessionUsageSnapshot, collect_usage};
@@ -23,6 +24,7 @@ pub struct WatchCycleOutcome {
     pub distill_threshold: f64,
     pub usage: SessionUsageSnapshot,
     pub triggers: Vec<String>,
+    pub inbound_watch: InboundWatchOutcome,
     pub archive: Option<ArchivePipelineOutcome>,
     pub prune_config_path: Option<String>,
     pub distill: Option<DistillOutput>,
@@ -65,6 +67,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     let paths = resolve_paths()?;
     let cfg = load_config()?;
     let mut state = load(&paths)?;
+    let inbound_watch = inbound_watch::process(&paths, &cfg, &mut state)?;
 
     let usage = collect_usage(&paths)?;
     state.last_heartbeat_epoch_secs = usage.captured_at_epoch_secs;
@@ -95,6 +98,25 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
             &format!(
                 "usage_ratio={:.4}, triggers={:?}",
                 usage.usage_ratio, trigger_names
+            ),
+        )?;
+    }
+
+    if inbound_watch.detected_files > 0 || inbound_watch.failed_events > 0 {
+        audit::append_event(
+            &paths,
+            "inbound_watch",
+            if inbound_watch.failed_events == 0 {
+                "ok"
+            } else {
+                "degraded"
+            },
+            &format!(
+                "detected={} triggered={} failed={} watched_paths={}",
+                inbound_watch.detected_files,
+                inbound_watch.triggered_events,
+                inbound_watch.failed_events,
+                inbound_watch.watched_paths.join(",")
             ),
         )?;
     }
@@ -186,6 +208,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
         distill_threshold: cfg.thresholds.distill_ratio,
         usage,
         triggers: trigger_names,
+        inbound_watch,
         archive: archive_out,
         prune_config_path,
         distill: distill_out,

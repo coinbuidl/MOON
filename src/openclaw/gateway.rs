@@ -109,6 +109,11 @@ pub fn plugins_list_json() -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+pub fn run_system_event(text: &str, mode: &str) -> Result<()> {
+    run_openclaw_retry(&["system", "event", "--text", text, "--mode", mode], 1)?;
+    Ok(())
+}
+
 pub fn openclaw_available() -> bool {
     resolve_openclaw_bin().is_ok()
 }

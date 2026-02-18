@@ -10,8 +10,6 @@ use crate::openclaw::plugin_verify;
 #[derive(Debug, Clone, Default)]
 pub struct StatusSnapshot {
     pub plugin_enabled: bool,
-    pub reserve_tokens_floor: bool,
-    pub max_history_share: bool,
     pub context_pruning_mode: bool,
     pub context_pruning_soft_trim: bool,
     pub plugin_max_tokens: bool,
@@ -40,6 +38,10 @@ fn path_value<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
     Some(cursor)
 }
 
+fn path_u64(root: &Value, path: &[&str]) -> Option<u64> {
+    path_value(root, path).and_then(Value::as_u64)
+}
+
 pub fn config_snapshot(root: &Value, plugin_id: &str) -> StatusSnapshot {
     StatusSnapshot {
         plugin_enabled: root
@@ -49,14 +51,6 @@ pub fn config_snapshot(root: &Value, plugin_id: &str) -> StatusSnapshot {
             .and_then(|v| v.get("enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        reserve_tokens_floor: path_exists(
-            root,
-            &["agents", "defaults", "compaction", "reserveTokensFloor"],
-        ),
-        max_history_share: path_exists(
-            root,
-            &["agents", "defaults", "compaction", "maxHistoryShare"],
-        ),
         context_pruning_mode: path_exists(root, &["agents", "defaults", "contextPruning", "mode"]),
         context_pruning_soft_trim: path_exists(
             root,
@@ -159,13 +153,10 @@ pub fn run() -> Result<CommandReport> {
     ) {
         report.detail(format!("plugin_config.maxRetainedBytes={v}"));
     }
+    if let Some(v) = path_value(&cfg, &["agents", "defaults", "contextTokens"]) {
+        report.detail(format!("agents.defaults.contextTokens={v}"));
+    }
 
-    if !snapshot.reserve_tokens_floor {
-        report.issue("missing agents.defaults.compaction.reserveTokensFloor");
-    }
-    if !snapshot.max_history_share {
-        report.issue("missing agents.defaults.compaction.maxHistoryShare");
-    }
     if !snapshot.context_pruning_mode {
         report.issue("missing agents.defaults.contextPruning.mode");
     }
@@ -183,6 +174,18 @@ pub fn run() -> Result<CommandReport> {
     }
     if !snapshot.plugin_read_profile_tokens {
         report.issue("missing plugins.entries.oc-token-optim.config.tools.read.maxTokens");
+    }
+    let context_tokens = path_u64(&cfg, &["agents", "defaults", "contextTokens"]);
+    if context_tokens.is_none() {
+        report.issue("missing agents.defaults.contextTokens");
+    }
+    if let Some(v) = context_tokens {
+        if v < config::MIN_AGENT_CONTEXT_TOKENS {
+            report.issue(format!(
+                "agents.defaults.contextTokens too low ({v}); minimum is {}",
+                config::MIN_AGENT_CONTEXT_TOKENS
+            ));
+        }
     }
     if !verify.present_on_disk {
         report.issue("plugin files missing on disk");

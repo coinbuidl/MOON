@@ -73,6 +73,14 @@ fn patch_respects_existing_values_unless_forced() {
             .and_then(Value::as_i64),
         Some(999)
     );
+    assert_eq!(
+        cfg_1
+            .get("agents")
+            .and_then(|v| v.get("defaults"))
+            .and_then(|v| v.get("contextTokens"))
+            .and_then(Value::as_i64),
+        Some(16_000)
+    );
 
     assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
         .current_dir(tmp.path())
@@ -93,7 +101,7 @@ fn patch_respects_existing_values_unless_forced() {
             .and_then(|v| v.get("compaction"))
             .and_then(|v| v.get("reserveTokensFloor"))
             .and_then(Value::as_i64),
-        Some(24_000)
+        Some(123)
     );
     assert_eq!(
         cfg_2
@@ -104,5 +112,13 @@ fn patch_respects_existing_values_unless_forced() {
             .and_then(|v| v.get("maxTokens"))
             .and_then(Value::as_i64),
         Some(12_000)
+    );
+    assert_eq!(
+        cfg_2
+            .get("agents")
+            .and_then(|v| v.get("defaults"))
+            .and_then(|v| v.get("contextTokens"))
+            .and_then(Value::as_i64),
+        Some(16_000)
     );
 }

@@ -6,3 +6,9 @@ distill_ratio = 0.90
 [watcher]
 poll_interval_secs = 30
 cooldown_secs = 300
+
+[inbound_watch]
+enabled = false
+recursive = true
+watch_paths = []
+event_mode = "now"

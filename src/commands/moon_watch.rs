@@ -40,6 +40,32 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
     report.detail(format!("usage.max_tokens={}", cycle.usage.max_tokens));
     report.detail(format!("usage.ratio={:.4}", cycle.usage.usage_ratio));
     report.detail(format!("triggers={}", cycle.triggers.join(",")));
+    report.detail(format!(
+        "inbound_watch.enabled={}",
+        cycle.inbound_watch.enabled
+    ));
+    report.detail(format!(
+        "inbound_watch.watched_paths={}",
+        cycle.inbound_watch.watched_paths.join(",")
+    ));
+    report.detail(format!(
+        "inbound_watch.detected_files={}",
+        cycle.inbound_watch.detected_files
+    ));
+    report.detail(format!(
+        "inbound_watch.triggered_events={}",
+        cycle.inbound_watch.triggered_events
+    ));
+    report.detail(format!(
+        "inbound_watch.failed_events={}",
+        cycle.inbound_watch.failed_events
+    ));
+    for event in &cycle.inbound_watch.events {
+        report.detail(format!(
+            "inbound_watch.event={} status={} message={}",
+            event.file_path, event.status, event.message
+        ));
+    }
 
     if let Some(archive) = cycle.archive {
         report.detail(format!("archive.path={}", archive.record.archive_path));
