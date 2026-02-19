@@ -93,6 +93,26 @@ MOON_DISTILL_MODEL=gemini-2.5-flash-lite
 GEMINI_API_KEY=...
 ```
 
+Distill safety guardrails (recommended):
+
+```bash
+# Archives larger than this threshold are chunk-distilled automatically.
+# Use `auto` to infer a safe chunk size from model context limits
+# when the provider exposes them (fallback heuristics are applied).
+# `auto` is also the runtime default if this variable is unset.
+MOON_DISTILL_CHUNK_BYTES=auto
+
+# Safety ceiling for number of chunks processed per archive run.
+MOON_DISTILL_MAX_CHUNKS=128
+
+# Optional explicit model context hint for `auto` mode.
+# MOON_DISTILL_MODEL_CONTEXT_TOKENS=250000
+
+# Background watcher alert threshold for extreme token usage (0 disables alert).
+# Default is 1,000,000 tokens.
+MOON_HIGH_TOKEN_ALERT_THRESHOLD=1000000
+```
+
 Cheapest possible mode (zero API cost, local-only distillation):
 
 ```bash
@@ -135,7 +155,9 @@ Commands:
 8. `moon-index [--name <collection>] [--dry-run]`
 9. `moon-watch [--once|--daemon]`
 10. `moon-recall --query <text> [--name <collection>]`
-11. `moon-distill --archive <path> [--session-id <id>]`
+11. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
+    - default: archives larger than `MOON_DISTILL_CHUNK_BYTES` are auto-distilled in chunks
+    - `--allow-large-archive`: force single-pass distill above the chunk threshold
 
 Exit codes:
 
@@ -188,11 +210,15 @@ Most-used variables:
 5. `MOON_DISTILL_PROVIDER`
 6. `MOON_DISTILL_MODEL`
 7. `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `AI_API_KEY` (distill only)
-8. `MOON_THRESHOLD_ARCHIVE_RATIO`
-9. `MOON_THRESHOLD_COMPACTION_RATIO`
-10. `MOON_POLL_INTERVAL_SECS`
-11. `MOON_COOLDOWN_SECS`
-12. `MOON_INBOUND_WATCH_PATHS`
+8. `MOON_DISTILL_CHUNK_BYTES` (default `auto`; use numeric bytes to force a fixed threshold)
+9. `MOON_DISTILL_MAX_CHUNKS` (default `128`)
+10. `MOON_DISTILL_MODEL_CONTEXT_TOKENS` (optional context hint used by `MOON_DISTILL_CHUNK_BYTES=auto`)
+11. `MOON_HIGH_TOKEN_ALERT_THRESHOLD` (default `1000000`; set `0` to disable)
+12. `MOON_THRESHOLD_ARCHIVE_RATIO`
+13. `MOON_THRESHOLD_COMPACTION_RATIO`
+14. `MOON_POLL_INTERVAL_SECS`
+15. `MOON_COOLDOWN_SECS`
+16. `MOON_INBOUND_WATCH_PATHS`
 
 ## Repository map
 

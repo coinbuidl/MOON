@@ -5,7 +5,10 @@ use crate::moon::audit;
 use crate::moon::channel_archive_map;
 use crate::moon::config::load_config;
 use crate::moon::continuity::{ContinuityOutcome, build_continuity};
-use crate::moon::distill::{DistillInput, DistillOutput, load_archive_excerpt, run_distillation};
+use crate::moon::distill::{
+    DistillInput, DistillOutput, archive_file_size, distill_chunk_bytes, load_archive_excerpt,
+    run_chunked_archive_distillation, run_distillation,
+};
 use crate::moon::inbound_watch::{self, InboundWatchOutcome};
 use crate::moon::paths::resolve_paths;
 use crate::moon::qmd;
@@ -20,10 +23,14 @@ use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+
+const DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD: u64 = 1_000_000;
+const MAX_HIGH_TOKEN_ALERT_SESSIONS: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct WatchCycleOutcome {
@@ -74,6 +81,22 @@ fn is_cooldown_ready(last_epoch: Option<u64>, now_epoch: u64, cooldown_secs: u64
     match last_epoch {
         None => true,
         Some(last) => now_epoch.saturating_sub(last) >= cooldown_secs,
+    }
+}
+
+fn high_token_alert_threshold() -> u64 {
+    match env::var("MOON_HIGH_TOKEN_ALERT_THRESHOLD") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD;
+            }
+            trimmed
+                .parse::<u64>()
+                .ok()
+                .unwrap_or(DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD)
+        }
+        Err(_) => DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD,
     }
 }
 
@@ -247,6 +270,47 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     state.last_session_id = Some(usage.session_id.clone());
     state.last_usage_ratio = Some(usage.usage_ratio);
     state.last_provider = Some(usage.provider.clone());
+
+    let high_token_threshold = high_token_alert_threshold();
+    if high_token_threshold > 0 {
+        let mut high_token_sessions = Vec::<SessionUsageSnapshot>::new();
+        if let Some(batch) = &usage_batch {
+            high_token_sessions = batch
+                .sessions
+                .iter()
+                .filter(|snapshot| snapshot.used_tokens >= high_token_threshold)
+                .cloned()
+                .collect::<Vec<_>>();
+        } else if usage.used_tokens >= high_token_threshold {
+            high_token_sessions.push(usage.clone());
+        }
+
+        if !high_token_sessions.is_empty() {
+            high_token_sessions.sort_by(|left, right| right.used_tokens.cmp(&left.used_tokens));
+            let preview = high_token_sessions
+                .iter()
+                .take(MAX_HIGH_TOKEN_ALERT_SESSIONS)
+                .map(|snapshot| {
+                    format!(
+                        "{}:{}:{:.4}",
+                        snapshot.session_id, snapshot.used_tokens, snapshot.usage_ratio
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            audit::append_event(
+                &paths,
+                "watcher",
+                "alert",
+                &format!(
+                    "high-token usage threshold={} sessions={} top={}",
+                    high_token_threshold,
+                    high_token_sessions.len(),
+                    preview
+                ),
+            )?;
+        }
+    }
 
     let triggers = evaluate(&cfg, &state, &usage);
     let trigger_names = triggers
@@ -519,6 +583,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
 
     let mut distill_notes = Vec::<String>::new();
     let mut distill_candidates = Vec::<crate::moon::archive::ArchiveRecord>::new();
+    let distill_chunk_trigger_bytes = distill_chunk_bytes() as u64;
 
     if cfg.distill.mode == "idle" {
         if !compaction_targets.is_empty() {
@@ -563,7 +628,11 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                                         && Path::new(&record.archive_path).exists()
                                 })
                                 .collect::<Vec<_>>();
-                            if let Some(first_pending) = pending.first() {
+
+                            if pending.is_empty() {
+                                distill_notes
+                                    .push("skipped reason=no-undistilled-archives".to_string());
+                            } else if let Some(first_pending) = pending.first() {
                                 let day_key =
                                     day_key_for_epoch(first_pending.created_at_epoch_secs);
                                 for record in pending {
@@ -578,13 +647,12 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                                     }
                                 }
                                 distill_notes.push(format!(
-                                    "selected_day={} selected={}",
+                                    "selected_day={} selected={} chunk_trigger_bytes={} oversized_archives=chunked",
                                     day_key,
-                                    distill_candidates.len()
+                                    distill_candidates.len(),
+                                    distill_chunk_trigger_bytes
                                 ));
-                            }
-
-                            if distill_candidates.is_empty() {
+                            } else {
                                 distill_notes
                                     .push("skipped reason=no-undistilled-archives".to_string());
                             }
@@ -601,9 +669,154 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     }
 
     if !distill_candidates.is_empty() {
+        if !distill_notes.is_empty() {
+            let selection_status = if distill_notes.iter().any(|note| {
+                note.contains("archive-too-large") || note.contains("archive-stat-failed")
+            }) {
+                "degraded"
+            } else {
+                "ok"
+            };
+            audit::append_event(
+                &paths,
+                "distill",
+                selection_status,
+                &format!("selection {}", distill_notes.join(" | ")),
+            )?;
+        }
+
         for record in distill_candidates {
             let archive_path = record.archive_path.clone();
-            let archive_text = load_archive_excerpt(&archive_path).unwrap_or_default();
+            let archive_size = match archive_file_size(&archive_path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    audit::append_event(
+                        &paths,
+                        "distill",
+                        "degraded",
+                        &format!(
+                            "mode=idle archive={} source={} session={} reason=archive-stat-failed error={err:#}",
+                            record.archive_path, record.source_path, record.session_id
+                        ),
+                    )?;
+                    continue;
+                }
+            };
+            if archive_size > distill_chunk_trigger_bytes {
+                let chunked_input = DistillInput {
+                    session_id: record.session_id.clone(),
+                    archive_path: archive_path.clone(),
+                    archive_text: String::new(),
+                    archive_epoch_secs: Some(record.created_at_epoch_secs),
+                };
+                match run_chunked_archive_distillation(&paths, &chunked_input) {
+                    Ok(chunked) => {
+                        let status = if chunked.truncated { "degraded" } else { "ok" };
+                        audit::append_event(
+                            &paths,
+                            "distill",
+                            status,
+                            &format!(
+                                "mode=idle-chunked archive={} source={} session={} bytes={} chunk_trigger_bytes={} chunk_count={} chunk_target_bytes={} truncated={}",
+                                record.archive_path,
+                                record.source_path,
+                                record.session_id,
+                                archive_size,
+                                distill_chunk_trigger_bytes,
+                                chunked.chunk_count,
+                                chunked.chunk_target_bytes,
+                                chunked.truncated
+                            ),
+                        )?;
+
+                        let distill = DistillOutput {
+                            provider: chunked.provider,
+                            summary: chunked.summary,
+                            summary_path: chunked.summary_path,
+                            audit_log_path: chunked.audit_log_path,
+                            created_at_epoch_secs: chunked.created_at_epoch_secs,
+                        };
+
+                        state.last_distill_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
+                        state
+                            .distilled_archives
+                            .insert(archive_path.clone(), usage.captured_at_epoch_secs);
+
+                        match build_continuity(
+                            &paths,
+                            &record.session_id,
+                            &record.archive_path,
+                            &distill.summary_path,
+                            extract_key_decisions(&distill.summary),
+                        ) {
+                            Ok(outcome) => {
+                                audit::append_event(
+                                    &paths,
+                                    "continuity",
+                                    if outcome.rollover_ok {
+                                        "ok"
+                                    } else {
+                                        "degraded"
+                                    },
+                                    &format!(
+                                        "archive={} session={} map={} target={} rollover_ok={}",
+                                        record.archive_path,
+                                        record.session_id,
+                                        outcome.map_path,
+                                        outcome.target_session_id,
+                                        outcome.rollover_ok
+                                    ),
+                                )?;
+                                continuity_out = Some(outcome);
+                            }
+                            Err(err) => {
+                                audit::append_event(
+                                    &paths,
+                                    "continuity",
+                                    "degraded",
+                                    &format!(
+                                        "archive={} session={} error={err:#}",
+                                        record.archive_path, record.session_id
+                                    ),
+                                )?;
+                            }
+                        }
+                        distill_out = Some(distill);
+                    }
+                    Err(err) => {
+                        audit::append_event(
+                            &paths,
+                            "distill",
+                            "degraded",
+                            &format!(
+                                "mode=idle-chunked archive={} source={} session={} bytes={} chunk_trigger_bytes={} error={err:#}",
+                                record.archive_path,
+                                record.source_path,
+                                record.session_id,
+                                archive_size,
+                                distill_chunk_trigger_bytes
+                            ),
+                        )?;
+                    }
+                }
+                continue;
+            }
+
+            let archive_text = match load_archive_excerpt(&archive_path) {
+                Ok(text) => text,
+                Err(err) => {
+                    audit::append_event(
+                        &paths,
+                        "distill",
+                        "degraded",
+                        &format!(
+                            "mode=idle archive={} source={} session={} reason=archive-read-failed error={err:#}",
+                            record.archive_path, record.source_path, record.session_id
+                        ),
+                    )?;
+                    continue;
+                }
+            };
 
             let input = DistillInput {
                 session_id: record.session_id.clone(),
@@ -623,8 +836,11 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                         "distill",
                         "ok",
                         &format!(
-                            "mode=idle archive={} source={} session={}",
-                            record.archive_path, record.source_path, record.session_id
+                            "mode=idle archive={} source={} session={} bytes={}",
+                            record.archive_path,
+                            record.source_path,
+                            record.session_id,
+                            archive_size
                         ),
                     )?;
 
@@ -675,8 +891,11 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                         "distill",
                         "degraded",
                         &format!(
-                            "mode=idle archive={} source={} session={} error={err:#}",
-                            record.archive_path, record.source_path, record.session_id
+                            "mode=idle archive={} source={} session={} bytes={} error={err:#}",
+                            record.archive_path,
+                            record.source_path,
+                            record.session_id,
+                            archive_size
                         ),
                     )?;
                 }

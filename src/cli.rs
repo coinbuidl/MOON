@@ -92,6 +92,8 @@ pub struct MoonDistillArgs {
     pub archive: String,
     #[arg(long)]
     pub session_id: Option<String>,
+    #[arg(long)]
+    pub allow_large_archive: bool,
 }
 
 fn print_report(report: &commands::CommandReport, as_json: bool) -> Result<()> {
@@ -164,6 +166,7 @@ pub fn run() -> Result<()> {
             commands::moon_distill::run(&commands::moon_distill::MoonDistillOptions {
                 archive_path: args.archive.clone(),
                 session_id: args.session_id.clone(),
+                allow_large_archive: args.allow_large_archive,
             })?
         }
     };

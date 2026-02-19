@@ -5,9 +5,11 @@ use chrono::{Datelike, Local, TimeZone};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
@@ -25,6 +27,18 @@ pub struct DistillOutput {
     pub summary_path: String,
     pub audit_log_path: String,
     pub created_at_epoch_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkedDistillOutput {
+    pub provider: String,
+    pub summary: String,
+    pub summary_path: String,
+    pub audit_log_path: String,
+    pub created_at_epoch_secs: u64,
+    pub chunk_count: usize,
+    pub chunk_target_bytes: usize,
+    pub truncated: bool,
 }
 
 pub trait Distiller {
@@ -86,9 +100,20 @@ const MAX_PROMPT_LINES: usize = 80;
 const MAX_MODEL_LINES: usize = 80;
 const MIN_MODEL_BULLETS: usize = 3;
 const REQUEST_TIMEOUT_SECS: u64 = 45;
+const DEFAULT_DISTILL_CHUNK_BYTES: usize = 512 * 1024;
+const DEFAULT_DISTILL_MAX_CHUNKS: usize = 128;
+const DEFAULT_AUTO_CONTEXT_TOKENS: u64 = 250_000;
+const MIN_DISTILL_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_AUTO_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const AUTO_CHUNK_BYTES_PER_TOKEN: f64 = 3.0;
+const AUTO_CHUNK_SAFETY_RATIO: f64 = 0.60;
+const MAX_ROLLUP_LINES_PER_SECTION: usize = 30;
+const MAX_ROLLUP_TOTAL_LINES: usize = 120;
 const MAX_ARCHIVE_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARCHIVE_SCAN_LINES: usize = 50_000;
 const MAX_ARCHIVE_CANDIDATES: usize = 400;
+
+static AUTO_CHUNK_BYTES_CACHE: OnceLock<usize> = OnceLock::new();
 
 fn env_non_empty(var: &str) -> Option<String> {
     match env::var(var) {
@@ -246,6 +271,197 @@ fn now_secs() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before UNIX_EPOCH")?
         .as_secs())
+}
+
+fn token_limit_to_chunk_bytes(tokens: u64) -> usize {
+    let estimated = (tokens as f64) * AUTO_CHUNK_BYTES_PER_TOKEN * AUTO_CHUNK_SAFETY_RATIO;
+    (estimated as usize).clamp(MIN_DISTILL_CHUNK_BYTES, MAX_AUTO_CHUNK_BYTES)
+}
+
+fn parse_env_u64(var: &str) -> Option<u64> {
+    env_non_empty(var).and_then(|raw| raw.trim().parse::<u64>().ok())
+}
+
+fn find_u64_paths(root: &Value, paths: &[&[&str]]) -> Option<u64> {
+    for path in paths {
+        let mut cursor = root;
+        let mut found = true;
+        for part in *path {
+            let Some(next) = cursor.get(*part) else {
+                found = false;
+                break;
+            };
+            cursor = next;
+        }
+        if found && let Some(value) = cursor.as_u64() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn detect_gemini_input_token_limit(api_key: &str, model: &str) -> Option<u64> {
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}?key={}",
+        model, api_key
+    );
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .ok()?;
+    let response = client.get(&url).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json: Value = response.json().ok()?;
+    json.get("inputTokenLimit").and_then(Value::as_u64)
+}
+
+fn detect_openai_compatible_input_token_limit(
+    api_key: &str,
+    base_url: Option<&str>,
+    model: &str,
+) -> Option<u64> {
+    let base = base_url
+        .map(str::to_string)
+        .or_else(|| resolve_compatible_base_url(model))
+        .unwrap_or_else(|| "https://api.openai.com".to_string());
+    let url = format!("{}/v1/models", base.trim_end_matches('/'));
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()
+        .ok()?;
+    let response = client.get(&url).bearer_auth(api_key).send().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json: Value = response.json().ok()?;
+    let data = json.get("data").and_then(Value::as_array)?;
+    let entry = data
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(model))?;
+
+    find_u64_paths(
+        entry,
+        &[
+            &["context_window"],
+            &["max_context_length"],
+            &["max_input_tokens"],
+            &["input_token_limit"],
+            &["inputTokenLimit"],
+            &["context_length"],
+            &["n_ctx"],
+            &["capabilities", "context_window"],
+            &["capabilities", "max_context_length"],
+            &["capabilities", "max_input_tokens"],
+            &["capabilities", "input_token_limit"],
+        ],
+    )
+}
+
+fn infer_context_tokens_from_model(provider: RemoteProvider, model: &str) -> u64 {
+    let lower = model.to_ascii_lowercase();
+    match provider {
+        RemoteProvider::Gemini => {
+            if lower.starts_with("gemini-2.5") {
+                1_000_000
+            } else {
+                250_000
+            }
+        }
+        RemoteProvider::OpenAi => {
+            if lower.starts_with("gpt-4.1") {
+                1_000_000
+            } else if lower.starts_with("gpt-4o") {
+                128_000
+            } else {
+                200_000
+            }
+        }
+        RemoteProvider::Anthropic => 200_000,
+        RemoteProvider::OpenAiCompatible => {
+            if lower.starts_with("deepseek-") {
+                128_000
+            } else {
+                200_000
+            }
+        }
+    }
+}
+
+fn detect_context_tokens_from_remote(remote: &RemoteModelConfig) -> Option<u64> {
+    match remote.provider {
+        RemoteProvider::Gemini => detect_gemini_input_token_limit(&remote.api_key, &remote.model),
+        RemoteProvider::OpenAiCompatible => detect_openai_compatible_input_token_limit(
+            &remote.api_key,
+            remote.base_url.as_deref(),
+            &remote.model,
+        ),
+        RemoteProvider::OpenAi | RemoteProvider::Anthropic => None,
+    }
+}
+
+fn detect_auto_chunk_bytes() -> usize {
+    if let Some(tokens) = parse_env_u64("MOON_DISTILL_MODEL_CONTEXT_TOKENS") {
+        return token_limit_to_chunk_bytes(tokens);
+    }
+
+    if let Some(remote) = resolve_remote_config() {
+        if let Some(tokens) = detect_context_tokens_from_remote(&remote) {
+            return token_limit_to_chunk_bytes(tokens);
+        }
+        return token_limit_to_chunk_bytes(infer_context_tokens_from_model(
+            remote.provider,
+            &remote.model,
+        ));
+    }
+
+    token_limit_to_chunk_bytes(DEFAULT_AUTO_CONTEXT_TOKENS)
+}
+
+pub fn distill_chunk_bytes() -> usize {
+    let auto = || *AUTO_CHUNK_BYTES_CACHE.get_or_init(detect_auto_chunk_bytes);
+    match env::var("MOON_DISTILL_CHUNK_BYTES") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return auto();
+            }
+            if trimmed.eq_ignore_ascii_case("auto") {
+                return auto();
+            }
+            trimmed
+                .parse::<usize>()
+                .ok()
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_DISTILL_CHUNK_BYTES)
+                .max(MIN_DISTILL_CHUNK_BYTES)
+        }
+        Err(_) => auto(),
+    }
+}
+
+fn distill_max_chunks() -> usize {
+    match env::var("MOON_DISTILL_MAX_CHUNKS") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return DEFAULT_DISTILL_MAX_CHUNKS;
+            }
+            trimmed
+                .parse::<usize>()
+                .ok()
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_DISTILL_MAX_CHUNKS)
+        }
+        Err(_) => DEFAULT_DISTILL_MAX_CHUNKS,
+    }
+}
+
+pub fn archive_file_size(path: &str) -> Result<u64> {
+    Ok(fs::metadata(path)
+        .with_context(|| format!("failed to stat {path}"))?
+        .len())
 }
 
 fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
@@ -437,9 +653,19 @@ fn build_prompt_context(raw: &str) -> String {
 fn build_llm_prompt(input: &DistillInput) -> String {
     let context = build_prompt_context(&input.archive_text);
     format!(
-        "Summarize this session into concise bullets under headings for Decisions, Rules, Milestones, and Open Tasks. Return markdown only.\nSession id: {}\nArchive path: {}\n\nContext lines:\n{}",
+        "Summarize this session into concise bullets under headings for Decisions, Rules, Milestones, and Open Tasks. Return markdown only. Never output raw JSON, JSONL, code fences, XML, YAML, tool payload dumps, or verbatim logs.\nSession id: {}\nArchive path: {}\n\nContext lines:\n{}",
         input.session_id, input.archive_path, context
     )
+}
+
+fn looks_like_structured_fragment(input: &str) -> bool {
+    let trimmed = input.trim();
+    trimmed.starts_with("```")
+        || trimmed == "{"
+        || trimmed == "}"
+        || trimmed == "["
+        || trimmed == "]"
+        || (trimmed.starts_with('"') && trimmed.contains("\":"))
 }
 
 fn extract_openai_text(json: &Value) -> Option<String> {
@@ -514,7 +740,10 @@ fn sanitize_model_summary(summary: &str) -> Option<String> {
         if trimmed.is_empty() {
             continue;
         }
-        if looks_like_json_blob(trimmed) || trimmed.contains("<<<EXTERNAL_UNTRUSTED_CONTENT>>>") {
+        if looks_like_json_blob(trimmed)
+            || looks_like_structured_fragment(trimmed)
+            || trimmed.contains("<<<EXTERNAL_UNTRUSTED_CONTENT>>>")
+        {
             continue;
         }
 
@@ -735,12 +964,17 @@ fn daily_memory_path(paths: &MoonPaths, archive_epoch_secs: Option<u64>) -> Stri
         .to_string()
 }
 
-pub fn run_distillation(paths: &MoonPaths, input: &DistillInput) -> Result<DistillOutput> {
-    fs::create_dir_all(&paths.memory_dir)
-        .with_context(|| format!("failed to create {}", paths.memory_dir.display()))?;
+fn distill_summary(input: &DistillInput) -> Result<(String, String)> {
+    let mut local_summary_cache: Option<String> = None;
+    let mut local_summary = || -> Result<String> {
+        if let Some(existing) = &local_summary_cache {
+            return Ok(existing.clone());
+        }
+        let summary = LocalDistiller.distill(input)?;
+        local_summary_cache = Some(summary.clone());
+        Ok(summary)
+    };
 
-    let local = LocalDistiller;
-    let local_summary = local.distill(input)?;
     let (provider_used, generated_summary) = if let Some(remote) = resolve_remote_config() {
         let remote_result = match remote.provider {
             RemoteProvider::OpenAi => OpenAiDistiller {
@@ -772,15 +1006,22 @@ pub fn run_distillation(paths: &MoonPaths, input: &DistillInput) -> Result<Disti
         match remote_result {
             Ok(out) => match sanitize_model_summary(&out) {
                 Some(cleaned) => (remote.provider.label().to_string(), cleaned),
-                None => ("local".to_string(), local_summary.clone()),
+                None => ("local".to_string(), local_summary()?),
             },
-            Err(_) => ("local".to_string(), local_summary.clone()),
+            Err(_) => ("local".to_string(), local_summary()?),
         }
     } else {
-        ("local".to_string(), local_summary)
+        ("local".to_string(), local_summary()?)
     };
-    let summary = clamp_summary(&generated_summary);
+    Ok((provider_used, clamp_summary(&generated_summary)))
+}
 
+fn append_distilled_summary(
+    paths: &MoonPaths,
+    input: &DistillInput,
+    provider_used: String,
+    summary: String,
+) -> Result<DistillOutput> {
     let summary_path = daily_memory_path(paths, input.archive_epoch_secs);
     let mut text = String::new();
     text.push_str(&format!("\n\n### {}\n", input.session_id));
@@ -800,8 +1041,8 @@ pub fn run_distillation(paths: &MoonPaths, input: &DistillInput) -> Result<Disti
         "distill",
         "ok",
         &format!(
-            "distilled session {} into {}",
-            input.session_id, summary_path
+            "distilled session {} into {} provider={}",
+            input.session_id, summary_path, provider_used
         ),
     )?;
 
@@ -814,14 +1055,278 @@ pub fn run_distillation(paths: &MoonPaths, input: &DistillInput) -> Result<Disti
     })
 }
 
+#[derive(Default)]
+struct ChunkSummaryRollup {
+    seen: BTreeSet<String>,
+    decisions: Vec<String>,
+    rules: Vec<String>,
+    milestones: Vec<String>,
+    tasks: Vec<String>,
+    other: Vec<String>,
+}
+
+impl ChunkSummaryRollup {
+    fn total_lines(&self) -> usize {
+        self.decisions.len()
+            + self.rules.len()
+            + self.milestones.len()
+            + self.tasks.len()
+            + self.other.len()
+    }
+
+    fn push_line(&mut self, raw_line: &str) {
+        if self.total_lines() >= MAX_ROLLUP_TOTAL_LINES {
+            return;
+        }
+
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let normalized = trimmed
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim();
+        if normalized.is_empty() || normalized.starts_with('#') {
+            return;
+        }
+        if looks_like_json_blob(normalized) || looks_like_structured_fragment(normalized) {
+            return;
+        }
+
+        let Some(cleaned) = clean_candidate_text(normalized) else {
+            return;
+        };
+        let key = cleaned.to_ascii_lowercase();
+        if !self.seen.insert(key) {
+            return;
+        }
+
+        let lower = cleaned.to_ascii_lowercase();
+        let target = if lower.contains("decision") {
+            &mut self.decisions
+        } else if lower.contains("rule") {
+            &mut self.rules
+        } else if lower.contains("milestone") {
+            &mut self.milestones
+        } else if lower.contains("todo")
+            || lower.contains("open task")
+            || lower.contains("next")
+            || lower.contains("follow up")
+            || lower.contains("follow-up")
+            || lower.contains("action item")
+        {
+            &mut self.tasks
+        } else {
+            &mut self.other
+        };
+
+        if target.len() < MAX_ROLLUP_LINES_PER_SECTION {
+            target.push(cleaned);
+        }
+    }
+
+    fn ingest_summary(&mut self, summary: &str) {
+        for line in summary.lines() {
+            self.push_line(line);
+            if self.total_lines() >= MAX_ROLLUP_TOTAL_LINES {
+                break;
+            }
+        }
+    }
+
+    fn render(
+        &self,
+        session_id: &str,
+        archive_path: &str,
+        chunk_count: usize,
+        chunk_target_bytes: usize,
+        max_chunks: usize,
+        truncated: bool,
+    ) -> String {
+        fn append_section(out: &mut String, title: &str, lines: &[String]) {
+            if lines.is_empty() {
+                return;
+            }
+            out.push_str(&format!("### {title}\n"));
+            for line in lines {
+                out.push_str("- ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+
+        let mut out = String::new();
+        out.push_str("## Distilled Session Summary\n");
+        out.push_str(&format!("- session_id: {session_id}\n"));
+        out.push_str(&format!("- archive_path: {archive_path}\n"));
+        out.push_str(&format!("- chunk_count: {chunk_count}\n"));
+        out.push_str(&format!("- chunk_target_bytes: {chunk_target_bytes}\n"));
+        if truncated {
+            out.push_str(&format!(
+                "- chunking_truncated: true (max_chunks={max_chunks})\n"
+            ));
+        }
+        out.push('\n');
+
+        append_section(&mut out, "Decisions", &self.decisions);
+        append_section(&mut out, "Rules", &self.rules);
+        append_section(&mut out, "Milestones", &self.milestones);
+        append_section(&mut out, "Open Tasks", &self.tasks);
+        append_section(&mut out, "Other Signals", &self.other);
+
+        if self.total_lines() == 0 {
+            out.push_str("### Notes\n- no high-signal lines extracted from chunk summaries\n");
+        }
+
+        out
+    }
+}
+
+fn summarize_provider_mix(provider_counts: &BTreeMap<String, usize>) -> String {
+    if provider_counts.is_empty() {
+        return "local".to_string();
+    }
+    if provider_counts.len() == 1 {
+        return provider_counts.keys().next().cloned().unwrap_or_default();
+    }
+    let parts = provider_counts
+        .iter()
+        .map(|(provider, count)| format!("{provider}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("mixed({parts})")
+}
+
+fn stream_archive_chunks<F>(
+    path: &str,
+    chunk_target_bytes: usize,
+    max_chunks: usize,
+    mut on_chunk: F,
+) -> Result<(usize, bool)>
+where
+    F: FnMut(usize, String) -> Result<()>,
+{
+    let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
+    let reader = BufReader::new(file);
+
+    let mut current_chunk = String::new();
+    let mut current_bytes = 0usize;
+    let mut chunk_count = 0usize;
+    let mut truncated = false;
+
+    for line in reader.split(b'\n') {
+        let raw = line.with_context(|| format!("failed to read line from {path}"))?;
+        let line_bytes = raw.len().saturating_add(1);
+
+        if !current_chunk.is_empty()
+            && current_bytes.saturating_add(line_bytes) > chunk_target_bytes
+        {
+            chunk_count = chunk_count.saturating_add(1);
+            on_chunk(chunk_count, std::mem::take(&mut current_chunk))?;
+            current_bytes = 0;
+            if chunk_count >= max_chunks {
+                truncated = true;
+                break;
+            }
+        }
+
+        current_chunk.push_str(&String::from_utf8_lossy(&raw));
+        current_chunk.push('\n');
+        current_bytes = current_bytes.saturating_add(line_bytes);
+    }
+
+    if !truncated {
+        if current_chunk.is_empty() {
+            if chunk_count == 0 {
+                chunk_count = 1;
+                on_chunk(chunk_count, String::new())?;
+            }
+        } else {
+            chunk_count = chunk_count.saturating_add(1);
+            on_chunk(chunk_count, current_chunk)?;
+        }
+    }
+
+    Ok((chunk_count, truncated))
+}
+
+pub fn run_chunked_archive_distillation(
+    paths: &MoonPaths,
+    input: &DistillInput,
+) -> Result<ChunkedDistillOutput> {
+    fs::create_dir_all(&paths.memory_dir)
+        .with_context(|| format!("failed to create {}", paths.memory_dir.display()))?;
+
+    let chunk_target_bytes = distill_chunk_bytes();
+    let max_chunks = distill_max_chunks();
+
+    let mut rollup = ChunkSummaryRollup::default();
+    let mut provider_counts = BTreeMap::<String, usize>::new();
+
+    let (chunk_count, truncated) = stream_archive_chunks(
+        &input.archive_path,
+        chunk_target_bytes,
+        max_chunks,
+        |chunk_index, chunk_text| {
+            let chunk_input = DistillInput {
+                session_id: format!("{} [chunk {}]", input.session_id, chunk_index),
+                archive_path: format!("{}#chunk={}", input.archive_path, chunk_index),
+                archive_text: chunk_text,
+                archive_epoch_secs: input.archive_epoch_secs,
+            };
+            let (provider, summary) = distill_summary(&chunk_input)?;
+            *provider_counts.entry(provider).or_insert(0) += 1;
+            rollup.ingest_summary(&summary);
+            Ok(())
+        },
+    )?;
+
+    let provider = summarize_provider_mix(&provider_counts);
+    let summary = clamp_summary(&rollup.render(
+        &input.session_id,
+        &input.archive_path,
+        chunk_count,
+        chunk_target_bytes,
+        max_chunks,
+        truncated,
+    ));
+    let out = append_distilled_summary(paths, input, provider.clone(), summary.clone())?;
+
+    Ok(ChunkedDistillOutput {
+        provider,
+        summary,
+        summary_path: out.summary_path,
+        audit_log_path: out.audit_log_path,
+        created_at_epoch_secs: out.created_at_epoch_secs,
+        chunk_count,
+        chunk_target_bytes,
+        truncated,
+    })
+}
+
+pub fn run_distillation(paths: &MoonPaths, input: &DistillInput) -> Result<DistillOutput> {
+    fs::create_dir_all(&paths.memory_dir)
+        .with_context(|| format!("failed to create {}", paths.memory_dir.display()))?;
+
+    let (provider_used, summary) = distill_summary(input)?;
+    append_distilled_summary(paths, input, provider_used, summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DistillInput, Distiller, LocalDistiller, MAX_SUMMARY_CHARS, RemoteProvider, clamp_summary,
-        extract_anthropic_text, extract_openai_compatible_text, extract_openai_text,
-        infer_provider_from_model, parse_prefixed_model, sanitize_model_summary,
+        ChunkSummaryRollup, DistillInput, Distiller, LocalDistiller, MAX_SUMMARY_CHARS,
+        RemoteProvider, clamp_summary, extract_anthropic_text, extract_openai_compatible_text,
+        extract_openai_text, infer_provider_from_model, parse_prefixed_model,
+        sanitize_model_summary, stream_archive_chunks, summarize_provider_mix,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn local_distiller_avoids_raw_jsonl_payloads() {
@@ -942,5 +1447,57 @@ mod tests {
             extract_openai_compatible_text(&payload).as_deref(),
             Some("hello from compatible provider")
         );
+    }
+
+    #[test]
+    fn chunk_rollup_groups_keyword_sections() {
+        let mut rollup = ChunkSummaryRollup::default();
+        rollup.ingest_summary(
+            "- Decision: enable chunk distill\n- Rule: keep archive gate at 2MB\n- Milestone: watcher can process 10MB archives\n- Open task: tune chunk size by workload",
+        );
+
+        let rendered = rollup.render("session-1", "/tmp/a.jsonl", 4, 524_288, 128, false);
+        assert!(rendered.contains("### Decisions"));
+        assert!(rendered.contains("### Rules"));
+        assert!(rendered.contains("### Milestones"));
+        assert!(rendered.contains("### Open Tasks"));
+    }
+
+    #[test]
+    fn stream_archive_chunks_splits_input_by_target_size() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("moon-chunk-test-{stamp}.jsonl"));
+        fs::write(&path, "line-one\nline-two\nline-three\n").expect("write test file");
+
+        let mut chunks = Vec::new();
+        let path_str = path.to_string_lossy().to_string();
+        let (count, truncated) = stream_archive_chunks(&path_str, 10, 16, |idx, text| {
+            chunks.push((idx, text));
+            Ok(())
+        })
+        .expect("chunking should succeed");
+
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(count, 3);
+        assert!(!truncated);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[0].1.contains("line-one"));
+        assert!(chunks[1].1.contains("line-two"));
+        assert!(chunks[2].1.contains("line-three"));
+    }
+
+    #[test]
+    fn summarize_provider_mix_reports_mixed_counts() {
+        let mut counts = BTreeMap::new();
+        counts.insert("local".to_string(), 2usize);
+        counts.insert("gemini".to_string(), 3usize);
+        let label = summarize_provider_mix(&counts);
+        assert!(label.starts_with("mixed("));
+        assert!(label.contains("local:2"));
+        assert!(label.contains("gemini:3"));
     }
 }
