@@ -10,7 +10,7 @@
     <string>cargo</string>
     <string>run</string>
     <string>--manifest-path</string>
-    <string>/Users/lilac/gh/moon-system/Cargo.toml</string>
+    <string>{{MOON_SYSTEM_DIR}}/Cargo.toml</string>
     <string>--</string>
     <string>moon-watch</string>
     <string>--daemon</string>

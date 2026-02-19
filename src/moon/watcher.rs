@@ -4,17 +4,20 @@ use crate::moon::archive::{
 use crate::moon::audit;
 use crate::moon::channel_archive_map;
 use crate::moon::config::load_config;
-use crate::moon::continuity::ContinuityOutcome;
-use crate::moon::distill::{DistillInput, DistillOutput, run_distillation};
+use crate::moon::continuity::{ContinuityOutcome, build_continuity};
+use crate::moon::distill::{DistillInput, DistillOutput, load_archive_excerpt, run_distillation};
 use crate::moon::inbound_watch::{self, InboundWatchOutcome};
 use crate::moon::paths::resolve_paths;
 use crate::moon::qmd;
-use crate::moon::session_usage::{SessionUsageSnapshot, collect_openclaw_usages, collect_usage};
+use crate::moon::session_usage::{
+    SessionUsageSnapshot, collect_openclaw_usage_batch, collect_usage,
+};
 use crate::moon::snapshot::latest_session_file;
 use crate::moon::state::{load, save};
 use crate::moon::thresholds::{TriggerKind, evaluate};
 use crate::openclaw::gateway;
 use anyhow::{Context, Result};
+use chrono::{Local, TimeZone};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -185,13 +188,61 @@ fn cleanup_expired_distilled_archives(
     )))
 }
 
+fn day_key_for_epoch(epoch_secs: u64) -> String {
+    Local
+        .timestamp_opt(epoch_secs as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+fn extract_key_decisions(summary: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = trimmed
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        let lower = normalized.to_ascii_lowercase();
+        if lower.contains("decision")
+            || lower.contains("rule")
+            || lower.contains("milestone")
+            || lower.contains("next")
+        {
+            out.push(normalized.to_string());
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
 pub fn run_once() -> Result<WatchCycleOutcome> {
     let paths = resolve_paths()?;
     let cfg = load_config()?;
     let mut state = load(&paths)?;
     let inbound_watch = inbound_watch::process(&paths, &cfg, &mut state)?;
 
-    let usage = collect_usage(&paths)?;
+    let mut usage_batch_note = None;
+    let usage_batch = match collect_openclaw_usage_batch() {
+        Ok(batch) => Some(batch),
+        Err(err) => {
+            usage_batch_note = Some(format!("batch-scan failed: {err:#}"));
+            None
+        }
+    };
+    let usage = match &usage_batch {
+        Some(batch) => batch.current.clone(),
+        None => collect_usage(&paths)?,
+    };
     state.last_heartbeat_epoch_secs = usage.captured_at_epoch_secs;
     state.last_session_id = Some(usage.session_id.clone());
     state.last_usage_ratio = Some(usage.usage_ratio);
@@ -209,7 +260,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     let mut archive_out = None;
     let mut compaction_result = None;
     let mut distill_out = None;
-    let continuity_out = None;
+    let mut continuity_out = None;
     let mut archive_retention_result = None;
     let compaction_cooldown_ready = is_cooldown_ready(
         state.last_compaction_trigger_epoch_secs,
@@ -220,25 +271,25 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     let mut compaction_targets = Vec::<SessionUsageSnapshot>::new();
     let mut compaction_notes = Vec::<String>::new();
 
+    if let Some(note) = usage_batch_note {
+        compaction_notes.push(note);
+    }
+
     if usage.provider == "openclaw" {
-        match collect_openclaw_usages() {
-            Ok(snapshots) => {
-                compaction_targets = snapshots
-                    .into_iter()
-                    .filter(|s| {
-                        is_compaction_channel_session(&s.session_id)
-                            && s.usage_ratio >= cfg.thresholds.compaction_ratio
-                    })
-                    .collect();
-            }
-            Err(err) => {
-                compaction_notes.push(format!("scan failed: {err:#}"));
-                if usage.usage_ratio >= cfg.thresholds.compaction_ratio
-                    && is_compaction_channel_session(&usage.session_id)
-                {
-                    compaction_targets.push(usage.clone());
-                }
-            }
+        if let Some(batch) = &usage_batch {
+            compaction_targets = batch
+                .sessions
+                .iter()
+                .filter(|s| {
+                    is_compaction_channel_session(&s.session_id)
+                        && s.usage_ratio >= cfg.thresholds.compaction_ratio
+                })
+                .cloned()
+                .collect();
+        } else if usage.usage_ratio >= cfg.thresholds.compaction_ratio
+            && is_compaction_channel_session(&usage.session_id)
+        {
+            compaction_targets.push(usage.clone());
         }
     } else if usage.usage_ratio >= cfg.thresholds.compaction_ratio
         && is_compaction_channel_session(&usage.session_id)
@@ -502,20 +553,35 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                             ));
                         } else {
                             ledger.sort_by_key(|r| r.created_at_epoch_secs);
-                            for record in ledger {
-                                if !record.indexed {
-                                    continue;
+                            let pending = ledger
+                                .into_iter()
+                                .filter(|record| {
+                                    record.indexed
+                                        && !state
+                                            .distilled_archives
+                                            .contains_key(&record.archive_path)
+                                        && Path::new(&record.archive_path).exists()
+                                })
+                                .collect::<Vec<_>>();
+                            if let Some(first_pending) = pending.first() {
+                                let day_key =
+                                    day_key_for_epoch(first_pending.created_at_epoch_secs);
+                                for record in pending {
+                                    if day_key_for_epoch(record.created_at_epoch_secs) != day_key {
+                                        continue;
+                                    }
+                                    distill_candidates.push(record);
+                                    if distill_candidates.len()
+                                        >= cfg.distill.max_per_cycle as usize
+                                    {
+                                        break;
+                                    }
                                 }
-                                if state.distilled_archives.contains_key(&record.archive_path) {
-                                    continue;
-                                }
-                                if !Path::new(&record.archive_path).exists() {
-                                    continue;
-                                }
-                                distill_candidates.push(record);
-                                if distill_candidates.len() >= cfg.distill.max_per_cycle as usize {
-                                    break;
-                                }
+                                distill_notes.push(format!(
+                                    "selected_day={} selected={}",
+                                    day_key,
+                                    distill_candidates.len()
+                                ));
                             }
 
                             if distill_candidates.is_empty() {
@@ -537,17 +603,13 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     if !distill_candidates.is_empty() {
         for record in distill_candidates {
             let archive_path = record.archive_path.clone();
-            let archive_text = std::fs::read_to_string(&archive_path).unwrap_or_else(|_| {
-                std::fs::read(&archive_path)
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).to_string())
-                    .unwrap_or_default()
-            });
+            let archive_text = load_archive_excerpt(&archive_path).unwrap_or_default();
 
             let input = DistillInput {
                 session_id: record.session_id.clone(),
                 archive_path: archive_path.clone(),
                 archive_text,
+                archive_epoch_secs: Some(record.created_at_epoch_secs),
             };
 
             match run_distillation(&paths, &input) {
@@ -565,6 +627,46 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                             record.archive_path, record.source_path, record.session_id
                         ),
                     )?;
+
+                    match build_continuity(
+                        &paths,
+                        &record.session_id,
+                        &record.archive_path,
+                        &distill.summary_path,
+                        extract_key_decisions(&distill.summary),
+                    ) {
+                        Ok(outcome) => {
+                            audit::append_event(
+                                &paths,
+                                "continuity",
+                                if outcome.rollover_ok {
+                                    "ok"
+                                } else {
+                                    "degraded"
+                                },
+                                &format!(
+                                    "archive={} session={} map={} target={} rollover_ok={}",
+                                    record.archive_path,
+                                    record.session_id,
+                                    outcome.map_path,
+                                    outcome.target_session_id,
+                                    outcome.rollover_ok
+                                ),
+                            )?;
+                            continuity_out = Some(outcome);
+                        }
+                        Err(err) => {
+                            audit::append_event(
+                                &paths,
+                                "continuity",
+                                "degraded",
+                                &format!(
+                                    "archive={} session={} error={err:#}",
+                                    record.archive_path, record.session_id
+                                ),
+                            )?;
+                        }
+                    }
                     distill_out = Some(distill);
                 }
                 Err(err) => {
@@ -624,9 +726,41 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
 }
 
 pub fn run_daemon() -> Result<()> {
+    let mut consecutive_failures = 0u32;
     loop {
-        let cycle = run_once()?;
-        let sleep_for = Duration::from_secs(cycle.poll_interval_secs);
-        thread::sleep(sleep_for);
+        match run_once() {
+            Ok(cycle) => {
+                consecutive_failures = 0;
+                let sleep_for = Duration::from_secs(cycle.poll_interval_secs.max(1));
+                thread::sleep(sleep_for);
+            }
+            Err(err) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let base_secs = load_config()
+                    .map(|cfg| cfg.watcher.poll_interval_secs.max(1))
+                    .unwrap_or(30);
+                let exponent = consecutive_failures.saturating_sub(1).min(4);
+                let multiplier = 1u64 << exponent;
+                let retry_in_secs = base_secs.saturating_mul(multiplier).min(300);
+
+                if let Ok(paths) = resolve_paths() {
+                    let _ = audit::append_event(
+                        &paths,
+                        "watcher",
+                        "degraded",
+                        &format!(
+                            "daemon cycle failed retry_in_secs={} consecutive_failures={} error={err:#}",
+                            retry_in_secs, consecutive_failures
+                        ),
+                    );
+                }
+
+                eprintln!(
+                    "moon watcher cycle failed; retrying in {}s: {err:#}",
+                    retry_in_secs
+                );
+                thread::sleep(Duration::from_secs(retry_in_secs));
+            }
+        }
     }
 }

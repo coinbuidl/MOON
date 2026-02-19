@@ -4,8 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/Users/lilac/gh/moon-system
-ExecStart=/usr/bin/env cargo run -- moon-watch --daemon
+WorkingDirectory={{MOON_SYSTEM_DIR}}
+ExecStart=/usr/bin/env cargo run --manifest-path {{MOON_SYSTEM_DIR}}/Cargo.toml -- moon-watch --daemon
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info

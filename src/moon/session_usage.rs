@@ -24,6 +24,20 @@ pub trait SessionUsageProvider {
 
 pub struct OpenClawUsageProvider;
 
+#[derive(Debug, Clone)]
+struct ParsedSessionUsage {
+    session_id: String,
+    used_tokens: u64,
+    max_tokens: u64,
+    updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenClawUsageBatch {
+    pub current: SessionUsageSnapshot,
+    pub sessions: Vec<SessionUsageSnapshot>,
+}
+
 fn epoch_now() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -38,21 +52,37 @@ fn usage_ratio(used: u64, max: u64) -> f64 {
     (used as f64) / (max as f64)
 }
 
+fn to_snapshot_with_capture(
+    session_id: String,
+    used_tokens: u64,
+    max_tokens: u64,
+    provider: &str,
+    captured_at_epoch_secs: u64,
+) -> SessionUsageSnapshot {
+    let max = if max_tokens == 0 { 1 } else { max_tokens };
+    SessionUsageSnapshot {
+        session_id,
+        used_tokens,
+        max_tokens: max,
+        usage_ratio: usage_ratio(used_tokens, max),
+        captured_at_epoch_secs,
+        provider: provider.to_string(),
+    }
+}
+
 fn to_snapshot(
     session_id: String,
     used_tokens: u64,
     max_tokens: u64,
     provider: &str,
 ) -> Result<SessionUsageSnapshot> {
-    let max = if max_tokens == 0 { 1 } else { max_tokens };
-    Ok(SessionUsageSnapshot {
+    Ok(to_snapshot_with_capture(
         session_id,
         used_tokens,
-        max_tokens: max,
-        usage_ratio: usage_ratio(used_tokens, max),
-        captured_at_epoch_secs: epoch_now()?,
-        provider: provider.to_string(),
-    })
+        max_tokens,
+        provider,
+        epoch_now()?,
+    ))
 }
 
 fn parse_u64(v: Option<&Value>) -> Option<u64> {
@@ -116,34 +146,17 @@ fn openclaw_sessions_args() -> Vec<String> {
 }
 
 fn parse_openclaw_usage(raw: &str) -> Result<(String, u64, u64)> {
-    let parsed: Value = serde_json::from_str(raw).context("invalid OpenClaw usage JSON")?;
-
-    if let Some(sessions) = parsed.get("sessions").and_then(Value::as_array) {
-        let latest = sessions
-            .iter()
-            .filter_map(|entry| {
-                let used = find_u64(entry, &[&["totalTokens"], &["inputTokens"]])?;
-                let updated = entry.get("updatedAt").and_then(Value::as_u64).unwrap_or(0);
-                Some((updated, entry, used))
-            })
-            .max_by_key(|(updated, _, _)| *updated)
-            .context("OpenClaw sessions payload missing used token fields")?;
-
-        let session_id = latest
-            .1
-            .get("key")
-            .and_then(Value::as_str)
-            .or_else(|| latest.1.get("sessionId").and_then(Value::as_str))
-            .or_else(|| latest.1.get("id").and_then(Value::as_str))
-            .unwrap_or("current")
-            .to_string();
-
-        let used = latest.2;
-        let max = find_u64(latest.1, &[&["contextTokens"], &["maxTokens"]]).unwrap_or(200_000);
-
-        return Ok((session_id, used, max));
+    if let Ok(sessions) = parse_openclaw_sessions(raw)
+        && let Some(latest) = sessions.iter().max_by_key(|entry| entry.updated_at)
+    {
+        return Ok((
+            latest.session_id.clone(),
+            latest.used_tokens,
+            latest.max_tokens,
+        ));
     }
 
+    let parsed: Value = serde_json::from_str(raw).context("invalid OpenClaw usage JSON")?;
     let session_id = parsed
         .get("sessionId")
         .and_then(Value::as_str)
@@ -177,7 +190,7 @@ fn parse_openclaw_usage(raw: &str) -> Result<(String, u64, u64)> {
     Ok((session_id, used, max))
 }
 
-fn parse_openclaw_sessions(raw: &str) -> Result<Vec<(String, u64, u64)>> {
+fn parse_openclaw_sessions(raw: &str) -> Result<Vec<ParsedSessionUsage>> {
     let parsed: Value = serde_json::from_str(raw).context("invalid OpenClaw sessions JSON")?;
     let sessions = parsed
         .get("sessions")
@@ -212,7 +225,12 @@ fn parse_openclaw_sessions(raw: &str) -> Result<Vec<(String, u64, u64)>> {
         )
         .unwrap_or(200_000);
 
-        out.push((session_id, used, max));
+        out.push(ParsedSessionUsage {
+            session_id,
+            used_tokens: used,
+            max_tokens: max,
+            updated_at: entry.get("updatedAt").and_then(Value::as_u64).unwrap_or(0),
+        });
     }
 
     if out.is_empty() {
@@ -253,7 +271,7 @@ pub fn collect_usage(paths: &MoonPaths) -> Result<SessionUsageSnapshot> {
     primary.collect(paths)
 }
 
-pub fn collect_openclaw_usages() -> Result<Vec<SessionUsageSnapshot>> {
+pub fn collect_openclaw_usage_batch() -> Result<OpenClawUsageBatch> {
     let bin = resolve_openclaw_bin()?;
     let args = openclaw_sessions_args();
     let output = Command::new(&bin)
@@ -269,23 +287,34 @@ pub fn collect_openclaw_usages() -> Result<Vec<SessionUsageSnapshot>> {
     }
 
     let raw = String::from_utf8_lossy(&output.stdout).to_string();
-    let snapshots = parse_openclaw_sessions(&raw)?;
+    let parsed = parse_openclaw_sessions(&raw)?;
     let captured_at_epoch_secs = epoch_now()?;
-
-    Ok(snapshots
-        .into_iter()
-        .map(|(session_id, used_tokens, max_tokens)| {
-            let max = if max_tokens == 0 { 1 } else { max_tokens };
-            SessionUsageSnapshot {
-                session_id,
-                used_tokens,
-                max_tokens: max,
-                usage_ratio: usage_ratio(used_tokens, max),
+    let sessions = parsed
+        .iter()
+        .map(|entry| {
+            to_snapshot_with_capture(
+                entry.session_id.clone(),
+                entry.used_tokens,
+                entry.max_tokens,
+                "openclaw",
                 captured_at_epoch_secs,
-                provider: "openclaw".to_string(),
-            }
+            )
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    let latest = parsed
+        .iter()
+        .max_by_key(|entry| entry.updated_at)
+        .context("OpenClaw sessions payload missing latest session")?;
+    let current = to_snapshot_with_capture(
+        latest.session_id.clone(),
+        latest.used_tokens,
+        latest.max_tokens,
+        "openclaw",
+        captured_at_epoch_secs,
+    );
+
+    Ok(OpenClawUsageBatch { current, sessions })
 }
 
 #[cfg(test)]
@@ -327,12 +356,12 @@ mod tests {
         }"#;
         let parsed = parse_openclaw_sessions(raw).expect("parse should succeed");
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].0, "agent:main:discord:channel:1");
-        assert_eq!(parsed[0].1, 1200);
-        assert_eq!(parsed[0].2, 32000);
-        assert_eq!(parsed[1].0, "agent:main:whatsapp:+614");
-        assert_eq!(parsed[1].1, 86000);
-        assert_eq!(parsed[1].2, 64000);
+        assert_eq!(parsed[0].session_id, "agent:main:discord:channel:1");
+        assert_eq!(parsed[0].used_tokens, 1200);
+        assert_eq!(parsed[0].max_tokens, 32000);
+        assert_eq!(parsed[1].session_id, "agent:main:whatsapp:+614");
+        assert_eq!(parsed[1].used_tokens, 86000);
+        assert_eq!(parsed[1].max_tokens, 64000);
     }
 
     #[test]
@@ -361,8 +390,8 @@ mod tests {
         }"#;
         let parsed = parse_openclaw_sessions(raw).expect("parse should succeed");
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].0, "good");
-        assert_eq!(parsed[0].1, 2000);
-        assert_eq!(parsed[0].2, 32000);
+        assert_eq!(parsed[0].session_id, "good");
+        assert_eq!(parsed[0].used_tokens, 2000);
+        assert_eq!(parsed[0].max_tokens, 32000);
     }
 }

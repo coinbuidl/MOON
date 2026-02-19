@@ -163,13 +163,13 @@ pub fn run_sessions_compact(key: &str) -> Result<String> {
         ));
     }
 
-    if let Some(ok) = parsed.get("ok").and_then(Value::as_bool) {
-        if ok {
-            return Ok(format!(
-                "requested key={} mode=chat.send:/compact status={}",
-                normalized_key, status
-            ));
-        }
+    if let Some(ok) = parsed.get("ok").and_then(Value::as_bool)
+        && ok
+    {
+        return Ok(format!(
+            "requested key={} mode=chat.send:/compact status={}",
+            normalized_key, status
+        ));
     }
 
     anyhow::bail!(

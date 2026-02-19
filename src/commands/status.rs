@@ -179,13 +179,13 @@ pub fn run() -> Result<CommandReport> {
     if context_tokens.is_none() {
         report.issue("missing agents.defaults.contextTokens");
     }
-    if let Some(v) = context_tokens {
-        if v < config::MIN_AGENT_CONTEXT_TOKENS {
-            report.issue(format!(
-                "agents.defaults.contextTokens too low ({v}); minimum is {}",
-                config::MIN_AGENT_CONTEXT_TOKENS
-            ));
-        }
+    if let Some(v) = context_tokens
+        && v < config::MIN_AGENT_CONTEXT_TOKENS
+    {
+        report.issue(format!(
+            "agents.defaults.contextTokens too low ({v}); minimum is {}",
+            config::MIN_AGENT_CONTEXT_TOKENS
+        ));
     }
     if !verify.present_on_disk {
         report.issue("plugin files missing on disk");
