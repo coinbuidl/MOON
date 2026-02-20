@@ -50,6 +50,12 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
         "distill.archive_grace_hours={}",
         cycle.distill_archive_grace_hours
     ));
+    report.detail(format!(
+        "retention.active_days={}",
+        cycle.retention_active_days
+    ));
+    report.detail(format!("retention.warm_days={}", cycle.retention_warm_days));
+    report.detail(format!("retention.cold_days={}", cycle.retention_cold_days));
     report.detail(format!("usage.session_id={}", cycle.usage.session_id));
     report.detail(format!("usage.provider={}", cycle.usage.provider));
     report.detail(format!("usage.used_tokens={}", cycle.usage.used_tokens));

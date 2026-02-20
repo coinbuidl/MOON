@@ -5,6 +5,25 @@
 1. Archive before any destructive reduction.
 2. Prefer degraded operation over hard stop.
 3. Always emit audit detail for failures and fallbacks.
+4. Emit AI-readable warning lines for actionable failures:
+`MOON_WARN code=<CODE> stage=<STAGE> action=<ACTION> session=<SESSION_ID> archive=<ARCHIVE_PATH> source=<SOURCE_PATH> retry=<RETRY_POLICY> reason=<REASON> err=<ERR_SUMMARY>`.
+
+## Warning Codes
+
+1. `INDEX_FAILED`
+2. `DISTILL_FAILED`
+3. `DISTILL_CHUNKED_FAILED`
+4. `CONTINUITY_FAILED`
+5. `RETENTION_DELETE_FAILED`
+6. `LEDGER_READ_FAILED`
+
+## Warning Triage
+
+1. `INDEX_FAILED`: verify `QMD_BIN`, `qmd collection add`, and `qmd update`.
+2. `DISTILL_FAILED` / `DISTILL_CHUNKED_FAILED`: verify distill provider credentials/model and archive readability.
+3. `CONTINUITY_FAILED`: verify session rollover command and continuity map write permissions.
+4. `RETENTION_DELETE_FAILED`: verify archive file permissions and filesystem health.
+5. `LEDGER_READ_FAILED`: verify `archives/ledger.jsonl` exists and contains valid JSONL records.
 
 ## Stage Policies
 

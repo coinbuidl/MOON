@@ -9,9 +9,14 @@ cooldown_secs = 300
 
 [distill]
 mode = "idle"
-idle_secs = 21600
+idle_secs = 360
 max_per_cycle = 1
 archive_grace_hours = 60
+
+[retention]
+active_days = 7
+warm_days = 30
+cold_days = 31
 
 [inbound_watch]
 enabled = false

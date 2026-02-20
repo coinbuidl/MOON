@@ -6,6 +6,27 @@
 cargo run -- moon-watch --once
 ```
 
+Bootstrap sequence (minimal setup):
+
+```bash
+cp .env.example .env
+cargo run -- verify --strict
+cargo run -- moon-status
+cargo run -- moon-watch --once
+```
+
+Distill trigger behavior:
+
+1. Use `distill.mode = "idle"` with `distill.idle_secs = 360` for active OpenClaw environments.
+2. Distill starts only after no newer archive is created during the idle window.
+3. Selection order is oldest pending archive day first, then up to `max_per_cycle`.
+4. Start with `max_per_cycle=1` in test stage, then increase after stable runs.
+
+Retention windows:
+
+1. Active (`<=7` days), warm (`8-30` days), cold candidate (`>=31` days).
+2. Cold deletion requires a distill marker in state for that archive.
+
 ## Start Daemon
 
 ```bash

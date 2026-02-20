@@ -1,5 +1,8 @@
+use predicates::str::contains;
+use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 fn write_fake_qmd(bin_path: &Path) {
@@ -69,6 +72,16 @@ exit 0
         perms.set_mode(0o755);
         fs::set_permissions(bin_path, perms).expect("chmod");
     }
+}
+
+fn read_distilled_archive_paths(state_file: &Path) -> Vec<String> {
+    let raw = fs::read_to_string(state_file).expect("read state");
+    let parsed: Value = serde_json::from_str(&raw).expect("parse state");
+    let map = parsed
+        .get("distilled_archives")
+        .and_then(Value::as_object)
+        .expect("distilled_archives map");
+    map.keys().cloned().collect()
 }
 
 #[test]
@@ -248,6 +261,173 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
 }
 
 #[test]
+fn moon_watch_once_distills_oldest_pending_archive_day_first() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    fs::write(
+        sessions_dir.join("s1.json"),
+        "{\"decision\":\"distill ordering\"}\n",
+    )
+    .expect("write session");
+
+    let old_archive = moon_home.join("archives/old.jsonl");
+    let new_archive = moon_home.join("archives/new.jsonl");
+    fs::write(&old_archive, "{\"session\":\"old\"}\n").expect("write old archive");
+    fs::write(&new_archive, "{\"session\":\"new\"}\n").expect("write new archive");
+
+    let ledger = format!(
+        concat!(
+            "{{\"session_id\":\"old\",\"source_path\":\"/tmp/old.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"aaa\",\"created_at_epoch_secs\":86400,\"indexed_collection\":\"history\",\"indexed\":true}}\n",
+            "{{\"session_id\":\"new\",\"source_path\":\"/tmp/new.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"bbb\",\"created_at_epoch_secs\":172800,\"indexed_collection\":\"history\",\"indexed\":true}}\n"
+        ),
+        old_archive.display(),
+        new_archive.display()
+    );
+    fs::write(moon_home.join("archives/ledger.jsonl"), ledger).expect("write ledger");
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd(&qmd);
+    let openclaw = tmp.path().join("openclaw");
+    write_fake_openclaw(&openclaw);
+
+    assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
+        .env("QMD_BIN", &qmd)
+        .env("OPENCLAW_BIN", &openclaw)
+        .env("MOON_DISTILL_MODE", "idle")
+        .env("MOON_DISTILL_IDLE_SECS", "1")
+        .env("MOON_DISTILL_PROVIDER", "local")
+        .env("MOON_DISTILL_MAX_PER_CYCLE", "1")
+        .env("MOON_COOLDOWN_SECS", "0")
+        .env("MOON_RETENTION_COLD_DAYS", "99999")
+        .arg("moon-watch")
+        .arg("--once")
+        .assert()
+        .success();
+
+    let distilled = read_distilled_archive_paths(&moon_home.join("state/moon_state.json"));
+    assert_eq!(distilled.len(), 1);
+    assert!(distilled.contains(&old_archive.to_string_lossy().to_string()));
+    assert!(!distilled.contains(&new_archive.to_string_lossy().to_string()));
+}
+
+#[test]
+fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distilled() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    fs::write(
+        sessions_dir.join("s1.json"),
+        "{\"decision\":\"distill filtering\"}\n",
+    )
+    .expect("write session");
+
+    let eligible = moon_home.join("archives/eligible.jsonl");
+    let unindexed = moon_home.join("archives/unindexed.jsonl");
+    let already = moon_home.join("archives/already.jsonl");
+    let missing = moon_home.join("archives/missing.jsonl");
+    fs::write(&eligible, "{\"session\":\"eligible\"}\n").expect("write eligible");
+    fs::write(&unindexed, "{\"session\":\"unindexed\"}\n").expect("write unindexed");
+    fs::write(&already, "{\"session\":\"already\"}\n").expect("write already");
+
+    let ledger = format!(
+        concat!(
+            "{{\"session_id\":\"eligible\",\"source_path\":\"/tmp/e.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"a\",\"created_at_epoch_secs\":86400,\"indexed_collection\":\"history\",\"indexed\":true}}\n",
+            "{{\"session_id\":\"unindexed\",\"source_path\":\"/tmp/u.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"b\",\"created_at_epoch_secs\":86401,\"indexed_collection\":\"history\",\"indexed\":false}}\n",
+            "{{\"session_id\":\"already\",\"source_path\":\"/tmp/a.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"c\",\"created_at_epoch_secs\":86402,\"indexed_collection\":\"history\",\"indexed\":true}}\n",
+            "{{\"session_id\":\"missing\",\"source_path\":\"/tmp/m.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"d\",\"created_at_epoch_secs\":86403,\"indexed_collection\":\"history\",\"indexed\":true}}\n"
+        ),
+        eligible.display(),
+        unindexed.display(),
+        already.display(),
+        missing.display()
+    );
+    fs::write(moon_home.join("archives/ledger.jsonl"), ledger).expect("write ledger");
+
+    let state = format!(
+        "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
+        already.display()
+    );
+    fs::write(moon_home.join("state/moon_state.json"), state).expect("write state");
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd(&qmd);
+    let openclaw = tmp.path().join("openclaw");
+    write_fake_openclaw(&openclaw);
+
+    assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
+        .env("QMD_BIN", &qmd)
+        .env("OPENCLAW_BIN", &openclaw)
+        .env("MOON_DISTILL_MODE", "idle")
+        .env("MOON_DISTILL_IDLE_SECS", "1")
+        .env("MOON_DISTILL_PROVIDER", "local")
+        .env("MOON_DISTILL_MAX_PER_CYCLE", "5")
+        .env("MOON_COOLDOWN_SECS", "0")
+        .env("MOON_RETENTION_COLD_DAYS", "99999")
+        .arg("moon-watch")
+        .arg("--once")
+        .assert()
+        .success();
+
+    let distilled = read_distilled_archive_paths(&moon_home.join("state/moon_state.json"));
+    assert_eq!(distilled.len(), 2);
+    assert!(distilled.contains(&eligible.to_string_lossy().to_string()));
+    assert!(distilled.contains(&already.to_string_lossy().to_string()));
+    assert!(!distilled.contains(&unindexed.to_string_lossy().to_string()));
+    assert!(!distilled.contains(&missing.to_string_lossy().to_string()));
+}
+
+#[test]
+fn moon_watch_once_emits_ai_warning_when_ledger_is_invalid() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    fs::write(sessions_dir.join("s1.json"), "{\"decision\":\"bad ledger\"}\n").expect("session");
+    fs::write(moon_home.join("archives/ledger.jsonl"), "not-jsonl\n").expect("ledger");
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd(&qmd);
+    let openclaw = tmp.path().join("openclaw");
+    write_fake_openclaw(&openclaw);
+
+    assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
+        .env("QMD_BIN", &qmd)
+        .env("OPENCLAW_BIN", &openclaw)
+        .env("MOON_DISTILL_MODE", "idle")
+        .env("MOON_DISTILL_IDLE_SECS", "1")
+        .env("MOON_COOLDOWN_SECS", "0")
+        .arg("moon-watch")
+        .arg("--once")
+        .assert()
+        .success()
+        .stderr(contains("MOON_WARN code=LEDGER_READ_FAILED"))
+        .stderr(contains("stage=distill-selection"))
+        .stderr(contains("action=read-ledger"));
+}
+
+#[test]
 fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -328,4 +508,64 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
 
     let qmd_calls = fs::read_to_string(&qmd_log).expect("qmd calls");
     assert!(qmd_calls.lines().any(|line| line.trim() == "update"));
+}
+
+#[test]
+fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    fs::write(
+        sessions_dir.join("s1.json"),
+        "{\"decision\":\"retention boundary\"}\n",
+    )
+    .expect("write session");
+
+    let archive_path = moon_home.join("archives/recent.json");
+    fs::write(&archive_path, "{\"session\":\"recent\"}\n").expect("write archive");
+    let archive_path_str = archive_path.to_string_lossy().to_string();
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    let created_at = now_epoch.saturating_sub(10 * 86_400);
+    let ledger_record = format!(
+        "{{\"session_id\":\"agent:main:discord:channel:recent\",\"source_path\":\"/tmp/source.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"deadbeef\",\"created_at_epoch_secs\":{},\"indexed_collection\":\"history\",\"indexed\":true}}\n",
+        archive_path_str, created_at
+    );
+    fs::write(moon_home.join("archives/ledger.jsonl"), ledger_record).expect("write ledger");
+    let state = format!(
+        "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
+        archive_path_str
+    );
+    fs::write(moon_home.join("state/moon_state.json"), state).expect("write state");
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd(&qmd);
+    let openclaw = tmp.path().join("openclaw");
+    write_fake_openclaw(&openclaw);
+
+    assert_cmd::cargo::cargo_bin_cmd!("oc-token-optim")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
+        .env("QMD_BIN", &qmd)
+        .env("OPENCLAW_BIN", &openclaw)
+        .env("MOON_DISTILL_MODE", "manual")
+        .env("MOON_RETENTION_ACTIVE_DAYS", "7")
+        .env("MOON_RETENTION_WARM_DAYS", "30")
+        .env("MOON_RETENTION_COLD_DAYS", "31")
+        .arg("moon-watch")
+        .arg("--once")
+        .assert()
+        .success();
+
+    assert!(archive_path.exists());
+    let state_raw = fs::read_to_string(moon_home.join("state/moon_state.json")).expect("state");
+    assert!(state_raw.contains(&archive_path_str));
 }

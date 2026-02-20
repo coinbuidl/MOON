@@ -45,6 +45,18 @@ Rules:
 1. Must always include `provider` and output paths.
 2. Failure path must emit an audit record.
 
+## Distill Trigger Contract
+
+Fields:
+1. `distill.mode: String` (`manual` or `idle`)
+2. `distill.idle_secs: u64`
+3. `distill.max_per_cycle: u64`
+
+Rules:
+1. `idle` mode starts only after the latest archive has been idle for `idle_secs`.
+2. Selection is deterministic: oldest pending archive day first, then up to `max_per_cycle`.
+3. Internal watcher trigger model is extensible for future modes (for example archive-event), while current public config remains `manual|idle`.
+
 ## ContinuityMap
 
 Fields:

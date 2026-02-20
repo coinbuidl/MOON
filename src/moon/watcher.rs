@@ -3,7 +3,7 @@ use crate::moon::archive::{
 };
 use crate::moon::audit;
 use crate::moon::channel_archive_map;
-use crate::moon::config::load_config;
+use crate::moon::config::{MoonRetentionConfig, load_config};
 use crate::moon::continuity::{ContinuityOutcome, build_continuity};
 use crate::moon::distill::{
     DistillInput, DistillOutput, archive_file_size, distill_chunk_bytes, load_archive_excerpt,
@@ -18,6 +18,7 @@ use crate::moon::session_usage::{
 use crate::moon::snapshot::latest_session_file;
 use crate::moon::state::{load, save};
 use crate::moon::thresholds::{TriggerKind, evaluate};
+use crate::moon::warn;
 use crate::openclaw::gateway;
 use anyhow::{Context, Result};
 use chrono::{Local, TimeZone};
@@ -35,6 +36,23 @@ use std::time::Duration;
 const DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD: u64 = 1_000_000;
 const MAX_HIGH_TOKEN_ALERT_SESSIONS: usize = 5;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistillTriggerMode {
+    Manual,
+    Idle,
+}
+
+impl DistillTriggerMode {
+    fn from_config_mode(raw: &str) -> Self {
+        // Reserved for future trigger extensions (for example archive_event).
+        if raw.eq_ignore_ascii_case("idle") {
+            Self::Idle
+        } else {
+            Self::Manual
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WatchCycleOutcome {
     pub state_file: String,
@@ -47,6 +65,9 @@ pub struct WatchCycleOutcome {
     pub distill_idle_secs: u64,
     pub distill_max_per_cycle: u64,
     pub distill_archive_grace_hours: u64,
+    pub retention_active_days: u64,
+    pub retention_warm_days: u64,
+    pub retention_cold_days: u64,
     pub usage: SessionUsageSnapshot,
     pub triggers: Vec<String>,
     pub inbound_watch: InboundWatchOutcome,
@@ -155,13 +176,37 @@ fn cleanup_expired_distilled_archives(
     paths: &crate::moon::paths::MoonPaths,
     state: &mut crate::moon::state::MoonState,
     now_epoch_secs: u64,
-    grace_hours: u64,
+    retention: &MoonRetentionConfig,
 ) -> Result<Option<String>> {
-    let grace_secs = grace_hours.saturating_mul(3600);
-    if grace_secs == 0 {
-        return Ok(Some("skipped reason=grace-disabled".to_string()));
-    }
+    let ledger = match read_ledger_records(paths) {
+        Ok(records) => records,
+        Err(err) => {
+            warn::emit(
+                "LEDGER_READ_FAILED",
+                "archive-retention",
+                "read-ledger",
+                "na",
+                "na",
+                "na",
+                "retry-next-cycle",
+                "ledger-read-failed",
+                &format!("{err:#}"),
+            );
+            return Ok(Some(format!(
+                "retention_active_days={} retention_warm_days={} retention_cold_days={} removed=0 missing=0 failed=1 map_removed=0 ledger_removed=0 qmd_updated=false reason=ledger-read-failed",
+                retention.active_days, retention.warm_days, retention.cold_days
+            )));
+        }
+    };
+    let ledger_by_archive = ledger
+        .into_iter()
+        .map(|r| (r.archive_path, r.created_at_epoch_secs))
+        .collect::<BTreeMap<_, _>>();
 
+    let seconds_per_day = 86_400u64;
+    let mut active_count = 0usize;
+    let mut warm_count = 0usize;
+    let mut cold_candidates = 0usize;
     let mut purge_paths = BTreeSet::new();
     let mut removed_files = 0usize;
     let mut missing_files = 0usize;
@@ -174,10 +219,38 @@ fn cleanup_expired_distilled_archives(
         .collect::<Vec<_>>();
 
     for (archive_path, distilled_at) in candidates {
-        if now_epoch_secs.saturating_sub(distilled_at) < grace_secs {
+        let Some(created_at) = ledger_by_archive.get(&archive_path).copied() else {
+            warn::emit(
+                "LEDGER_READ_FAILED",
+                "archive-retention",
+                "lookup-ledger-record",
+                "na",
+                &archive_path,
+                "na",
+                "skip-current-archive",
+                "archive-path-missing-in-ledger",
+                "missing-ledger-record",
+            );
+            continue;
+        };
+
+        let age_days = now_epoch_secs
+            .saturating_sub(created_at)
+            .saturating_div(seconds_per_day);
+        if age_days <= retention.active_days {
+            active_count += 1;
             continue;
         }
+        if age_days <= retention.warm_days || age_days < retention.cold_days {
+            warm_count += 1;
+            continue;
+        }
+        cold_candidates += 1;
 
+        if now_epoch_secs.saturating_sub(distilled_at) < seconds_per_day {
+            // Require at least one day from distill marker before delete to reduce race risk.
+            continue;
+        }
         if Path::new(&archive_path).exists() {
             match fs::remove_file(&archive_path) {
                 Ok(_) => {
@@ -185,8 +258,19 @@ fn cleanup_expired_distilled_archives(
                     purge_paths.insert(archive_path.clone());
                     state.distilled_archives.remove(&archive_path);
                 }
-                Err(_) => {
+                Err(err) => {
                     failed += 1;
+                    warn::emit(
+                        "RETENTION_DELETE_FAILED",
+                        "archive-retention",
+                        "delete-archive",
+                        "na",
+                        &archive_path,
+                        "na",
+                        "retry-next-cycle",
+                        "remove-file-failed",
+                        &format!("{err:#}"),
+                    );
                 }
             }
         } else {
@@ -209,8 +293,19 @@ fn cleanup_expired_distilled_archives(
     };
 
     Ok(Some(format!(
-        "grace_hours={} removed={} missing={} failed={} map_removed={} ledger_removed={} qmd_updated={}",
-        grace_hours, removed_files, missing_files, failed, map_removed, ledger_removed, qmd_updated
+        "retention_active_days={} retention_warm_days={} retention_cold_days={} active={} warm={} cold_candidates={} removed={} missing={} failed={} map_removed={} ledger_removed={} qmd_updated={}",
+        retention.active_days,
+        retention.warm_days,
+        retention.cold_days,
+        active_count,
+        warm_count,
+        cold_candidates,
+        removed_files,
+        missing_files,
+        failed,
+        map_removed,
+        ledger_removed,
+        qmd_updated
     )))
 }
 
@@ -625,7 +720,8 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     let mut distill_candidates = Vec::<crate::moon::archive::ArchiveRecord>::new();
     let distill_chunk_trigger_bytes = distill_chunk_bytes() as u64;
 
-    if cfg.distill.mode == "idle" {
+    let distill_trigger_mode = DistillTriggerMode::from_config_mode(&cfg.distill.mode);
+    if matches!(distill_trigger_mode, DistillTriggerMode::Idle) {
         if !compaction_targets.is_empty() {
             distill_notes.push("skipped reason=compaction-active".to_string());
         } else if !is_cooldown_ready(
@@ -700,6 +796,17 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                     }
                 }
                 Err(err) => {
+                    warn::emit(
+                        "LEDGER_READ_FAILED",
+                        "distill-selection",
+                        "read-ledger",
+                        "na",
+                        "na",
+                        "na",
+                        "retry-next-cycle",
+                        "ledger-read-failed",
+                        &format!("{err:#}"),
+                    );
                     distill_notes.push(format!("skipped reason=ledger-read-failed error={err:#}"))
                 }
             }
@@ -810,6 +917,17 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                                 continuity_out = Some(outcome);
                             }
                             Err(err) => {
+                                warn::emit(
+                                    "CONTINUITY_FAILED",
+                                    "continuity",
+                                    "build-continuity",
+                                    &record.session_id,
+                                    &record.archive_path,
+                                    &record.source_path,
+                                    "retry-next-cycle",
+                                    "continuity-build-failed",
+                                    &format!("{err:#}"),
+                                );
                                 audit::append_event(
                                     &paths,
                                     "continuity",
@@ -824,6 +942,17 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                         distill_out = Some(distill);
                     }
                     Err(err) => {
+                        warn::emit(
+                            "DISTILL_CHUNKED_FAILED",
+                            "distill",
+                            "chunked-distill",
+                            &record.session_id,
+                            &record.archive_path,
+                            &record.source_path,
+                            "retry-next-cycle",
+                            "chunked-distillation-failed",
+                            &format!("{err:#}"),
+                        );
                         audit::append_event(
                             &paths,
                             "distill",
@@ -912,6 +1041,17 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                             continuity_out = Some(outcome);
                         }
                         Err(err) => {
+                            warn::emit(
+                                "CONTINUITY_FAILED",
+                                "continuity",
+                                "build-continuity",
+                                &record.session_id,
+                                &record.archive_path,
+                                &record.source_path,
+                                "retry-next-cycle",
+                                "continuity-build-failed",
+                                &format!("{err:#}"),
+                            );
                             audit::append_event(
                                 &paths,
                                 "continuity",
@@ -926,6 +1066,17 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                     distill_out = Some(distill);
                 }
                 Err(err) => {
+                    warn::emit(
+                        "DISTILL_FAILED",
+                        "distill",
+                        "run-distill",
+                        &record.session_id,
+                        &record.archive_path,
+                        &record.source_path,
+                        "retry-next-cycle",
+                        "distillation-failed",
+                        &format!("{err:#}"),
+                    );
                     audit::append_event(
                         &paths,
                         "distill",
@@ -949,7 +1100,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
         &paths,
         &mut state,
         usage.captured_at_epoch_secs,
-        cfg.distill.archive_grace_hours,
+        &cfg.retention,
     )? {
         let status = if summary.contains("failed=") && !summary.contains("failed=0") {
             "degraded"
@@ -973,6 +1124,9 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
         distill_idle_secs: cfg.distill.idle_secs,
         distill_max_per_cycle: cfg.distill.max_per_cycle,
         distill_archive_grace_hours: cfg.distill.archive_grace_hours,
+        retention_active_days: cfg.retention.active_days,
+        retention_warm_days: cfg.retention.warm_days,
+        retention_cold_days: cfg.retention.cold_days,
         usage,
         triggers: trigger_names,
         inbound_watch,

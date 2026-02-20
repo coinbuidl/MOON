@@ -12,4 +12,5 @@ pub mod session_usage;
 pub mod snapshot;
 pub mod state;
 pub mod thresholds;
+pub mod warn;
 pub mod watcher;

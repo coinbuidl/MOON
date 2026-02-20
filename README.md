@@ -66,6 +66,7 @@ Recommended explicit path setup (these are the runtime defaults, written explici
 
 ```bash
 # Binaries
+# QMD is an external dependency (separate repo/project). Moon only calls its CLI.
 QMD_BIN=$HOME/.bun/bin/qmd
 QMD_DB=$HOME/.cache/qmd/index.sqlite
 
@@ -96,6 +97,19 @@ GEMINI_API_KEY=...
 Distill safety guardrails (recommended):
 
 ```bash
+# Distill trigger behavior:
+# - mode=idle: run distill after no new archives for idle_secs.
+# - recommended idle window for active OpenClaw usage: 360 seconds (6 minutes).
+MOON_DISTILL_MODE=idle
+MOON_DISTILL_IDLE_SECS=360
+# During validation start with 1 and raise after stable runs.
+MOON_DISTILL_MAX_PER_CYCLE=1
+
+# Retention windows (days)
+MOON_RETENTION_ACTIVE_DAYS=7
+MOON_RETENTION_WARM_DAYS=30
+MOON_RETENTION_COLD_DAYS=31
+
 # Archives larger than this threshold are chunk-distilled automatically.
 # Use `auto` to infer a safe chunk size from model context limits
 # when the provider exposes them (fallback heuristics are applied).
@@ -192,6 +206,18 @@ Run one watcher cycle:
 cargo run -- moon-watch --once
 ```
 
+Idle distill selection order:
+
+1. Distill waits until the latest archive has been idle for `MOON_DISTILL_IDLE_SECS`.
+2. It then selects the oldest pending archive day first.
+3. It processes up to `max_per_cycle` archives from that day.
+
+Retention lifecycle windows:
+
+1. Active (`<= active_days`): keep archives for fast debug/resume.
+2. Warm (`active_days < age <= warm_days`): retained and indexed.
+3. Cold candidate (`>= cold_days`): deleted only when a distill marker exists.
+
 ## Configuration
 
 The CLI autoloads `.env` on startup (if present).
@@ -219,6 +245,7 @@ Most-used variables:
 14. `MOON_POLL_INTERVAL_SECS`
 15. `MOON_COOLDOWN_SECS`
 16. `MOON_INBOUND_WATCH_PATHS`
+17. `MOON_RETENTION_ACTIVE_DAYS` / `MOON_RETENTION_WARM_DAYS` / `MOON_RETENTION_COLD_DAYS`
 
 ## Repository map
 

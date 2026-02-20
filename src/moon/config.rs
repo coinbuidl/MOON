@@ -66,6 +66,7 @@ pub struct MoonDistillConfig {
     pub mode: String,
     pub idle_secs: u64,
     pub max_per_cycle: u64,
+    #[serde(alias = "grace_hours")]
     pub archive_grace_hours: u64,
 }
 
@@ -73,9 +74,26 @@ impl Default for MoonDistillConfig {
     fn default() -> Self {
         Self {
             mode: "manual".to_string(),
-            idle_secs: 21_600,
+            idle_secs: 360,
             max_per_cycle: 1,
             archive_grace_hours: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoonRetentionConfig {
+    pub active_days: u64,
+    pub warm_days: u64,
+    pub cold_days: u64,
+}
+
+impl Default for MoonRetentionConfig {
+    fn default() -> Self {
+        Self {
+            active_days: 7,
+            warm_days: 30,
+            cold_days: 31,
         }
     }
 }
@@ -86,6 +104,7 @@ pub struct MoonConfig {
     pub watcher: MoonWatcherConfig,
     pub inbound_watch: MoonInboundWatchConfig,
     pub distill: MoonDistillConfig,
+    pub retention: MoonRetentionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -94,6 +113,7 @@ struct PartialMoonConfig {
     watcher: Option<MoonWatcherConfig>,
     inbound_watch: Option<MoonInboundWatchConfig>,
     distill: Option<MoonDistillConfig>,
+    retention: Option<MoonRetentionConfig>,
 }
 
 fn env_or_f64(var: &str, fallback: f64) -> f64 {
@@ -201,6 +221,19 @@ fn validate(cfg: &MoonConfig) -> Result<()> {
     if cfg.distill.archive_grace_hours == 0 {
         return Err(anyhow!("invalid distill archive grace hours: must be >= 1"));
     }
+    if cfg.retention.active_days == 0 {
+        return Err(anyhow!("invalid retention active days: must be >= 1"));
+    }
+    if cfg.retention.warm_days < cfg.retention.active_days {
+        return Err(anyhow!(
+            "invalid retention windows: require active_days <= warm_days"
+        ));
+    }
+    if cfg.retention.cold_days <= cfg.retention.warm_days {
+        return Err(anyhow!(
+            "invalid retention windows: require warm_days < cold_days"
+        ));
+    }
     Ok(())
 }
 
@@ -238,6 +271,9 @@ fn merge_file_config(base: &mut MoonConfig) -> Result<()> {
     }
     if let Some(distill) = parsed.distill {
         base.distill = distill;
+    }
+    if let Some(retention) = parsed.retention {
+        base.retention = retention;
     }
     Ok(())
 }
@@ -277,6 +313,9 @@ pub fn load_config() -> Result<MoonConfig> {
         "MOON_DISTILL_ARCHIVE_GRACE_HOURS",
         cfg.distill.archive_grace_hours,
     );
+    cfg.retention.active_days = env_or_u64("MOON_RETENTION_ACTIVE_DAYS", cfg.retention.active_days);
+    cfg.retention.warm_days = env_or_u64("MOON_RETENTION_WARM_DAYS", cfg.retention.warm_days);
+    cfg.retention.cold_days = env_or_u64("MOON_RETENTION_COLD_DAYS", cfg.retention.cold_days);
 
     validate(&cfg)?;
     Ok(cfg)
