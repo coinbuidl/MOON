@@ -1,3 +1,4 @@
+use crate::moon::archive::projection_path_for_archive;
 use crate::moon::channel_archive_map;
 use crate::moon::paths::MoonPaths;
 use crate::moon::qmd;
@@ -72,6 +73,37 @@ fn parse_matches(raw: &str) -> Vec<RecallMatch> {
 }
 
 fn snippet_from_archive(path: &str) -> String {
+    let projection_path = projection_path_for_archive(path);
+    let projection_path_str = projection_path.to_string_lossy().to_string();
+    let projection = fs::read_to_string(&projection_path_str).ok();
+    if let Some(raw) = projection {
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("---")
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("moon_archive_projection:")
+                || trimmed.starts_with("session_id:")
+                || trimmed.starts_with("source_path:")
+                || trimmed.starts_with("archive_jsonl_path:")
+                || trimmed.starts_with("content_hash:")
+                || trimmed.starts_with("created_at_epoch_secs:")
+                || trimmed.eq_ignore_ascii_case("this file stores non-noise text signals extracted from the raw session archive for retrieval.")
+            {
+                continue;
+            }
+
+            let normalized = trimmed.trim_start_matches("- ").trim();
+            if normalized.is_empty() {
+                continue;
+            }
+
+            return normalized.chars().take(280).collect();
+        }
+    }
+
     let Ok(raw) = fs::read_to_string(path) else {
         return String::new();
     };
@@ -113,6 +145,7 @@ pub fn recall(
                 "deterministic": true,
                 "channelKey": record.channel_key,
                 "sourcePath": record.source_path,
+                "projectionPath": projection_path_for_archive(&record.archive_path).display().to_string(),
                 "updatedAtEpochSecs": record.updated_at_epoch_secs,
             }),
         });

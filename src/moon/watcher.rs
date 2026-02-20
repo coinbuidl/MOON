@@ -1,5 +1,6 @@
 use crate::moon::archive::{
-    ArchivePipelineOutcome, archive_and_index, read_ledger_records, remove_ledger_records,
+    ArchivePipelineOutcome, archive_and_index, projection_path_for_archive, read_ledger_records,
+    remove_ledger_records,
 };
 use crate::moon::audit;
 use crate::moon::channel_archive_map;
@@ -172,6 +173,25 @@ fn load_session_source_map(sessions_dir: &Path) -> Result<BTreeMap<String, PathB
     Ok(out)
 }
 
+fn resolve_distill_source_path(record: &crate::moon::archive::ArchiveRecord) -> Option<PathBuf> {
+    if let Some(path) = record.projection_path.as_deref() {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let projection = PathBuf::from(trimmed);
+            if projection.exists() {
+                return Some(projection);
+            }
+        }
+    }
+
+    let fallback = projection_path_for_archive(&record.archive_path);
+    if fallback.exists() {
+        return Some(fallback);
+    }
+
+    None
+}
+
 fn cleanup_expired_distilled_archives(
     paths: &crate::moon::paths::MoonPaths,
     state: &mut crate::moon::state::MoonState,
@@ -211,6 +231,9 @@ fn cleanup_expired_distilled_archives(
     let mut removed_files = 0usize;
     let mut missing_files = 0usize;
     let mut failed = 0usize;
+    let mut projection_removed = 0usize;
+    let mut projection_missing = 0usize;
+    let mut projection_failed = 0usize;
 
     let candidates = state
         .distilled_archives
@@ -251,12 +274,35 @@ fn cleanup_expired_distilled_archives(
             // Require at least one day from distill marker before delete to reduce race risk.
             continue;
         }
+        let projection_path = projection_path_for_archive(&archive_path);
+        let projection_path_display = projection_path.display().to_string();
+
         if Path::new(&archive_path).exists() {
             match fs::remove_file(&archive_path) {
                 Ok(_) => {
                     removed_files += 1;
                     purge_paths.insert(archive_path.clone());
                     state.distilled_archives.remove(&archive_path);
+                    match fs::remove_file(&projection_path) {
+                        Ok(_) => projection_removed += 1,
+                        Err(err) if err.kind() == ErrorKind::NotFound => {
+                            projection_missing += 1;
+                        }
+                        Err(err) => {
+                            projection_failed += 1;
+                            warn::emit(WarnEvent {
+                                code: "RETENTION_DELETE_FAILED",
+                                stage: "archive-retention",
+                                action: "delete-projection",
+                                session: "na",
+                                archive: &archive_path,
+                                source: &projection_path_display,
+                                retry: "retry-next-cycle",
+                                reason: "remove-projection-file-failed",
+                                err: &format!("{err:#}"),
+                            });
+                        }
+                    }
                 }
                 Err(err) => {
                     failed += 1;
@@ -277,6 +323,26 @@ fn cleanup_expired_distilled_archives(
             missing_files += 1;
             purge_paths.insert(archive_path.clone());
             state.distilled_archives.remove(&archive_path);
+            match fs::remove_file(&projection_path) {
+                Ok(_) => projection_removed += 1,
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    projection_missing += 1;
+                }
+                Err(err) => {
+                    projection_failed += 1;
+                    warn::emit(WarnEvent {
+                        code: "RETENTION_DELETE_FAILED",
+                        stage: "archive-retention",
+                        action: "delete-projection",
+                        session: "na",
+                        archive: &archive_path,
+                        source: &projection_path_display,
+                        retry: "retry-next-cycle",
+                        reason: "remove-projection-file-failed",
+                        err: &format!("{err:#}"),
+                    });
+                }
+            }
         }
     }
 
@@ -293,7 +359,7 @@ fn cleanup_expired_distilled_archives(
     };
 
     Ok(Some(format!(
-        "retention_active_days={} retention_warm_days={} retention_cold_days={} active={} warm={} cold_candidates={} removed={} missing={} failed={} map_removed={} ledger_removed={} qmd_updated={}",
+        "retention_active_days={} retention_warm_days={} retention_cold_days={} active={} warm={} cold_candidates={} removed={} missing={} failed={} projection_removed={} projection_missing={} projection_failed={} map_removed={} ledger_removed={} qmd_updated={}",
         retention.active_days,
         retention.warm_days,
         retention.cold_days,
@@ -303,6 +369,9 @@ fn cleanup_expired_distilled_archives(
         removed_files,
         missing_files,
         failed,
+        projection_removed,
+        projection_missing,
+        projection_failed,
         map_removed,
         ledger_removed,
         qmd_updated
@@ -648,23 +717,48 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
             let line = match gateway::run_sessions_compact(&target.session_id) {
                 Ok(summary) => {
                     succeeded += 1;
+                    let index_note = match gateway::run_sessions_index_note(
+                        &target.session_id,
+                        &mapped.archive_path,
+                        archived.record.projection_path.as_deref(),
+                        &archived.record.source_path,
+                        &archived.record.content_hash,
+                        &archived.record.indexed_collection,
+                    ) {
+                        Ok(note) => note,
+                        Err(err) => {
+                            warn::emit(WarnEvent {
+                                code: "INDEX_NOTE_FAILED",
+                                stage: "compaction",
+                                action: "write-index-note",
+                                session: &target.session_id,
+                                archive: &mapped.archive_path,
+                                source: &archived.record.source_path,
+                                retry: "retry-next-cycle",
+                                reason: "chat-send-index-note-failed",
+                                err: &format!("{err:#}"),
+                            });
+                            format!("index_note_failed error={err:#}")
+                        }
+                    };
                     audit::append_event(
                         &paths,
                         "compaction",
                         "ok",
                         &format!(
-                            "key={} archived={} result={}",
-                            target.session_id, mapped.archive_path, summary
+                            "key={} archived={} result={} index_note={}",
+                            target.session_id, mapped.archive_path, summary, index_note
                         ),
                     )?;
                     format!(
-                        "ok key={} ratio={:.4} used={} max={} archived={} {}",
+                        "ok key={} ratio={:.4} used={} max={} archived={} {} {}",
                         target.session_id,
                         target.usage_ratio,
                         target.used_tokens,
                         target.max_tokens,
                         mapped.archive_path,
-                        summary
+                        summary,
+                        index_note
                     )
                 }
                 Err(err) => {
@@ -717,7 +811,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     }
 
     let mut distill_notes = Vec::<String>::new();
-    let mut distill_candidates = Vec::<crate::moon::archive::ArchiveRecord>::new();
+    let mut distill_candidates = Vec::<(crate::moon::archive::ArchiveRecord, String)>::new();
     let distill_chunk_trigger_bytes = distill_chunk_bytes() as u64;
 
     let distill_trigger_mode = DistillTriggerMode::from_config_mode(&cfg.distill.mode);
@@ -754,28 +848,45 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                             ));
                         } else {
                             ledger.sort_by_key(|r| r.created_at_epoch_secs);
-                            let pending = ledger
-                                .into_iter()
-                                .filter(|record| {
-                                    record.indexed
-                                        && !state
-                                            .distilled_archives
-                                            .contains_key(&record.archive_path)
-                                        && Path::new(&record.archive_path).exists()
-                                })
-                                .collect::<Vec<_>>();
+                            let mut pending = Vec::new();
+                            for record in ledger {
+                                if !record.indexed
+                                    || state.distilled_archives.contains_key(&record.archive_path)
+                                    || !Path::new(&record.archive_path).exists()
+                                {
+                                    continue;
+                                }
+
+                                let Some(distill_source_path) =
+                                    resolve_distill_source_path(&record)
+                                else {
+                                    warn::emit(WarnEvent {
+                                        code: "DISTILL_SOURCE_MISSING",
+                                        stage: "distill-selection",
+                                        action: "resolve-distill-source",
+                                        session: &record.session_id,
+                                        archive: &record.archive_path,
+                                        source: &record.source_path,
+                                        retry: "retry-next-cycle",
+                                        reason: "projection-md-missing",
+                                        err: "projection-md-not-found",
+                                    });
+                                    continue;
+                                };
+                                pending.push((record, distill_source_path.display().to_string()));
+                            }
 
                             if pending.is_empty() {
                                 distill_notes
                                     .push("skipped reason=no-undistilled-archives".to_string());
-                            } else if let Some(first_pending) = pending.first() {
+                            } else if let Some((first_pending, _)) = pending.first() {
                                 let day_key =
                                     day_key_for_epoch(first_pending.created_at_epoch_secs);
-                                for record in pending {
+                                for (record, distill_source_path) in pending {
                                     if day_key_for_epoch(record.created_at_epoch_secs) != day_key {
                                         continue;
                                     }
-                                    distill_candidates.push(record);
+                                    distill_candidates.push((record, distill_source_path));
                                     if distill_candidates.len()
                                         >= cfg.distill.max_per_cycle as usize
                                     {
@@ -832,9 +943,9 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
             )?;
         }
 
-        for record in distill_candidates {
+        for (record, distill_source_path) in distill_candidates {
             let archive_path = record.archive_path.clone();
-            let archive_size = match archive_file_size(&archive_path) {
+            let archive_size = match archive_file_size(&distill_source_path) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     audit::append_event(
@@ -842,8 +953,11 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                         "distill",
                         "degraded",
                         &format!(
-                            "mode=idle archive={} source={} session={} reason=archive-stat-failed error={err:#}",
-                            record.archive_path, record.source_path, record.session_id
+                            "mode=idle archive={} distill_source={} source={} session={} reason=archive-stat-failed error={err:#}",
+                            record.archive_path,
+                            distill_source_path,
+                            record.source_path,
+                            record.session_id
                         ),
                     )?;
                     continue;
@@ -852,7 +966,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
             if archive_size > distill_chunk_trigger_bytes {
                 let chunked_input = DistillInput {
                     session_id: record.session_id.clone(),
-                    archive_path: archive_path.clone(),
+                    archive_path: distill_source_path.clone(),
                     archive_text: String::new(),
                     archive_epoch_secs: Some(record.created_at_epoch_secs),
                 };
@@ -864,8 +978,9 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                             "distill",
                             status,
                             &format!(
-                                "mode=idle-chunked archive={} source={} session={} bytes={} chunk_trigger_bytes={} chunk_count={} chunk_target_bytes={} truncated={}",
+                                "mode=idle-chunked archive={} distill_source={} source={} session={} bytes={} chunk_trigger_bytes={} chunk_count={} chunk_target_bytes={} truncated={}",
                                 record.archive_path,
+                                distill_source_path,
                                 record.source_path,
                                 record.session_id,
                                 archive_size,
@@ -958,8 +1073,9 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                             "distill",
                             "degraded",
                             &format!(
-                                "mode=idle-chunked archive={} source={} session={} bytes={} chunk_trigger_bytes={} error={err:#}",
+                                "mode=idle-chunked archive={} distill_source={} source={} session={} bytes={} chunk_trigger_bytes={} error={err:#}",
                                 record.archive_path,
+                                distill_source_path,
                                 record.source_path,
                                 record.session_id,
                                 archive_size,
@@ -971,7 +1087,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                 continue;
             }
 
-            let archive_text = match load_archive_excerpt(&archive_path) {
+            let archive_text = match load_archive_excerpt(&distill_source_path) {
                 Ok(text) => text,
                 Err(err) => {
                     audit::append_event(
@@ -979,8 +1095,11 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                         "distill",
                         "degraded",
                         &format!(
-                            "mode=idle archive={} source={} session={} reason=archive-read-failed error={err:#}",
-                            record.archive_path, record.source_path, record.session_id
+                            "mode=idle archive={} distill_source={} source={} session={} reason=archive-read-failed error={err:#}",
+                            record.archive_path,
+                            distill_source_path,
+                            record.source_path,
+                            record.session_id
                         ),
                     )?;
                     continue;
@@ -989,7 +1108,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
 
             let input = DistillInput {
                 session_id: record.session_id.clone(),
-                archive_path: archive_path.clone(),
+                archive_path: distill_source_path.clone(),
                 archive_text,
                 archive_epoch_secs: Some(record.created_at_epoch_secs),
             };
@@ -1005,8 +1124,9 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                         "distill",
                         "ok",
                         &format!(
-                            "mode=idle archive={} source={} session={} bytes={}",
+                            "mode=idle archive={} distill_source={} source={} session={} bytes={}",
                             record.archive_path,
+                            distill_source_path,
                             record.source_path,
                             record.session_id,
                             archive_size
@@ -1082,8 +1202,9 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                         "distill",
                         "degraded",
                         &format!(
-                            "mode=idle archive={} source={} session={} bytes={} error={err:#}",
+                            "mode=idle archive={} distill_source={} source={} session={} bytes={} error={err:#}",
                             record.archive_path,
+                            distill_source_path,
                             record.source_path,
                             record.session_id,
                             archive_size

@@ -91,6 +91,9 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
 
     if let Some(archive) = cycle.archive {
         report.detail(format!("archive.path={}", archive.record.archive_path));
+        if let Some(projection_path) = &archive.record.projection_path {
+            report.detail(format!("archive.projection_path={projection_path}"));
+        }
         report.detail(format!("archive.indexed={}", archive.record.indexed));
         report.detail(format!("archive.deduped={}", archive.deduped));
         report.detail(format!(

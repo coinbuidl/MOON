@@ -110,6 +110,40 @@ pub fn remove_by_archive_paths(
     Ok(removed)
 }
 
+pub fn rewrite_archive_paths(
+    paths: &MoonPaths,
+    rewrites: &BTreeMap<String, String>,
+) -> Result<usize> {
+    if rewrites.is_empty() {
+        return Ok(0);
+    }
+
+    let mut map = load(paths)?;
+    if map.is_empty() {
+        return Ok(0);
+    }
+
+    let now = now_secs()?;
+    let mut updated = 0usize;
+    for record in map.values_mut() {
+        let Some(next_path) = rewrites.get(&record.archive_path) else {
+            continue;
+        };
+        if *next_path == record.archive_path {
+            continue;
+        }
+        record.archive_path = next_path.clone();
+        record.updated_at_epoch_secs = now;
+        updated += 1;
+    }
+
+    if updated > 0 {
+        save(paths, &map)?;
+    }
+
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +219,30 @@ mod tests {
                 .expect("get2")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn rewrite_archive_paths_updates_records_in_place() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        fs::create_dir_all(&paths.moon_home).expect("mkdir");
+
+        upsert(
+            &paths,
+            "agent:main:discord:channel:1",
+            "/tmp/s1.jsonl",
+            "/tmp/a1.jsonl",
+        )
+        .expect("upsert1");
+
+        let mut rewrites = BTreeMap::new();
+        rewrites.insert("/tmp/a1.jsonl".to_string(), "/tmp/raw/a1.jsonl".to_string());
+
+        let updated = rewrite_archive_paths(&paths, &rewrites).expect("rewrite");
+        assert_eq!(updated, 1);
+        let got = get(&paths, "agent:main:discord:channel:1")
+            .expect("get")
+            .expect("record");
+        assert_eq!(got.archive_path, "/tmp/raw/a1.jsonl");
     }
 }

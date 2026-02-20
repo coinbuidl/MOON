@@ -6,10 +6,10 @@
 [LOADING EXTERNAL MEMORY MODULE: M.O.O.N.]
 ```
 
-### <font color="#dd0000">**M**</font>emory
-### <font color="#dd0000">**O**</font>ptimisation
-### <font color="#dd0000">**O**</font>perational
-### <font color="#dd0000">**N**</font>ormaliser
+### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">M</font>emory</span>
+### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">O</font>ptimisation</span>
+### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">O</font>perational</span>
+### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">N</font>ormaliser</span>
 
 ---
 
@@ -21,9 +21,10 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
 ## Core Features
 
 1.  **Automated Lifecycle Watcher**: Monitors OpenClaw session and context size in real-time. Upon reaching defined thresholds, it triggers archiving, indexing, and compaction to prevent prompt overflow and minimize API costs.
-2.  **Semantic Context Retrieval**: Provides the agent with a dedicated search interface to retrieve original, uncompacted context from archives whenever high-fidelity recall is required.
+    * During compaction, Moon writes a deterministic `[MOON_ARCHIVE_INDEX]` note into the active session so agents can locate pre-compaction archives.
+2.  **Semantic Context Retrieval**: Moon writes a clean markdown projection (`archives/raw/*.md`) for each raw session archive (`archives/raw/*.jsonl`) and lets QMD index the markdown projection for higher-signal recall.
 3.  **Tiered Distillation Pipeline**:
-    *   **Phase 1 (Raw Distillation)**: Automatically distills archived sessions into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
+    *   **Phase 1 (Raw Distillation)**: Automatically distills archive projection markdown (`archives/raw/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
     *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
 
 ## Recommended Agent Integration
@@ -34,6 +35,28 @@ To ensure reliable long-term memory and optimal token hygiene, it is recommended
 *   **Agent (Strategic Distillation)**: Responsible for high-level cognitive review—auditing daily logs and migrating key strategic insights into the long-term `MEMORY.md`.
 
 This modular architecture prevents the Agent from being overwhelmed by raw session data while ensuring that distilled knowledge is persisted with high signal-to-noise ratios.
+
+### AGENTS.md Recall Policy Template
+
+Add this block to your workspace `AGENTS.md` (adjust the repo path if different):
+
+```md
+### MOON Archive Recall Policy (Required)
+
+1. History search backend is QMD collection `history`, rooted at `~/.lilac_metaflora/archives`, mask `**/*.md` (archive projections in `~/.lilac_metaflora/archives/raw/*.md`).
+2. Default history retrieval command is `cargo run --manifest-path /Users/lilac/.lilac_metaflora/skills/moon-system/Cargo.toml -- moon-recall --name history --query "<user-intent-query>"`.
+3. Run history retrieval before answering when any condition is true: user references past sessions, pre-compaction context, prior decisions, or current-session context is insufficient.
+4. Retrieval procedure is strict: run one primary query, run one fallback query if no hits, and use top 3 hits only; include `archive_path` in reasoning when available.
+5. If finer detail is required, read the projection frontmatter field `archive_jsonl_path` and fetch only the minimal raw JSONL segment needed.
+6. If both primary and fallback queries return no relevant hit, explicitly reply `HISTORY_NOT_FOUND` (cannot find in archives).
+7. Never fabricate prior-session facts when `moon-recall` returns no relevant match.
+```
+
+Query semantics:
+
+1. Primary query: direct user intent in natural language.
+2. Fallback query: broader keywords from the same intent when primary has no relevant match.
+3. Top 3 hits: highest-score results returned by `moon-recall`.
 
 ## Agent bootstrap checklist
 
@@ -194,6 +217,8 @@ cargo run -- moon-snapshot
 cargo run -- moon-index --name history
 ```
 
+`moon-index` also normalizes older archive layout into `archives/raw/` and backfills missing projection markdown files before running QMD sync.
+
 Recall prior context:
 
 ```bash
@@ -210,13 +235,20 @@ Idle distill selection order:
 
 1. Distill waits until the latest archive has been idle for `MOON_DISTILL_IDLE_SECS`.
 2. It then selects the oldest pending archive day first.
-3. It processes up to `max_per_cycle` archives from that day.
+3. It distills projection markdown sidecars (`*.md`) for those archives, not raw `*.jsonl`.
+4. It processes up to `max_per_cycle` archives from that day.
 
 Retention lifecycle windows:
 
 1. Active (`<= active_days`): keep archives for fast debug/resume.
 2. Warm (`active_days < age <= warm_days`): retained and indexed.
 3. Cold candidate (`>= cold_days`): deleted only when a distill marker exists.
+
+Archive layout:
+
+1. `archives/ledger.jsonl`: archive ledger metadata.
+2. `archives/raw/*.jsonl`: raw snapshot copy (full fidelity).
+3. `archives/raw/*.md`: noise-reduced projection indexed by QMD.
 
 ## Configuration
 

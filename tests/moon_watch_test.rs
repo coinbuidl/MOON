@@ -247,12 +247,25 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
     let compact_calls = fs::read_to_string(&compact_log).expect("read compact log");
     assert!(compact_calls.contains("agent:main:discord:channel:over"));
     assert!(compact_calls.contains("agent:main:whatsapp:+61400000000"));
+    assert!(compact_calls.contains("MOON_ARCHIVE_INDEX"));
+    assert!(compact_calls.contains("moon-system-index-note"));
     assert!(!compact_calls.contains("agent:main:discord:channel:small"));
     assert!(!compact_calls.contains("agent:main:main"));
 
     let ledger = fs::read_to_string(moon_home.join("archives/ledger.jsonl")).expect("read ledger");
     assert!(ledger.contains("sess-over.jsonl"));
     assert!(ledger.contains("sess-wa.jsonl"));
+    assert!(ledger.contains("\"projection_path\":"));
+    assert!(ledger.contains(".md"));
+
+    let raw_archives_dir = moon_home.join("archives/raw");
+    let projection_count = fs::read_dir(&raw_archives_dir)
+        .expect("read raw archives dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .count();
+    assert!(projection_count >= 2);
 
     let channel_map = fs::read_to_string(moon_home.join("continuity/channel_archive_map.json"))
         .expect("read channel archive map");
@@ -279,6 +292,16 @@ fn moon_watch_once_distills_oldest_pending_archive_day_first() {
     let new_archive = moon_home.join("archives/new.jsonl");
     fs::write(&old_archive, "{\"session\":\"old\"}\n").expect("write old archive");
     fs::write(&new_archive, "{\"session\":\"new\"}\n").expect("write new archive");
+    fs::write(
+        old_archive.with_extension("md"),
+        "- [user] old projection\n",
+    )
+    .expect("write old projection");
+    fs::write(
+        new_archive.with_extension("md"),
+        "- [user] new projection\n",
+    )
+    .expect("write new projection");
 
     let ledger = format!(
         concat!(
@@ -341,6 +364,21 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
     fs::write(&eligible, "{\"session\":\"eligible\"}\n").expect("write eligible");
     fs::write(&unindexed, "{\"session\":\"unindexed\"}\n").expect("write unindexed");
     fs::write(&already, "{\"session\":\"already\"}\n").expect("write already");
+    fs::write(
+        eligible.with_extension("md"),
+        "- [user] eligible projection\n",
+    )
+    .expect("write eligible projection");
+    fs::write(
+        unindexed.with_extension("md"),
+        "- [user] unindexed projection\n",
+    )
+    .expect("write unindexed projection");
+    fs::write(
+        already.with_extension("md"),
+        "- [user] already projection\n",
+    )
+    .expect("write already projection");
 
     let ledger = format!(
         concat!(

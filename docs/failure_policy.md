@@ -16,6 +16,9 @@
 4. `CONTINUITY_FAILED`
 5. `RETENTION_DELETE_FAILED`
 6. `LEDGER_READ_FAILED`
+7. `INDEX_NOTE_FAILED`
+8. `PROJECTION_WRITE_FAILED`
+9. `DISTILL_SOURCE_MISSING`
 
 ## Warning Triage
 
@@ -24,6 +27,9 @@
 3. `CONTINUITY_FAILED`: verify session rollover command and continuity map write permissions.
 4. `RETENTION_DELETE_FAILED`: verify archive file permissions and filesystem health.
 5. `LEDGER_READ_FAILED`: verify `archives/ledger.jsonl` exists and contains valid JSONL records.
+6. `INDEX_NOTE_FAILED`: verify gateway `chat.send` permissions and session key validity.
+7. `PROJECTION_WRITE_FAILED`: verify archive read permissions and projection markdown write permissions.
+8. `DISTILL_SOURCE_MISSING`: verify archive projection markdown exists (`archives/raw/*.md`) and rerun `moon-index --name history` to backfill.
 
 ## Stage Policies
 

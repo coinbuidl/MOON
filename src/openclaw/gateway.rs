@@ -114,20 +114,23 @@ pub fn run_system_event(text: &str, mode: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run_sessions_compact(key: &str) -> Result<String> {
-    let normalized_key = key.trim();
+fn run_chat_send(session_key: &str, message: &str, label: &str) -> Result<String> {
+    let normalized_key = session_key.trim();
     if normalized_key.is_empty() {
-        anyhow::bail!("chat.send /compact requires a non-empty session key");
+        anyhow::bail!("chat.send {label} requires a non-empty session key");
+    }
+    if message.trim().is_empty() {
+        anyhow::bail!("chat.send {label} requires a non-empty message");
     }
 
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before UNIX_EPOCH")?
         .as_millis();
-    let idempotency_key = format!("moon-system-compact-{}-{now_ms}", std::process::id());
+    let idempotency_key = format!("moon-system-{label}-{}-{now_ms}", std::process::id());
     let params = serde_json::json!({
         "sessionKey": normalized_key,
-        "message": "/compact",
+        "message": message,
         "deliver": false,
         "idempotencyKey": idempotency_key,
     });
@@ -158,8 +161,8 @@ pub fn run_sessions_compact(key: &str) -> Result<String> {
 
     if status == "started" && !run_id.is_empty() {
         return Ok(format!(
-            "requested key={} mode=chat.send:/compact run_id={}",
-            normalized_key, run_id
+            "requested key={} mode=chat.send:{} run_id={}",
+            normalized_key, label, run_id
         ));
     }
 
@@ -167,16 +170,61 @@ pub fn run_sessions_compact(key: &str) -> Result<String> {
         && ok
     {
         return Ok(format!(
-            "requested key={} mode=chat.send:/compact status={}",
-            normalized_key, status
+            "requested key={} mode=chat.send:{} status={}",
+            normalized_key, label, status
         ));
     }
 
     anyhow::bail!(
-        "chat.send /compact returned unexpected response for key {}: {}",
+        "chat.send {label} returned unexpected response for key {}: {}",
         normalized_key,
         String::from_utf8_lossy(&out.stdout)
     )
+}
+
+pub fn run_sessions_compact(key: &str) -> Result<String> {
+    run_chat_send(key, "/compact", "/compact")
+}
+
+pub fn run_sessions_index_note(
+    key: &str,
+    archive_path: &str,
+    projection_path: Option<&str>,
+    source_path: &str,
+    content_hash: &str,
+    collection_name: &str,
+) -> Result<String> {
+    let session_key = key.trim();
+    if session_key.is_empty() {
+        anyhow::bail!("index note requires a non-empty session key");
+    }
+
+    let mut message = format!(
+        concat!(
+            "[MOON_ARCHIVE_INDEX]\n",
+            "session_key={}\n",
+            "archive_path={}\n"
+        ),
+        session_key,
+        archive_path.trim()
+    );
+    if let Some(path) = projection_path.map(str::trim).filter(|v| !v.is_empty()) {
+        message.push_str(&format!("projection_path={path}\n"));
+    }
+    message.push_str(&format!(
+        concat!(
+            "source_path={}\n",
+            "content_hash={}\n",
+            "collection={}\n",
+            "lookup_hint=moon-recall --name {} --query \"{}\""
+        ),
+        source_path.trim(),
+        content_hash.trim(),
+        collection_name.trim(),
+        collection_name.trim(),
+        session_key
+    ));
+    run_chat_send(session_key, &message, "index-note")
 }
 
 pub fn openclaw_available() -> bool {

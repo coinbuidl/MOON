@@ -19,8 +19,9 @@ Distill trigger behavior:
 
 1. Use `distill.mode = "idle"` with `distill.idle_secs = 360` for active OpenClaw environments.
 2. Distill starts only after no newer archive is created during the idle window.
-3. Selection order is oldest pending archive day first, then up to `max_per_cycle`.
-4. Start with `max_per_cycle=1` in test stage, then increase after stable runs.
+3. Auto-distill reads archive projection markdown (`archives/raw/*.md`) as its source.
+4. Selection order is oldest pending archive day first, then up to `max_per_cycle`.
+5. Start with `max_per_cycle=1` in test stage, then increase after stable runs.
 
 Retention windows:
 
@@ -36,7 +37,7 @@ cargo run -- moon-watch --daemon
 ## Manual Distill
 
 ```bash
-cargo run -- moon-distill --archive ~/.lilac_metaflora/archives/<file>.json --session-id <id>
+cargo run -- moon-distill --archive ~/.lilac_metaflora/archives/raw/<file>.jsonl --session-id <id>
 ```
 
 ## Recall
@@ -45,13 +46,21 @@ cargo run -- moon-distill --archive ~/.lilac_metaflora/archives/<file>.json --se
 cargo run -- moon-recall --query "keyword" --name history
 ```
 
+Rebuild history index + normalize archive layout:
+
+```bash
+cargo run -- moon-index --name history
+```
+
 ## Key Paths
 
 1. State file: `~/.lilac_metaflora/state/moon_state.json`
 2. Archives: `~/.lilac_metaflora/archives/`
-3. Archive ledger: `~/.lilac_metaflora/archives/ledger.jsonl`
-4. Daily memory: `~/.lilac_metaflora/memory/YYYY-MM-DD.md`
-5. Audit log: `~/.lilac_metaflora/skills/moon-system/logs/audit.log`
+3. Raw session snapshots: `~/.lilac_metaflora/archives/raw/*.jsonl`
+4. Archive projections for retrieval: `~/.lilac_metaflora/archives/raw/*.md`
+5. Archive ledger: `~/.lilac_metaflora/archives/ledger.jsonl`
+6. Daily memory: `~/.lilac_metaflora/memory/YYYY-MM-DD.md`
+7. Audit log: `~/.lilac_metaflora/skills/moon-system/logs/audit.log`
 
 ## Troubleshooting
 

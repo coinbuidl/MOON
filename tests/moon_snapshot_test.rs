@@ -19,7 +19,8 @@ fn moon_snapshot_copies_latest_session_file_to_archives() {
         .assert()
         .success();
 
-    let entries = fs::read_dir(&archives_dir).expect("read archives");
+    let raw_archives_dir = archives_dir.join("raw");
+    let entries = fs::read_dir(&raw_archives_dir).expect("read raw archives");
     let mut count = 0usize;
     for entry in entries {
         let path = entry.expect("entry").path();

@@ -59,6 +59,9 @@ pub fn latest_session_file(dir: &Path) -> Result<Option<PathBuf>> {
 pub fn write_snapshot(archives_dir: &Path, source_path: &Path) -> Result<SnapshotOutcome> {
     fs::create_dir_all(archives_dir)
         .with_context(|| format!("failed to create {}", archives_dir.display()))?;
+    let raw_archives_dir = archives_dir.join("raw");
+    fs::create_dir_all(&raw_archives_dir)
+        .with_context(|| format!("failed to create {}", raw_archives_dir.display()))?;
 
     let raw = fs::read(source_path)
         .with_context(|| format!("failed to read source session {}", source_path.display()))?;
@@ -81,7 +84,7 @@ pub fn write_snapshot(archives_dir: &Path, source_path: &Path) -> Result<Snapsho
     } else {
         format!("{slug}-{stamp}.{ext}")
     };
-    let archive_path = archives_dir.join(filename);
+    let archive_path = raw_archives_dir.join(filename);
 
     fs::write(&archive_path, &raw)
         .with_context(|| format!("failed to write {}", archive_path.display()))?;
