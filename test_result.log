@@ -1,0 +1,68 @@
+   Compiling oc-token-optim v0.1.0 (C:\Users\czhu6\gh\MOON)
+warning: unused import: `tempfile::tempdir`
+ --> tests\moon_recall_test.rs:3:5
+  |
+3 | use tempfile::tempdir;
+  |     ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `write_fake_qmd` is never used
+ --> tests\moon_recall_test.rs:5:4
+  |
+5 | fn write_fake_qmd(bin_path: &Path, payload: &str) {
+  |    ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `oc-token-optim` (test "moon_recall_test") generated 2 warnings (run `cargo fix --test "moon_recall_test" -p oc-token-optim` to apply 1 suggestion)
+warning: unused import: `tempfile::tempdir`
+ --> tests\moon_index_test.rs:3:5
+  |
+3 | use tempfile::tempdir;
+  |     ^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `write_fake_qmd` is never used
+ --> tests\moon_index_test.rs:5:4
+  |
+5 | fn write_fake_qmd(bin_path: &Path, log_path: &Path) {
+  |    ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `write_fake_qmd_add_conflict_then_update` is never used
+  --> tests\moon_index_test.rs:20:4
+   |
+20 | fn write_fake_qmd_add_conflict_then_update(bin_path: &P...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_fake_qmd_add_conflict_then_recreate` is never used
+  --> tests\moon_index_test.rs:44:4
+   |
+44 | fn write_fake_qmd_add_conflict_then_recreate(bin_path: ...
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `oc-token-optim` (test "moon_index_test") generated 4 warnings (run `cargo fix --test "moon_index_test" -p oc-token-optim` to apply 1 suggestion)
+warning: function `truncate_with_ellipsis` is never used
+  --> src\moon\util.rs:14:8
+   |
+14 | pub fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `oc-token-optim` (bin "MOON" test) generated 1 warning
+warning: `oc-token-optim` (bin "MOON") generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.40s
+     Running unittests src\main.rs (target\debug\deps\MOON-55da409110df0f64.exe)
+     Running tests\config_patch_test.rs (target\debug\deps\config_patch_test-ac12ee44144544ff.exe)
+     Running tests\failure_path_test.rs (target\debug\deps\failure_path_test-9d4df122389e8853.exe)
+     Running tests\idempotency_test.rs (target\debug\deps\idempotency_test-d6ff612cfb62e5ab.exe)
+     Running tests\install_flow_test.rs (target\debug\deps\install_flow_test-d4b799505ed1f8d7.exe)
+     Running tests\moon_index_test.rs (target\debug\deps\moon_index_test-1d7a0c30f67af69c.exe)
+     Running tests\moon_recall_test.rs (target\debug\deps\moon_recall_test-93190652de962485.exe)
+     Running tests\moon_snapshot_test.rs (target\debug\deps\moon_snapshot_test-039a5e8f733c4a77.exe)
+     Running tests\moon_watch_test.rs (target\debug\deps\moon_watch_test-fabf6838aff680ff.exe)
+error: test failed, to rerun pass `--test moon_watch_test`

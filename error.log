@@ -1,0 +1,11 @@
+    Checking oc-token-optim v0.1.0 (C:\Users\czhu6\gh\MOON)
+warning: function `truncate_with_ellipsis` is never used
+  --> src\moon\util.rs:14:8
+   |
+14 | pub fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+   |        ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `oc-token-optim` (bin "MOON") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.67s
