@@ -1,10 +1,10 @@
 use crate::moon::paths::MoonPaths;
+use crate::moon::util::now_epoch_secs;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelArchiveRecord {
@@ -14,12 +14,7 @@ pub struct ChannelArchiveRecord {
     pub updated_at_epoch_secs: u64,
 }
 
-fn now_secs() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX_EPOCH")?
-        .as_secs())
-}
+
 
 pub fn map_path(paths: &MoonPaths) -> PathBuf {
     paths
@@ -82,7 +77,7 @@ pub fn upsert(
         channel_key: channel_key.to_string(),
         source_path: source_path.to_string(),
         archive_path: archive_path.to_string(),
-        updated_at_epoch_secs: now_secs()?,
+        updated_at_epoch_secs: now_epoch_secs()?,
     };
     map.insert(channel_key.to_string(), record.clone());
 
@@ -123,7 +118,7 @@ pub fn rewrite_archive_paths(
         return Ok(0);
     }
 
-    let now = now_secs()?;
+    let now = now_epoch_secs()?;
     let mut updated = 0usize;
     for record in map.values_mut() {
         let Some(next_path) = rewrites.get(&record.archive_path) else {

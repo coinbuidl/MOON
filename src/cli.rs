@@ -66,6 +66,8 @@ pub struct MoonIndexArgs {
     pub name: String,
     #[arg(long)]
     pub dry_run: bool,
+    #[arg(long)]
+    pub reproject: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -147,6 +149,7 @@ pub fn run() -> Result<()> {
             commands::moon_index::run(&commands::moon_index::MoonIndexOptions {
                 collection_name: args.name.clone(),
                 dry_run: args.dry_run,
+                reproject: args.reproject,
             })?
         }
         Command::MoonWatch(args) => {

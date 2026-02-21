@@ -86,6 +86,7 @@ exit 1\n",
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_index_registers_history_collection() {
     let tmp = tempdir().expect("tempdir");
     let archives_dir = tmp.path().join("archives");
@@ -112,6 +113,7 @@ fn moon_index_registers_history_collection() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_index_updates_when_collection_already_exists() {
     let tmp = tempdir().expect("tempdir");
     let archives_dir = tmp.path().join("archives");
@@ -138,6 +140,7 @@ fn moon_index_updates_when_collection_already_exists() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_index_recreates_collection_when_mask_mismatches() {
     let tmp = tempdir().expect("tempdir");
     let archives_dir = tmp.path().join("archives");

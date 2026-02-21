@@ -1,5 +1,6 @@
 use crate::moon::audit;
 use crate::moon::paths::MoonPaths;
+use crate::moon::util::now_epoch_secs;
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, TimeZone};
 use reqwest::blocking::Client;
@@ -10,7 +11,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 #[derive(Debug, Clone)]
 pub struct DistillInput {
@@ -39,6 +40,42 @@ pub struct ChunkedDistillOutput {
     pub chunk_count: usize,
     pub chunk_target_bytes: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectionData {
+    pub entries: Vec<ProjectionEntry>,
+    pub tool_calls: Vec<String>,
+    pub keywords: Vec<String>,
+    pub topics: Vec<String>,
+    pub time_start_epoch: Option<u64>,
+    pub time_end_epoch: Option<u64>,
+    pub message_count: usize,
+    pub truncated: bool,
+    pub compaction_anchors: Vec<CompactionAnchor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionAnchor {
+    pub note: String,
+    pub origin_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ToolPriority {
+    High,
+    Normal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectionEntry {
+    pub timestamp_epoch: Option<u64>,
+    pub role: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub tool_target: Option<String>,
+    pub priority: Option<ToolPriority>,
+    pub coupled_result: Option<String>,
 }
 
 pub trait Distiller {
@@ -94,7 +131,7 @@ struct RemoteModelConfig {
 const SIGNAL_KEYWORDS: [&str; 5] = ["decision", "rule", "todo", "next", "milestone"];
 const MAX_SIGNAL_LINES: usize = 20;
 const MAX_FALLBACK_LINES: usize = 12;
-const MAX_CANDIDATE_CHARS: usize = 280;
+const MAX_CANDIDATE_CHARS: usize = 512;
 const MAX_SUMMARY_CHARS: usize = 12_000;
 const MAX_PROMPT_LINES: usize = 80;
 const MAX_MODEL_LINES: usize = 80;
@@ -266,12 +303,7 @@ fn resolve_remote_config() -> Option<RemoteModelConfig> {
     })
 }
 
-fn now_secs() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX_EPOCH")?
-        .as_secs())
-}
+
 
 fn token_limit_to_chunk_bytes(tokens: u64) -> usize {
     let estimated = (tokens as f64) * AUTO_CHUNK_BYTES_PER_TOKEN * AUTO_CHUNK_SAFETY_RATIO;
@@ -482,12 +514,21 @@ fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
     out
 }
 
+fn unescape_json_noise(input: &str) -> String {
+    input
+        .replace("\\\\\"", "\"")
+        .replace("\\\\n", "\n")
+        .replace("\\\\t", "\t")
+        .replace("\\\\\\\\", "\\")
+}
+
 fn normalize_text(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn clean_candidate_text(input: &str) -> Option<String> {
-    let normalized = normalize_text(input);
+    let unescaped = unescape_json_noise(input);
+    let normalized = normalize_text(&unescaped);
     if normalized.is_empty() {
         return None;
     }
@@ -575,14 +616,116 @@ fn extract_candidate_lines(raw: &str) -> Vec<String> {
     out
 }
 
-pub fn load_archive_excerpt(path: &str) -> Result<String> {
+fn extract_message_entry(entry: &Value) -> Option<ProjectionEntry> {
+    let message = entry.get("message")?;
+    let role = message.get("role").and_then(Value::as_str).unwrap_or("").to_string();
+    
+    let mut timestamp_epoch = None;
+    if let Some(ts_str) = message.get("createdAt").and_then(Value::as_str) {
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+            timestamp_epoch = Some(ts.timestamp() as u64);
+        }
+    } else if let Some(ts_num) = entry.get("timestamp_epoch").and_then(Value::as_u64) {
+        timestamp_epoch = Some(ts_num);
+    }
+    
+    let content_arr = message.get("content").and_then(Value::as_array)?;
+    let mut text_parts = Vec::new();
+    let mut tool_name = None;
+    let mut tool_target = None;
+    let mut priority = None;
+
+    if role == "toolResult" {
+        for part in content_arr {
+            if part.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = part.get("text").and_then(Value::as_str)
+                    && let Some(cleaned) = clean_candidate_text(text)
+                        && cleaned.len() <= 1024 && !looks_like_json_blob(&cleaned) && !cleaned.contains("<<<EXTERNAL_UNTRUSTED_CONTENT>>>") {
+                            text_parts.push(cleaned);
+                        }
+        }
+    } else {
+        for part in content_arr {
+            let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+            if part_type == "text" {
+                if let Some(text) = part.get("text").and_then(Value::as_str)
+                    && let Some(cleaned) = clean_candidate_text(text) {
+                        text_parts.push(cleaned);
+                    }
+            } else if part_type == "toolUse"
+                && let Some(name) = part.get("name").and_then(Value::as_str) {
+                    tool_name = Some(name.to_string());
+                    priority = Some(match name {
+                        "write_to_file" | "exec" | "edit" | "gateway" => ToolPriority::High,
+                        _ => ToolPriority::Normal,
+                    });
+                    
+                    if let Some(input) = part.get("input").and_then(Value::as_object) {
+                        if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+                            tool_target = Some(cmd.to_string());
+                        } else if let Some(path) = input.get("path").or_else(|| input.get("file")).and_then(Value::as_str) {
+                            tool_target = Some(path.to_string());
+                        } else if let Ok(dump) = serde_json::to_string(input) {
+                            tool_target = Some(truncate_with_ellipsis(&dump, 64));
+                        }
+                    }
+                }
+        }
+    }
+
+    if text_parts.is_empty() && tool_name.is_none() {
+        return None;
+    }
+
+    Some(ProjectionEntry {
+        timestamp_epoch,
+        role,
+        content: text_parts.join("\n"),
+        tool_name,
+        tool_target,
+        priority,
+        coupled_result: None,
+    })
+}
+
+fn extract_keywords(entries: &[ProjectionEntry]) -> Vec<String> {
+    let mut keywords = BTreeSet::new();
+    for entry in entries {
+        if entry.role != "user" && entry.role != "assistant" {
+            continue;
+        }
+        for word in entry.content.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.') {
+            if word.len() > 4 && word.len() < 24 && !word.chars().all(|c| c.is_numeric()) {
+                keywords.insert(word.to_lowercase());
+            }
+        }
+        if keywords.len() > 100 {
+            break;
+        }
+    }
+    keywords.into_iter().take(30).collect()
+}
+
+fn infer_topics(_entries: &[ProjectionEntry], keywords: &[String]) -> Vec<String> {
+    if keywords.is_empty() {
+        vec![]
+    } else {
+        vec!["Session activity".to_string()]
+    }
+}
+
+pub fn extract_projection_data(path: &str) -> Result<ProjectionData> {
     let file = fs::File::open(path).with_context(|| format!("failed to open {path}"))?;
     let reader = BufReader::new(file);
 
     let mut scanned_bytes = 0usize;
     let mut scanned_lines = 0usize;
-    let mut out = Vec::new();
+    let mut entries: Vec<ProjectionEntry> = Vec::new();
+    let mut tool_calls_set = BTreeSet::new();
+    let mut compaction_anchors = Vec::new();
     let mut truncated = false;
+
+    let mut pending_tool_uses: Vec<usize> = Vec::new();
 
     for line in reader.split(b'\n') {
         let raw = line.with_context(|| format!("failed to read line from {path}"))?;
@@ -590,9 +733,45 @@ pub fn load_archive_excerpt(path: &str) -> Result<String> {
         scanned_bytes = scanned_bytes.saturating_add(raw.len().saturating_add(1));
 
         let decoded = String::from_utf8_lossy(&raw);
-        push_candidate_from_line(decoded.trim(), &mut out);
+        let trimmed = decoded.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-        if out.len() >= MAX_ARCHIVE_CANDIDATES
+        if let Ok(json_entry) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(note) = json_entry.get("compaction_summary").and_then(Value::as_str) {
+                compaction_anchors.push(CompactionAnchor {
+                    note: note.to_string(),
+                    origin_message_id: json_entry.get("message_id").and_then(Value::as_str).map(|s| s.to_string()),
+                });
+            }
+
+            if let Some(entry) = extract_message_entry(&json_entry) {
+                let idx = entries.len();
+                
+                if entry.role == "assistant" && entry.tool_name.is_some() {
+                    tool_calls_set.insert(entry.tool_name.clone().unwrap());
+                    pending_tool_uses.push(idx);
+                } else if entry.role == "toolResult"
+                    && let Some(use_idx) = pending_tool_uses.pop() {
+                        entries[use_idx].coupled_result = Some(entry.content.clone());
+                    }
+                
+                entries.push(entry);
+            }
+        } else if !looks_like_json_blob(trimmed) && let Some(cleaned) = clean_candidate_text(trimmed) {
+            entries.push(ProjectionEntry {
+                timestamp_epoch: None,
+                role: "system".to_string(),
+                content: cleaned,
+                tool_name: None,
+                tool_target: None,
+                priority: None,
+                coupled_result: None,
+            });
+        }
+
+        if entries.len() >= MAX_ARCHIVE_CANDIDATES
             || scanned_lines >= MAX_ARCHIVE_SCAN_LINES
             || scanned_bytes >= MAX_ARCHIVE_SCAN_BYTES
         {
@@ -601,15 +780,65 @@ pub fn load_archive_excerpt(path: &str) -> Result<String> {
         }
     }
 
-    if out.is_empty() {
-        return Ok(String::new());
-    }
+    let message_count = entries.len();
+    let time_start_epoch = entries.first().and_then(|e| e.timestamp_epoch);
+    let time_end_epoch = entries.last().and_then(|e| e.timestamp_epoch);
+    let keywords = extract_keywords(&entries);
+    let topics = infer_topics(&entries, &keywords);
 
-    let mut excerpt = out.join("\n");
-    if truncated {
-        excerpt.push_str("\n[archive excerpt truncated]");
+    Ok(ProjectionData {
+        entries,
+        tool_calls: tool_calls_set.into_iter().collect(),
+        keywords,
+        topics,
+        time_start_epoch,
+        time_end_epoch,
+        message_count,
+        truncated,
+        compaction_anchors,
+    })
+}
+
+impl ProjectionData {
+    pub fn to_excerpt(&self) -> String {
+        let mut out = Vec::new();
+        for entry in &self.entries {
+            let candidate = match entry.role.as_str() {
+                "toolResult" => {
+                    if entry.coupled_result.is_none() {
+                        format!("[tool] {}", entry.content)
+                    } else {
+                        continue;
+                    }
+                }
+                "user" => format!("[user] {}", entry.content),
+                "assistant" => {
+                    let mut s = format!("[assistant] {}", entry.content);
+                    if let Some(ref t) = entry.tool_name {
+                        s.push_str(&format!(" [toolUse {}]", t));
+                    }
+                    if let Some(ref r) = entry.coupled_result {
+                        s.push_str(&format!("\n[toolResult] {}", r));
+                    }
+                    s
+                },
+                _ => entry.content.clone(),
+            };
+            if !candidate.trim().is_empty() {
+                out.push(candidate);
+            }
+        }
+        let mut excerpt = out.join("\n");
+        if self.truncated {
+            excerpt.push_str("\n[archive excerpt truncated]");
+        }
+        excerpt
     }
-    Ok(excerpt)
+}
+
+pub fn load_archive_excerpt(path: &str) -> Result<String> {
+    let data = extract_projection_data(path)?;
+    Ok(data.to_excerpt())
 }
 
 fn is_signal_line(line: &str) -> bool {
@@ -1051,7 +1280,7 @@ fn append_distilled_summary(
         summary,
         summary_path: summary_path.clone(),
         audit_log_path: paths.logs_dir.join("audit.log").display().to_string(),
-        created_at_epoch_secs: now_secs()?,
+        created_at_epoch_secs: now_epoch_secs()?,
     })
 }
 
@@ -1499,5 +1728,23 @@ mod tests {
         assert!(label.starts_with("mixed("));
         assert!(label.contains("local:2"));
         assert!(label.contains("gemini:3"));
+    }
+
+
+
+    #[test]
+    fn test_extract_keywords() {
+        let text = "We need to fix the WebGL rendering bug on Safari. Also investigate the auth-token expiration issue.";
+        let entry = super::ProjectionEntry {
+            timestamp_epoch: None,
+            role: "user".to_string(),
+            content: text.to_string(),
+            tool_name: None,
+            tool_target: None,
+            priority: None,
+            coupled_result: None,
+        };
+        let keywords = super::extract_keywords(&[entry]);
+        assert!(keywords.contains(&"webgl".to_string()) || keywords.contains(&"safari".to_string()) || keywords.contains(&"auth-token".to_string()));
     }
 }

@@ -12,6 +12,7 @@ use crate::moon::state;
 pub struct MoonIndexOptions {
     pub collection_name: String,
     pub dry_run: bool,
+    pub reproject: bool,
 }
 
 pub fn run(opts: &MoonIndexOptions) -> Result<CommandReport> {
@@ -61,7 +62,7 @@ pub fn run(opts: &MoonIndexOptions) -> Result<CommandReport> {
         report.detail(format!("layout_migration.state_updates={}", state_updates));
     }
 
-    let backfill = backfill_archive_projections(&paths)?;
+    let backfill = backfill_archive_projections(&paths, opts.reproject)?;
     report.detail(format!("projection_backfill.scanned={}", backfill.scanned));
     report.detail(format!("projection_backfill.created={}", backfill.created));
     report.detail(format!("projection_backfill.failed={}", backfill.failed));

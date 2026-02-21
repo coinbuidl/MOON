@@ -1,4 +1,4 @@
-use crate::moon::distill::load_archive_excerpt;
+use crate::moon::distill::{extract_projection_data, ProjectionData};
 use crate::moon::paths::MoonPaths;
 use crate::moon::qmd;
 use crate::moon::snapshot::write_snapshot;
@@ -133,17 +133,30 @@ fn yaml_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn render_projection_markdown(
+fn truncate_preview(text: &str, max: usize) -> String {
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() > max {
+        let mut s: String = clean.chars().take(max).collect();
+        s.push_str("...");
+        s
+    } else {
+        clean
+    }
+}
+
+fn render_projection_markdown_v2(
     session_id: &str,
     source_path: &Path,
     archive_path: &Path,
     content_hash: &str,
     created_at_epoch_secs: u64,
-    excerpt: &str,
+    data: &ProjectionData,
 ) -> String {
+    use chrono::{DateTime, Utc, TimeZone, Local};
+
     let mut out = String::new();
     out.push_str("---\n");
-    out.push_str("moon_archive_projection: 1\n");
+    out.push_str("moon_archive_projection: 2\n");
     out.push_str(&format!("session_id: {}\n", yaml_quote(session_id)));
     out.push_str(&format!(
         "source_path: {}\n",
@@ -155,31 +168,117 @@ fn render_projection_markdown(
     ));
     out.push_str(&format!("content_hash: {}\n", yaml_quote(content_hash)));
     out.push_str(&format!("created_at_epoch_secs: {created_at_epoch_secs}\n"));
+
+    let start_utc = data.time_start_epoch.map(|t| Utc.timestamp_opt(t as i64, 0).unwrap()).unwrap_or_else(Utc::now);
+    let end_utc = data.time_end_epoch.map(|t| Utc.timestamp_opt(t as i64, 0).unwrap()).unwrap_or_else(Utc::now);
+    
+    let local_offset = std::env::var("MOON_LOCAL_TIMEZONE").unwrap_or_else(|_| Local::now().offset().to_string());
+    
+    let start_local: DateTime<Local> = start_utc.with_timezone(&Local);
+    let end_local: DateTime<Local> = end_utc.with_timezone(&Local);
+
+    out.push_str(&format!("time_range_utc: \"{} — {}\"\n", start_utc.format("%Y-%m-%dT%H:%M:%SZ"), end_utc.format("%Y-%m-%dT%H:%M:%SZ")));
+    out.push_str(&format!("time_range_local: \"{} — {}\"\n", start_local.format("%Y-%m-%dT%H:%M:%S%:z"), end_local.format("%Y-%m-%dT%H:%M:%S%:z")));
+    out.push_str(&format!("local_timezone: {}\n", yaml_quote(&local_offset)));
+    out.push_str(&format!("message_count: {}\n", data.entries.len()));
+    
+    let tools_str = serde_json::to_string(&data.tool_calls).unwrap_or_else(|_| "[]".to_string());
+    out.push_str(&format!("tool_calls: {}\n", tools_str));
+    
+    let keywords_str = serde_json::to_string(&data.keywords).unwrap_or_else(|_| "[]".to_string());
+    out.push_str(&format!("keywords: {}\n", keywords_str));
+    
+    let topics_str = serde_json::to_string(&data.topics).unwrap_or_else(|_| "[]".to_string());
+    out.push_str(&format!("topics: {}\n", topics_str));
+    
     out.push_str("---\n\n");
-    out.push_str("# Archive Projection\n\n");
-    out.push_str(
-        "This file stores non-noise text signals extracted from the raw session archive for retrieval.\n\n",
-    );
-    out.push_str("## Signals\n");
-    if excerpt.trim().is_empty() {
-        out.push_str("- no textual signals extracted\n");
-        return out;
-    }
-
-    for line in excerpt.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    
+    out.push_str(&format!("# Archive Projection — {}\n\n", session_id));
+    out.push_str(&format!("> Session: {}–{} {} ({}–{} UTC)\n", start_local.format("%Y-%m-%d %H:%M"), end_local.format("%H:%M"), local_offset, start_utc.format("%Y-%m-%d %H:%M"), end_utc.format("%H:%M")));
+    out.push_str(&format!("> Messages: {} | Tools used: {}\n\n", data.entries.len(), data.tool_calls.join(", ")));
+    
+    out.push_str("## Timeline\n\n");
+    out.push_str("| # | Time (UTC) | Time (Local) | Role | Summary |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    
+    let mut convs_user = String::new();
+    let mut convs_asst = String::new();
+    let mut tool_sections: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    
+    for (i, entry) in data.entries.iter().enumerate() {
+        let ts_utc = entry.timestamp_epoch.map(|t| Utc.timestamp_opt(t as i64, 0).unwrap()).unwrap_or_else(Utc::now);
+        let ts_local: DateTime<Local> = ts_utc.with_timezone(&Local);
+        let time_str_utc = ts_utc.format("%H:%M:%SZ").to_string();
+        let time_str_local = ts_local.format("%H:%M:%S").to_string();
+        
+        let preview = truncate_preview(&entry.content, 60);
+        
+        // NL injection every 15 entries for Lilac §4
+        if i > 0 && i % 15 == 0 {
+            let nl_time = ts_local.format("%A %p").to_string();
+            out.push_str(&format!("| - | **[{}]** | - | - | - |\n", nl_time));
         }
-        let normalized = trimmed.trim_start_matches("- ").trim();
-        if normalized.is_empty() {
-            continue;
-        }
-        out.push_str("- ");
-        out.push_str(normalized);
-        out.push('\n');
-    }
 
+        let role_display = if let Some(ref tool) = entry.tool_name {
+            format!("tool:{}", tool)
+        } else {
+            entry.role.clone()
+        };
+        out.push_str(&format!("| {} | {} | {} | {} | {} |\n", i + 1, time_str_utc, time_str_local, role_display, preview));
+        
+        let conv_line = format!("- [{}] {}\n", time_str_utc, preview);
+        if entry.role == "user" {
+            convs_user.push_str(&conv_line);
+        } else if entry.role == "assistant" {
+            convs_asst.push_str(&format!("- [{}] {}\n", time_str_utc, truncate_preview(&entry.content, 120)));
+        }
+        
+        if let Some(ref tool) = entry.tool_name {
+            let list = tool_sections.entry(tool.clone()).or_default();
+            let target = entry.tool_target.as_deref().unwrap_or("");
+            let result_preview = entry.coupled_result.as_deref().map(|r| truncate_preview(r, 60)).unwrap_or_default();
+            // Contextual stitching (Lilac §3)
+            list.push(format!("- [{}] `{}` → {}\n", time_str_utc, target, result_preview));
+        } else if entry.role == "toolResult" && entry.coupled_result.is_none() {
+            let list = tool_sections.entry("unknown_tool".to_string()).or_default();
+            list.push(format!("- [{}] {}\n", time_str_utc, preview));
+        }
+    }
+    
+    out.push_str("\n## Conversations\n\n### User Queries\n");
+    if convs_user.is_empty() { out.push_str("- None\n"); } else { out.push_str(&convs_user); }
+    out.push_str("\n### Assistant Responses\n");
+    if convs_asst.is_empty() { out.push_str("- None\n"); } else { out.push_str(&convs_asst); }
+    
+    out.push_str("\n## Tool Activity\n\n");
+    if tool_sections.is_empty() {
+        out.push_str("- None\n");
+    } else {
+        for (tool, acts) in tool_sections {
+            out.push_str(&format!("### {}\n", tool));
+            for act in acts {
+                out.push_str(&act);
+            }
+            out.push('\n');
+        }
+    }
+    
+    out.push_str("## Decisions & Outcomes\n- (Extracted via periodic compaction)\n\n");
+    
+    out.push_str("## Keywords & Topics\n");
+    out.push_str(&format!("- **Keywords**: {}\n", data.keywords.join(", ")));
+    out.push_str(&format!("- **Topics**: {}\n\n", data.topics.join(", ")));
+    
+    out.push_str("## Compaction Notes\n");
+    if data.compaction_anchors.is_empty() {
+        out.push_str("- No compactions recorded in this session.\n");
+    } else {
+        for anchor in &data.compaction_anchors {
+            let origin_ref = anchor.origin_message_id.as_deref().unwrap_or("unknown");
+            out.push_str(&format!("- {} (Origin: `{}`)\n", anchor.note, origin_ref));
+        }
+    }
+    
     out
 }
 
@@ -192,16 +291,18 @@ fn write_archive_projection(
 ) -> Result<PathBuf> {
     let projection_path = projection_path_for_archive_path(archive_path);
     let archive_path_str = archive_path.display().to_string();
-    let excerpt = load_archive_excerpt(&archive_path_str)
-        .with_context(|| format!("failed to extract excerpt from {}", archive_path.display()))?;
-    let markdown = render_projection_markdown(
+    let proj_data = extract_projection_data(&archive_path_str)
+        .with_context(|| format!("failed to extract projection data from {}", archive_path.display()))?;
+    
+    let markdown = render_projection_markdown_v2(
         session_id,
         source_path,
         archive_path,
         content_hash,
         created_at_epoch_secs,
-        &excerpt,
+        &proj_data,
     );
+    
     fs::write(&projection_path, markdown)
         .with_context(|| format!("failed to write {}", projection_path.display()))?;
     Ok(projection_path)
@@ -350,7 +451,7 @@ pub fn normalize_archive_layout(paths: &MoonPaths) -> Result<ArchiveLayoutMigrat
     Ok(out)
 }
 
-pub fn backfill_archive_projections(paths: &MoonPaths) -> Result<ProjectionBackfillOutcome> {
+pub fn backfill_archive_projections(paths: &MoonPaths, reproject: bool) -> Result<ProjectionBackfillOutcome> {
     let ledger = ledger_path(paths);
     if !ledger.exists() {
         return Ok(ProjectionBackfillOutcome::default());
@@ -375,19 +476,21 @@ pub fn backfill_archive_projections(paths: &MoonPaths) -> Result<ProjectionBackf
             continue;
         }
 
-        if let Some(existing_projection) = record
-            .projection_path
-            .as_deref()
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-        {
-            let normalized = existing_projection.display().to_string();
-            if record.projection_path.as_deref() != Some(normalized.as_str()) {
-                record.projection_path = Some(normalized);
-                changed = true;
+        if !reproject
+            && let Some(existing_projection) = record
+                .projection_path
+                .as_deref()
+                .map(PathBuf::from)
+                .filter(|path| path.exists())
+            {
+                let normalized = existing_projection.display().to_string();
+                if record.projection_path.as_deref() != Some(normalized.as_str()) {
+                    record.projection_path = Some(normalized);
+                    changed = true;
+                }
+                continue;
             }
-            continue;
-        }
+
 
         match write_archive_projection(
             &record.session_id,

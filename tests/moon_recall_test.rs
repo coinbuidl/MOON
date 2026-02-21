@@ -18,6 +18,7 @@ fn write_fake_qmd(bin_path: &Path, payload: &str) {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_recall_returns_matches() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -42,6 +43,7 @@ fn moon_recall_returns_matches() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_recall_prefers_exact_channel_archive_match() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");

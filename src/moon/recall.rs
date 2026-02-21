@@ -2,13 +2,13 @@ use crate::moon::archive::projection_path_for_archive;
 use crate::moon::channel_archive_map;
 use crate::moon::paths::MoonPaths;
 use crate::moon::qmd;
+use crate::moon::util::now_epoch_secs;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallMatch {
@@ -25,8 +25,19 @@ pub struct RecallResult {
     pub generated_at_epoch_secs: u64,
 }
 
-fn now_secs() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+
+
+fn boost_score_for_priority(snippet: &str, base_score: f64) -> f64 {
+    let lower = snippet.to_ascii_lowercase();
+    if lower.contains("write_to_file") || lower.contains("exec") || lower.contains("edit") || lower.contains("gateway") {
+        // High priority side-effects
+        base_score * 1.30
+    } else if lower.contains("read_file") || lower.contains("web_search") || lower.contains("ls") {
+        // Normal priority side-effects
+        base_score * 1.05
+    } else {
+        base_score
+    }
 }
 
 fn parse_matches(raw: &str) -> Vec<RecallMatch> {
@@ -55,10 +66,12 @@ fn parse_matches(raw: &str) -> Vec<RecallMatch> {
             .or_else(|| item.get("source").and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
-        let score = item
+        let base_score = item
             .get("score")
             .and_then(Value::as_f64)
             .unwrap_or_else(|| (snippet.len() as f64) / 1000.0);
+
+        let score = boost_score_for_priority(&snippet, base_score);
 
         out.push(RecallMatch {
             archive_path,
@@ -77,9 +90,15 @@ fn snippet_from_archive(path: &str) -> String {
     let projection_path_str = projection_path.to_string_lossy().to_string();
     let projection = fs::read_to_string(&projection_path_str).ok();
     if let Some(raw) = projection {
+        let mut in_v2_content = false;
+        let mut fallback = String::new();
         for line in raw.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed == "## Conversations" || trimmed == "## Timeline" || trimmed == "## Tool Activity" {
+                in_v2_content = true;
                 continue;
             }
             if trimmed.starts_with("---")
@@ -90,6 +109,14 @@ fn snippet_from_archive(path: &str) -> String {
                 || trimmed.starts_with("archive_jsonl_path:")
                 || trimmed.starts_with("content_hash:")
                 || trimmed.starts_with("created_at_epoch_secs:")
+                || trimmed.starts_with("time_range_utc:")
+                || trimmed.starts_with("time_range_local:")
+                || trimmed.starts_with("local_timezone:")
+                || trimmed.starts_with("message_count:")
+                || trimmed.starts_with("tool_calls:")
+                || trimmed.starts_with("keywords:")
+                || trimmed.starts_with("topics:")
+                || trimmed.starts_with('>')
                 || trimmed.eq_ignore_ascii_case("this file stores non-noise text signals extracted from the raw session archive for retrieval.")
             {
                 continue;
@@ -99,8 +126,17 @@ fn snippet_from_archive(path: &str) -> String {
             if normalized.is_empty() {
                 continue;
             }
+            
+            if fallback.is_empty() {
+                fallback = normalized.chars().take(280).collect();
+            }
 
-            return normalized.chars().take(280).collect();
+            if in_v2_content && !normalized.starts_with('|') {
+                return normalized.chars().take(280).collect();
+            }
+        }
+        if !fallback.is_empty() {
+            return fallback;
         }
     }
 
@@ -151,7 +187,16 @@ pub fn recall(
         });
     }
 
-    let raw = qmd::search(&paths.qmd_bin, collection_name, query)?;
+    // Timezone-aware query pre-processing (Lilac)
+    // Basic heuristic: append UTC version if query contains a time-like pattern
+    let mut enhanced_query = query.to_string();
+    if query.contains(':') || query.to_lowercase().contains("am") || query.to_lowercase().contains("pm") {
+        use chrono::Local;
+        let offset = Local::now().offset().to_string();
+        enhanced_query.push_str(&format!(" UTC {}", offset));
+    }
+
+    let raw = qmd::search(&paths.qmd_bin, collection_name, &enhanced_query)?;
     matches.extend(parse_matches(&raw));
 
     let mut deduped = Vec::with_capacity(matches.len());
@@ -171,6 +216,6 @@ pub fn recall(
     Ok(RecallResult {
         query: query.to_string(),
         matches: deduped,
-        generated_at_epoch_secs: now_secs()?,
+        generated_at_epoch_secs: now_epoch_secs()?,
     })
 }

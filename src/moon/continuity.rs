@@ -1,10 +1,10 @@
 use crate::moon::paths::MoonPaths;
+use crate::moon::util::now_epoch_secs;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContinuityMap {
@@ -23,12 +23,7 @@ pub struct ContinuityOutcome {
     pub rollover_ok: bool,
 }
 
-fn now_secs() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX_EPOCH")?
-        .as_secs())
-}
+
 
 fn try_rollover() -> Result<String> {
     let enabled = std::env::var("MOON_ENABLE_SESSION_ROLLOVER")
@@ -62,7 +57,7 @@ fn try_rollover() -> Result<String> {
         {
             return Ok(id.to_string());
         }
-        return Ok(format!("external-{}", now_secs()?));
+        return Ok(format!("external-{}", now_epoch_secs()?));
     }
 
     let out = Command::new("openclaw")
@@ -76,7 +71,7 @@ fn try_rollover() -> Result<String> {
             {
                 return Ok(id.to_string());
             }
-            Ok(format!("openclaw-{}", now_secs()?))
+            Ok(format!("openclaw-{}", now_epoch_secs()?))
         }
         Ok(o) => anyhow::bail!(
             "openclaw session rollover failed: {}",
@@ -93,7 +88,7 @@ pub fn build_continuity(
     daily_memory_ref: &str,
     key_decisions: Vec<String>,
 ) -> Result<ContinuityOutcome> {
-    let ts = now_secs()?;
+    let ts = now_epoch_secs()?;
     let (target_session_id, rollover_ok) = match try_rollover() {
         Ok(id) => (id, true),
         Err(_) => (format!("pending-{}", ts), false),

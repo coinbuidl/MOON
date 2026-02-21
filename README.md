@@ -22,7 +22,13 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
 
 1.  **Automated Lifecycle Watcher**: Monitors OpenClaw session and context size in real-time. Upon reaching defined thresholds, it triggers archiving, indexing, and compaction to prevent prompt overflow and minimize API costs.
     * During compaction, Moon writes a deterministic `[MOON_ARCHIVE_INDEX]` note into the active session so agents can locate pre-compaction archives.
-2.  **Semantic Context Retrieval**: Moon writes a clean markdown projection (`archives/raw/*.md`) for each raw session archive (`archives/raw/*.jsonl`) and lets QMD index the markdown projection for higher-signal recall.
+2.  **Semantic Context Retrieval**: Moon writes a structured v2 markdown projection (`archives/raw/*.md`) for each raw session archive (`archives/raw/*.jsonl`). Projections include:
+    * Timeline table with UTC + local timestamps
+    * Conversation summaries (user queries / assistant responses)
+    * Tool activity with contextual stitching (toolUse → toolResult coupling)
+    * Keywords, topics, and compaction anchors
+    * Natural language time markers for improved semantic recall
+    * Side-effect priority classification for tool entries
 3.  **Tiered Distillation Pipeline**:
     *   **Phase 1 (Raw Distillation)**: Automatically distills archive projection markdown (`archives/raw/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
     *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
@@ -189,7 +195,8 @@ Commands:
 5. `post-upgrade`
 6. `moon-status`
 7. `moon-snapshot [--source <path>] [--dry-run]`
-8. `moon-index [--name <collection>] [--dry-run]`
+8. `moon-index [--name <collection>] [--dry-run] [--reproject]`
+   - `--reproject`: regenerate all projection markdown files using the v2 structured format
 9. `moon-watch [--once|--daemon]`
 10. `moon-recall --query <text> [--name <collection>]`
 11. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
@@ -285,9 +292,11 @@ Most-used variables:
 2. `src/commands/*.rs`: top-level command handlers
 3. `src/openclaw/*.rs`: OpenClaw config/plugin/gateway operations
 4. `src/moon/*.rs`: snapshot/index/recall/distill/watch logic
+   - `src/moon/util.rs`: shared utilities (`now_epoch_secs`, `truncate_with_ellipsis`)
 5. `assets/plugin/*`: plugin files embedded and installed by `install`
 6. `tests/*.rs`: regression tests
 7. `docs/*`: deeper operational docs
+8. `audit_report.md`: latest code audit findings and fixes
 
 ## Detailed docs
 

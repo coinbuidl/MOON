@@ -1,8 +1,8 @@
 use crate::moon::paths::MoonPaths;
+use crate::moon::util::now_epoch_secs;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEvent {
@@ -12,18 +12,13 @@ pub struct AuditEvent {
     pub message: String,
 }
 
-fn now_secs() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX_EPOCH")?
-        .as_secs())
-}
+
 
 pub fn append_event(paths: &MoonPaths, phase: &str, status: &str, message: &str) -> Result<()> {
     fs::create_dir_all(&paths.logs_dir)
         .with_context(|| format!("failed to create {}", paths.logs_dir.display()))?;
     let event = AuditEvent {
-        at_epoch_secs: now_secs()?,
+        at_epoch_secs: now_epoch_secs()?,
         phase: phase.to_string(),
         status: status.to_string(),
         message: message.to_string(),
