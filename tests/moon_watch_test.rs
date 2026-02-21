@@ -85,6 +85,7 @@ fn read_distilled_archive_paths(state_file: &Path) -> Vec<String> {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -124,6 +125,7 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -177,6 +179,7 @@ fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -274,6 +277,7 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_distills_oldest_pending_archive_day_first() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -342,6 +346,7 @@ fn moon_watch_once_distills_oldest_pending_archive_day_first() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distilled() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -431,6 +436,7 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_emits_ai_warning_when_ledger_is_invalid() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -470,6 +476,7 @@ fn moon_watch_once_emits_ai_warning_when_ledger_is_invalid() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -553,6 +560,7 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");

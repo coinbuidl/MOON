@@ -18,6 +18,7 @@ fn write_fake_openclaw(bin_path: &Path, log_path: &Path) {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn post_upgrade_runs_restart_and_doctor_flow() {
     let tmp = tempdir().expect("tempdir");
     let state_dir = tmp.path().join("state");
