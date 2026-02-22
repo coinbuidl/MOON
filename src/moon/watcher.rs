@@ -22,7 +22,8 @@ use crate::moon::thresholds::{TriggerKind, evaluate};
 use crate::moon::warn::{self, WarnEvent};
 use crate::openclaw::gateway;
 use anyhow::{Context, Result};
-use chrono::{Local, TimeZone};
+use chrono::{Local, TimeZone, Utc};
+use chrono_tz::Tz;
 use fs2::FileExt;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,6 +42,7 @@ const MAX_HIGH_TOKEN_ALERT_SESSIONS: usize = 5;
 enum DistillTriggerMode {
     Manual,
     Idle,
+    Daily,
 }
 
 impl DistillTriggerMode {
@@ -48,10 +50,17 @@ impl DistillTriggerMode {
         // Reserved for future trigger extensions (for example archive_event).
         if raw.eq_ignore_ascii_case("idle") {
             Self::Idle
+        } else if raw.eq_ignore_ascii_case("daily") {
+            Self::Daily
         } else {
             Self::Manual
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WatchRunOptions {
+    pub force_distill_now: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,13 +68,10 @@ pub struct WatchCycleOutcome {
     pub state_file: String,
     pub heartbeat_epoch_secs: u64,
     pub poll_interval_secs: u64,
-    pub archive_threshold: f64,
-    pub archive_trigger_enabled: bool,
-    pub compaction_threshold: f64,
+    pub trigger_threshold: f64,
     pub distill_mode: String,
     pub distill_idle_secs: u64,
     pub distill_max_per_cycle: u64,
-    pub distill_archive_grace_hours: u64,
     pub retention_active_days: u64,
     pub retention_warm_days: u64,
     pub retention_cold_days: u64,
@@ -79,10 +85,42 @@ pub struct WatchCycleOutcome {
     pub archive_retention_result: Option<String>,
 }
 
+type DistillCandidate = (crate::moon::archive::ArchiveRecord, String);
+type DistillSelection = (Vec<DistillCandidate>, Vec<String>);
+
+fn residential_tz_name(cfg: &crate::moon::config::MoonConfig) -> String {
+    let name = cfg.distill.residential_timezone.trim();
+    if name.is_empty() {
+        "UTC".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn parse_residential_tz(cfg: &crate::moon::config::MoonConfig) -> Tz {
+    residential_tz_name(cfg)
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::UTC)
+}
+
+fn day_key_for_epoch_in_timezone(epoch_secs: u64, tz: Tz) -> String {
+    let dt = tz
+        .timestamp_opt(epoch_secs as i64, 0)
+        .single()
+        .unwrap_or_else(|| tz.from_utc_datetime(&Utc::now().naive_utc()));
+    dt.format("%Y-%m-%d").to_string()
+}
+
 fn run_archive_if_needed(
     paths: &crate::moon::paths::MoonPaths,
     trigger_set: &[TriggerKind],
+    compaction_targets_present: bool,
 ) -> Result<Option<ArchivePipelineOutcome>> {
+    // Compaction path already archives each target source before compacting.
+    if compaction_targets_present {
+        return Ok(None);
+    }
+
     let needs_archive = trigger_set
         .iter()
         .any(|t| matches!(t, TriggerKind::Archive));
@@ -106,6 +144,17 @@ fn is_cooldown_ready(last_epoch: Option<u64>, now_epoch: u64, cooldown_secs: u64
     match last_epoch {
         None => true,
         Some(last) => now_epoch.saturating_sub(last) >= cooldown_secs,
+    }
+}
+
+fn unified_layer1_last_trigger_epoch(state: &crate::moon::state::MoonState) -> Option<u64> {
+    match (
+        state.last_archive_trigger_epoch_secs,
+        state.last_compaction_trigger_epoch_secs,
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
     }
 }
 
@@ -189,7 +238,55 @@ fn resolve_distill_source_path(record: &crate::moon::archive::ArchiveRecord) -> 
         return Some(fallback);
     }
 
+    let legacy = Path::new(&record.archive_path).with_extension("md");
+    if legacy.exists() {
+        return Some(legacy);
+    }
+
     None
+}
+
+fn is_distillable_archive_record(record: &crate::moon::archive::ArchiveRecord) -> bool {
+    let source_path = Path::new(&record.source_path);
+    let archive_path = Path::new(&record.archive_path);
+
+    let source_file = source_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let archive_file = archive_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let source_ext = source_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let archive_ext = archive_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    // `sessions.json` snapshots and lock artifacts are metadata/noise, not conversation history.
+    if source_file == "sessions.json" {
+        return false;
+    }
+    if source_ext == "lock"
+        || archive_ext == "lock"
+        || source_file.ends_with(".lock")
+        || archive_file.ends_with(".lock")
+    {
+        return false;
+    }
+    if archive_ext == "json" && archive_file.starts_with("sessions-") {
+        return false;
+    }
+
+    true
 }
 
 fn cleanup_expired_distilled_archives(
@@ -386,6 +483,95 @@ fn day_key_for_epoch(epoch_secs: u64) -> String {
         .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
+fn select_pending_distill_candidates(
+    paths: &crate::moon::paths::MoonPaths,
+    state: &crate::moon::state::MoonState,
+    max_per_cycle: u64,
+    distill_chunk_trigger_bytes: u64,
+) -> Result<DistillSelection> {
+    let mut notes = Vec::new();
+    let mut distill_candidates = Vec::<(crate::moon::archive::ArchiveRecord, String)>::new();
+
+    let mut ledger = read_ledger_records(paths)?;
+    if ledger.is_empty() {
+        notes.push("skipped reason=no-archives".to_string());
+        return Ok((distill_candidates, notes));
+    }
+
+    ledger.sort_by_key(|r| r.created_at_epoch_secs);
+    let mut pending = Vec::new();
+    let mut skipped_non_distillable = 0usize;
+    for record in ledger {
+        if !record.indexed
+            || state.distilled_archives.contains_key(&record.archive_path)
+            || !Path::new(&record.archive_path).exists()
+        {
+            continue;
+        }
+
+        if !is_distillable_archive_record(&record) {
+            skipped_non_distillable = skipped_non_distillable.saturating_add(1);
+            continue;
+        }
+
+        let Some(distill_source_path) = resolve_distill_source_path(&record) else {
+            warn::emit(WarnEvent {
+                code: "DISTILL_SOURCE_MISSING",
+                stage: "distill-selection",
+                action: "resolve-distill-source",
+                session: &record.session_id,
+                archive: &record.archive_path,
+                source: &record.source_path,
+                retry: "retry-next-cycle",
+                reason: "projection-md-missing",
+                err: "projection-md-not-found",
+            });
+            continue;
+        };
+        pending.push((record, distill_source_path.display().to_string()));
+    }
+
+    if pending.is_empty() {
+        notes.push("skipped reason=no-undistilled-archives".to_string());
+        if skipped_non_distillable > 0 {
+            notes.push(format!(
+                "skipped_non_distillable_archives={}",
+                skipped_non_distillable
+            ));
+        }
+        return Ok((distill_candidates, notes));
+    }
+
+    if let Some((first_pending, _)) = pending.first() {
+        let day_key = day_key_for_epoch(first_pending.created_at_epoch_secs);
+        for (record, distill_source_path) in pending {
+            if day_key_for_epoch(record.created_at_epoch_secs) != day_key {
+                continue;
+            }
+            distill_candidates.push((record, distill_source_path));
+            if distill_candidates.len() >= max_per_cycle as usize {
+                break;
+            }
+        }
+        notes.push(format!(
+            "selected_day={} selected={} chunk_trigger_bytes={} oversized_archives=chunked",
+            day_key,
+            distill_candidates.len(),
+            distill_chunk_trigger_bytes
+        ));
+        if skipped_non_distillable > 0 {
+            notes.push(format!(
+                "skipped_non_distillable_archives={}",
+                skipped_non_distillable
+            ));
+        }
+    } else {
+        notes.push("skipped reason=no-undistilled-archives".to_string());
+    }
+
+    Ok((distill_candidates, notes))
+}
+
 fn acquire_daemon_lock() -> Result<File> {
     let paths = resolve_paths()?;
     fs::create_dir_all(&paths.logs_dir)
@@ -453,6 +639,10 @@ fn extract_key_decisions(summary: &str) -> Vec<String> {
 }
 
 pub fn run_once() -> Result<WatchCycleOutcome> {
+    run_once_with_options(WatchRunOptions::default())
+}
+
+pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutcome> {
     let paths = resolve_paths()?;
     let cfg = load_config()?;
     let mut state = load(&paths)?;
@@ -531,13 +721,14 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     let mut continuity_out = None;
     let mut archive_retention_result = None;
     let compaction_cooldown_ready = is_cooldown_ready(
-        state.last_compaction_trigger_epoch_secs,
+        unified_layer1_last_trigger_epoch(&state),
         usage.captured_at_epoch_secs,
         cfg.watcher.cooldown_secs,
     );
 
     let mut compaction_targets = Vec::<SessionUsageSnapshot>::new();
     let mut compaction_notes = Vec::<String>::new();
+    let mut compaction_has_archivable_targets = false;
 
     if let Some(note) = usage_batch_note {
         compaction_notes.push(note);
@@ -550,16 +741,16 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                 .iter()
                 .filter(|s| {
                     is_compaction_channel_session(&s.session_id)
-                        && s.usage_ratio >= cfg.thresholds.compaction_ratio
+                        && s.usage_ratio >= cfg.thresholds.trigger_ratio
                 })
                 .cloned()
                 .collect();
-        } else if usage.usage_ratio >= cfg.thresholds.compaction_ratio
+        } else if usage.usage_ratio >= cfg.thresholds.trigger_ratio
             && is_compaction_channel_session(&usage.session_id)
         {
             compaction_targets.push(usage.clone());
         }
-    } else if usage.usage_ratio >= cfg.thresholds.compaction_ratio
+    } else if usage.usage_ratio >= cfg.thresholds.trigger_ratio
         && is_compaction_channel_session(&usage.session_id)
     {
         compaction_targets.push(usage.clone());
@@ -568,7 +759,12 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     let mut compaction_source_map = BTreeMap::new();
     if !compaction_targets.is_empty() {
         match load_session_source_map(&paths.openclaw_sessions_dir) {
-            Ok(map) => compaction_source_map = map,
+            Ok(map) => {
+                compaction_source_map = map;
+                compaction_has_archivable_targets = compaction_targets
+                    .iter()
+                    .any(|target| compaction_source_map.contains_key(&target.session_id));
+            }
             Err(err) => compaction_notes.push(format!("source_map failed: {err:#}")),
         }
     }
@@ -604,8 +800,11 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
         )?;
     }
 
-    if let Some(archive) = run_archive_if_needed(&paths, &triggers)? {
+    if let Some(archive) =
+        run_archive_if_needed(&paths, &triggers, compaction_has_archivable_targets)?
+    {
         state.last_archive_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
+        let filtered_noise_count = archive.record.projection_filtered_noise_count.unwrap_or(0);
         audit::append_event(
             &paths,
             "archive",
@@ -615,8 +814,11 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                 "degraded"
             },
             &format!(
-                "archive={} indexed={} deduped={}",
-                archive.record.archive_path, archive.record.indexed, archive.deduped
+                "archive={} indexed={} deduped={} filtered_noise_count={}",
+                archive.record.archive_path,
+                archive.record.indexed,
+                archive.deduped,
+                filtered_noise_count
             ),
         )?;
         archive_out = Some(archive);
@@ -632,6 +834,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
         compaction_result = Some(skip_note);
     } else if !compaction_targets.is_empty() {
         state.last_compaction_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
+        state.last_archive_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
         let mut outcomes = Vec::new();
         let mut failed = 0usize;
         let mut succeeded = 0usize;
@@ -671,12 +874,13 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                     "degraded"
                 },
                 &format!(
-                    "scope=pre-compaction key={} source={} archive={} indexed={} deduped={}",
+                    "scope=pre-compaction key={} source={} archive={} indexed={} deduped={} filtered_noise_count={}",
                     target.session_id,
                     archived.record.source_path,
                     archived.record.archive_path,
                     archived.record.indexed,
-                    archived.deduped
+                    archived.deduped,
+                    archived.record.projection_filtered_noise_count.unwrap_or(0)
                 ),
             )?;
 
@@ -815,7 +1019,45 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
     let distill_chunk_trigger_bytes = distill_chunk_bytes() as u64;
 
     let distill_trigger_mode = DistillTriggerMode::from_config_mode(&cfg.distill.mode);
-    if matches!(distill_trigger_mode, DistillTriggerMode::Idle) {
+    let residential_tz = parse_residential_tz(&cfg);
+    let current_day_key =
+        day_key_for_epoch_in_timezone(usage.captured_at_epoch_secs, residential_tz);
+    let last_distill_day_key = state
+        .last_distill_trigger_epoch_secs
+        .map(|epoch| day_key_for_epoch_in_timezone(epoch, residential_tz));
+
+    if run_opts.force_distill_now {
+        if !compaction_targets.is_empty() {
+            distill_notes.push("skipped reason=compaction-active".to_string());
+        } else {
+            distill_notes.push("manual_trigger=true".to_string());
+            match select_pending_distill_candidates(
+                &paths,
+                &state,
+                cfg.distill.max_per_cycle,
+                distill_chunk_trigger_bytes,
+            ) {
+                Ok((candidates, notes)) => {
+                    distill_candidates = candidates;
+                    distill_notes.extend(notes);
+                }
+                Err(err) => {
+                    warn::emit(WarnEvent {
+                        code: "LEDGER_READ_FAILED",
+                        stage: "distill-selection",
+                        action: "read-ledger",
+                        session: "na",
+                        archive: "na",
+                        source: "na",
+                        retry: "retry-next-cycle",
+                        reason: "ledger-read-failed",
+                        err: &format!("{err:#}"),
+                    });
+                    distill_notes.push(format!("skipped reason=ledger-read-failed error={err:#}"))
+                }
+            }
+        }
+    } else if matches!(distill_trigger_mode, DistillTriggerMode::Idle) {
         if !compaction_targets.is_empty() {
             distill_notes.push("skipped reason=compaction-active".to_string());
         } else if !is_cooldown_ready(
@@ -829,7 +1071,7 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
             ));
         } else {
             match read_ledger_records(&paths) {
-                Ok(mut ledger) => {
+                Ok(ledger) => {
                     if ledger.is_empty() {
                         distill_notes.push("skipped reason=no-archives".to_string());
                     } else {
@@ -847,61 +1089,126 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
                                 idle_for, cfg.distill.idle_secs
                             ));
                         } else {
-                            ledger.sort_by_key(|r| r.created_at_epoch_secs);
-                            let mut pending = Vec::new();
-                            for record in ledger {
-                                if !record.indexed
-                                    || state.distilled_archives.contains_key(&record.archive_path)
-                                    || !Path::new(&record.archive_path).exists()
-                                {
-                                    continue;
+                            match select_pending_distill_candidates(
+                                &paths,
+                                &state,
+                                cfg.distill.max_per_cycle,
+                                distill_chunk_trigger_bytes,
+                            ) {
+                                Ok((candidates, notes)) => {
+                                    distill_candidates = candidates;
+                                    distill_notes.extend(notes);
                                 }
-
-                                let Some(distill_source_path) =
-                                    resolve_distill_source_path(&record)
-                                else {
+                                Err(err) => {
                                     warn::emit(WarnEvent {
-                                        code: "DISTILL_SOURCE_MISSING",
+                                        code: "LEDGER_READ_FAILED",
                                         stage: "distill-selection",
-                                        action: "resolve-distill-source",
-                                        session: &record.session_id,
-                                        archive: &record.archive_path,
-                                        source: &record.source_path,
+                                        action: "read-ledger",
+                                        session: "na",
+                                        archive: "na",
+                                        source: "na",
                                         retry: "retry-next-cycle",
-                                        reason: "projection-md-missing",
-                                        err: "projection-md-not-found",
+                                        reason: "ledger-read-failed",
+                                        err: &format!("{err:#}"),
                                     });
-                                    continue;
-                                };
-                                pending.push((record, distill_source_path.display().to_string()));
-                            }
-
-                            if pending.is_empty() {
-                                distill_notes
-                                    .push("skipped reason=no-undistilled-archives".to_string());
-                            } else if let Some((first_pending, _)) = pending.first() {
-                                let day_key =
-                                    day_key_for_epoch(first_pending.created_at_epoch_secs);
-                                for (record, distill_source_path) in pending {
-                                    if day_key_for_epoch(record.created_at_epoch_secs) != day_key {
-                                        continue;
-                                    }
-                                    distill_candidates.push((record, distill_source_path));
-                                    if distill_candidates.len()
-                                        >= cfg.distill.max_per_cycle as usize
-                                    {
-                                        break;
-                                    }
+                                    distill_notes.push(format!(
+                                        "skipped reason=ledger-read-failed error={err:#}"
+                                    ));
                                 }
-                                distill_notes.push(format!(
-                                    "selected_day={} selected={} chunk_trigger_bytes={} oversized_archives=chunked",
-                                    day_key,
-                                    distill_candidates.len(),
-                                    distill_chunk_trigger_bytes
-                                ));
-                            } else {
-                                distill_notes
-                                    .push("skipped reason=no-undistilled-archives".to_string());
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn::emit(WarnEvent {
+                        code: "LEDGER_READ_FAILED",
+                        stage: "distill-selection",
+                        action: "read-ledger",
+                        session: "na",
+                        archive: "na",
+                        source: "na",
+                        retry: "retry-next-cycle",
+                        reason: "ledger-read-failed",
+                        err: &format!("{err:#}"),
+                    });
+                    distill_notes.push(format!("skipped reason=ledger-read-failed error={err:#}"))
+                }
+            }
+        }
+    } else if matches!(distill_trigger_mode, DistillTriggerMode::Daily) {
+        if !compaction_targets.is_empty() {
+            distill_notes.push("skipped reason=compaction-active".to_string());
+        } else if last_distill_day_key.as_deref() == Some(current_day_key.as_str()) {
+            distill_notes.push(format!(
+                "skipped reason=already-attempted-today day_key={} timezone={}",
+                current_day_key,
+                residential_tz_name(&cfg)
+            ));
+        } else {
+            match read_ledger_records(&paths) {
+                Ok(ledger) => {
+                    if ledger.is_empty() {
+                        // Count this as today's daily attempt to avoid repeated no-op cycles.
+                        state.last_distill_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
+                        distill_notes.push(format!(
+                            "skipped reason=no-archives day_key={} timezone={}",
+                            current_day_key,
+                            residential_tz_name(&cfg)
+                        ));
+                    } else {
+                        let latest_archive_epoch = ledger
+                            .iter()
+                            .map(|r| r.created_at_epoch_secs)
+                            .max()
+                            .unwrap_or(0);
+                        let idle_for = usage
+                            .captured_at_epoch_secs
+                            .saturating_sub(latest_archive_epoch);
+                        if idle_for < cfg.distill.idle_secs {
+                            distill_notes.push(format!(
+                                "skipped reason=not-idle day_key={} timezone={} idle_for_secs={} idle_required_secs={}",
+                                current_day_key,
+                                residential_tz_name(&cfg),
+                                idle_for,
+                                cfg.distill.idle_secs
+                            ));
+                        } else {
+                            distill_notes.push(format!(
+                                "daily_trigger day_key={} timezone={} idle_for_secs={} idle_required_secs={}",
+                                current_day_key,
+                                residential_tz_name(&cfg),
+                                idle_for,
+                                cfg.distill.idle_secs
+                            ));
+                            // Daily mode is once per residential day after idle guard.
+                            state.last_distill_trigger_epoch_secs =
+                                Some(usage.captured_at_epoch_secs);
+                            match select_pending_distill_candidates(
+                                &paths,
+                                &state,
+                                cfg.distill.max_per_cycle,
+                                distill_chunk_trigger_bytes,
+                            ) {
+                                Ok((candidates, notes)) => {
+                                    distill_candidates = candidates;
+                                    distill_notes.extend(notes);
+                                }
+                                Err(err) => {
+                                    warn::emit(WarnEvent {
+                                        code: "LEDGER_READ_FAILED",
+                                        stage: "distill-selection",
+                                        action: "read-ledger",
+                                        session: "na",
+                                        archive: "na",
+                                        source: "na",
+                                        retry: "retry-next-cycle",
+                                        reason: "ledger-read-failed",
+                                        err: &format!("{err:#}"),
+                                    });
+                                    distill_notes.push(format!(
+                                        "skipped reason=ledger-read-failed error={err:#}"
+                                    ))
+                                }
                             }
                         }
                     }
@@ -1238,13 +1545,10 @@ pub fn run_once() -> Result<WatchCycleOutcome> {
         state_file: file.display().to_string(),
         heartbeat_epoch_secs: state.last_heartbeat_epoch_secs,
         poll_interval_secs: cfg.watcher.poll_interval_secs,
-        archive_threshold: cfg.thresholds.archive_ratio,
-        archive_trigger_enabled: cfg.thresholds.archive_ratio_trigger_enabled,
-        compaction_threshold: cfg.thresholds.compaction_ratio,
+        trigger_threshold: cfg.thresholds.trigger_ratio,
         distill_mode: cfg.distill.mode.clone(),
         distill_idle_secs: cfg.distill.idle_secs,
         distill_max_per_cycle: cfg.distill.max_per_cycle,
-        distill_archive_grace_hours: cfg.distill.archive_grace_hours,
         retention_active_days: cfg.retention.active_days,
         retention_warm_days: cfg.retention.warm_days,
         retention_cold_days: cfg.retention.cold_days,
@@ -1263,7 +1567,7 @@ pub fn run_daemon() -> Result<()> {
     let _daemon_lock = acquire_daemon_lock()?;
     let mut consecutive_failures = 0u32;
     loop {
-        match run_once() {
+        match run_once_with_options(WatchRunOptions::default()) {
             Ok(cycle) => {
                 consecutive_failures = 0;
                 let sleep_for = Duration::from_secs(cycle.poll_interval_secs.max(1));

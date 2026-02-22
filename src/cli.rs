@@ -76,6 +76,8 @@ pub struct MoonWatchArgs {
     pub once: bool,
     #[arg(long)]
     pub daemon: bool,
+    #[arg(long)]
+    pub distill_now: bool,
 }
 
 #[derive(Debug, Args)]
@@ -156,6 +158,7 @@ pub fn run() -> Result<()> {
             commands::moon_watch::run(&commands::moon_watch::MoonWatchOptions {
                 once: args.once,
                 daemon: args.daemon,
+                distill_now: args.distill_now,
             })?
         }
         Command::MoonRecall(args) => {

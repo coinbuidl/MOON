@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const ARCHIVE_COLLECTION_MASK: &str = "**/*.md";
+const ARCHIVE_COLLECTION_MASK: &str = "mlib/**/*.md";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionSyncResult {

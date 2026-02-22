@@ -12,8 +12,6 @@ pub struct AuditEvent {
     pub message: String,
 }
 
-
-
 pub fn append_event(paths: &MoonPaths, phase: &str, status: &str, message: &str) -> Result<()> {
     fs::create_dir_all(&paths.logs_dir)
         .with_context(|| format!("failed to create {}", paths.logs_dir.display()))?;

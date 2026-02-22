@@ -10,6 +10,32 @@ pub struct SnapshotOutcome {
     pub bytes: usize,
 }
 
+fn is_session_snapshot_candidate(path: &Path) -> bool {
+    let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+
+    let lower_name = file_name.to_ascii_lowercase();
+    if lower_name.ends_with(".lock")
+        || lower_name.ends_with(".tmp")
+        || lower_name.ends_with(".swp")
+        || lower_name.ends_with(".part")
+    {
+        return false;
+    }
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    match ext.as_deref() {
+        Some("jsonl") => true,
+        Some("json") => lower_name != "sessions.json",
+        _ => false,
+    }
+}
+
 fn sanitize_slug(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut prev_dash = false;
@@ -43,6 +69,9 @@ pub fn latest_session_file(dir: &Path) -> Result<Option<PathBuf>> {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
+            continue;
+        }
+        if !is_session_snapshot_candidate(&path) {
             continue;
         }
         let meta = entry.metadata()?;
@@ -98,12 +127,33 @@ pub fn write_snapshot(archives_dir: &Path, source_path: &Path) -> Result<Snapsho
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_slug;
+    use super::{is_session_snapshot_candidate, sanitize_slug};
+    use std::path::Path;
 
     #[test]
     fn slug_sanitization_is_stable() {
         assert_eq!(sanitize_slug("Main Session #1"), "main-session-1");
         assert_eq!(sanitize_slug("---"), "");
         assert_eq!(sanitize_slug("abc___def"), "abc-def");
+    }
+
+    #[test]
+    fn snapshot_candidate_filter_excludes_non_session_files() {
+        assert!(is_session_snapshot_candidate(Path::new(
+            "/tmp/abc-123.jsonl"
+        )));
+        assert!(is_session_snapshot_candidate(Path::new(
+            "/tmp/abc-123.json"
+        )));
+        assert!(!is_session_snapshot_candidate(Path::new(
+            "/tmp/sessions.json"
+        )));
+        assert!(!is_session_snapshot_candidate(Path::new(
+            "/tmp/abc-123.jsonl.lock"
+        )));
+        assert!(!is_session_snapshot_candidate(Path::new(
+            "/tmp/abc-123.lock"
+        )));
+        assert!(!is_session_snapshot_candidate(Path::new("/tmp/abc-123.md")));
     }
 }

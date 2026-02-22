@@ -14,8 +14,6 @@ pub struct ChannelArchiveRecord {
     pub updated_at_epoch_secs: u64,
 }
 
-
-
 pub fn map_path(paths: &MoonPaths) -> PathBuf {
     paths
         .moon_home

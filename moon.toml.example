@@ -1,7 +1,5 @@
 [thresholds]
-archive_ratio = 0.80
-archive_ratio_trigger_enabled = true
-compaction_ratio = 0.85
+trigger_ratio = 1.0
 
 [watcher]
 poll_interval_secs = 30
@@ -11,7 +9,7 @@ cooldown_secs = 300
 mode = "idle"
 idle_secs = 360
 max_per_cycle = 1
-archive_grace_hours = 60
+residential_timezone = "UTC"
 
 [retention]
 active_days = 7

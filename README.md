@@ -22,15 +22,17 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
 
 1.  **Automated Lifecycle Watcher**: Monitors OpenClaw session and context size in real-time. Upon reaching defined thresholds, it triggers archiving, indexing, and compaction to prevent prompt overflow and minimize API costs.
     * During compaction, Moon writes a deterministic `[MOON_ARCHIVE_INDEX]` note into the active session so agents can locate pre-compaction archives.
-2.  **Semantic Context Retrieval**: Moon writes a structured v2 markdown projection (`archives/raw/*.md`) for each raw session archive (`archives/raw/*.jsonl`). Projections include:
+2.  **Semantic Context Retrieval**: Moon writes a structured v2 markdown projection (`archives/mlib/*.md`) for each raw session archive (`archives/raw/*.jsonl`). Projections include:
     * Timeline table with UTC + local timestamps
     * Conversation summaries (user queries / assistant responses)
     * Tool activity with contextual stitching (toolUse → toolResult coupling)
+    * Pre-emptive noise filtering (`NO_REPLY`, process poll chatter, repetitive status echoes)
     * Keywords, topics, and compaction anchors
     * Natural language time markers for improved semantic recall
     * Side-effect priority classification for tool entries
 3.  **Tiered Distillation Pipeline**:
-    *   **Phase 1 (Raw Distillation)**: Automatically distills archive projection markdown (`archives/raw/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
+    *   **Phase 1 (Raw Distillation)**: Automatically distills archive projection markdown (`archives/mlib/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
+    *   **Librarian Optimizations**: semantic de-duplication keeps final-state conclusions, and optional topic discovery (`MOON_TOPIC_DISCOVERY=true`) maintains a top-of-file entity anchor block in each daily memory file.
     *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
 
 ## Recommended Agent Integration
@@ -49,7 +51,7 @@ Add this block to your workspace `AGENTS.md` (adjust the repo path if different)
 ```md
 ### MOON Archive Recall Policy (Required)
 
-1. History search backend is QMD collection `history`, rooted at `~/.lilac_metaflora/archives`, mask `**/*.md` (archive projections in `~/.lilac_metaflora/archives/raw/*.md`).
+1. History search backend is QMD collection `history`, rooted at `~/.lilac_metaflora/archives`, mask `mlib/**/*.md` (archive projections in `~/.lilac_metaflora/archives/mlib/*.md`).
 2. Default history retrieval command is `cargo run --manifest-path /Users/lilac/.lilac_metaflora/skills/moon-system/Cargo.toml -- moon-recall --name history --query "<user-intent-query>"`.
 3. Run history retrieval before answering when any condition is true: user references past sessions, pre-compaction context, prior decisions, or current-session context is insufficient.
 4. Retrieval procedure is strict: run one primary query, run one fallback query if no hits, and use top 3 hits only; include `archive_path` in reasoning when available.
@@ -128,11 +130,15 @@ Distill safety guardrails (recommended):
 ```bash
 # Distill trigger behavior:
 # - mode=idle: run distill after no new archives for idle_secs.
+# - mode=daily: run layer-2 distill once per residential day after idle_secs (timezone below).
+# - mode=manual: disable auto layer-2 distill; trigger with `moon-watch --once --distill-now`.
 # - recommended idle window for active OpenClaw usage: 360 seconds (6 minutes).
 MOON_DISTILL_MODE=idle
 MOON_DISTILL_IDLE_SECS=360
 # During validation start with 1 and raise after stable runs.
 MOON_DISTILL_MAX_PER_CYCLE=1
+MOON_RESIDENTIAL_TIMEZONE=UTC
+MOON_TOPIC_DISCOVERY=true
 
 # Retention windows (days)
 MOON_RETENTION_ACTIVE_DAYS=7
@@ -197,7 +203,7 @@ Commands:
 7. `moon-snapshot [--source <path>] [--dry-run]`
 8. `moon-index [--name <collection>] [--dry-run] [--reproject]`
    - `--reproject`: regenerate all projection markdown files using the v2 structured format
-9. `moon-watch [--once|--daemon]`
+9. `moon-watch [--once|--daemon] [--distill-now]`
 10. `moon-recall --query <text> [--name <collection>]`
 11. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
     - default: archives larger than `MOON_DISTILL_CHUNK_BYTES` are auto-distilled in chunks
@@ -245,6 +251,13 @@ Idle distill selection order:
 3. It distills projection markdown sidecars (`*.md`) for those archives, not raw `*.jsonl`.
 4. It processes up to `max_per_cycle` archives from that day.
 
+Daily distill selection order:
+
+1. In `MOON_DISTILL_MODE=daily`, distill attempts once per residential day (`MOON_RESIDENTIAL_TIMEZONE`) after the latest archive is idle for `MOON_DISTILL_IDLE_SECS`.
+2. It selects the oldest pending archive day first.
+3. It distills projection markdown sidecars (`*.md`) for those archives.
+4. Use `moon-watch --once --distill-now` for manual immediate layer-2 runs.
+
 Retention lifecycle windows:
 
 1. Active (`<= active_days`): keep archives for fast debug/resume.
@@ -255,7 +268,7 @@ Archive layout:
 
 1. `archives/ledger.jsonl`: archive ledger metadata.
 2. `archives/raw/*.jsonl`: raw snapshot copy (full fidelity).
-3. `archives/raw/*.md`: noise-reduced projection indexed by QMD.
+3. `archives/mlib/*.md`: noise-reduced projection indexed by QMD.
 
 ## Configuration
 
@@ -279,12 +292,17 @@ Most-used variables:
 9. `MOON_DISTILL_MAX_CHUNKS` (default `128`)
 10. `MOON_DISTILL_MODEL_CONTEXT_TOKENS` (optional context hint used by `MOON_DISTILL_CHUNK_BYTES=auto`)
 11. `MOON_HIGH_TOKEN_ALERT_THRESHOLD` (default `1000000`; set `0` to disable)
-12. `MOON_THRESHOLD_ARCHIVE_RATIO`
-13. `MOON_THRESHOLD_COMPACTION_RATIO`
-14. `MOON_POLL_INTERVAL_SECS`
-15. `MOON_COOLDOWN_SECS`
-16. `MOON_INBOUND_WATCH_PATHS`
-17. `MOON_RETENTION_ACTIVE_DAYS` / `MOON_RETENTION_WARM_DAYS` / `MOON_RETENTION_COLD_DAYS`
+12. `MOON_TRIGGER_RATIO`
+13. `MOON_POLL_INTERVAL_SECS`
+14. `MOON_COOLDOWN_SECS`
+15. `MOON_RESIDENTIAL_TIMEZONE`
+16. `MOON_TOPIC_DISCOVERY`
+17. `MOON_INBOUND_WATCH_PATHS`
+18. `MOON_RETENTION_ACTIVE_DAYS` / `MOON_RETENTION_WARM_DAYS` / `MOON_RETENTION_COLD_DAYS`
+
+Legacy compatibility: `MOON_THRESHOLD_COMPACTION_RATIO`,
+`MOON_THRESHOLD_ARCHIVE_RATIO`, and `MOON_THRESHOLD_PRUNE_RATIO` are still read
+as fallback inputs for `MOON_TRIGGER_RATIO`.
 
 ## Repository map
 

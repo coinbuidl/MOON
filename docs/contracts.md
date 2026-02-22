@@ -26,10 +26,12 @@ Fields:
 3. `content_hash: String`
 4. `created_at_epoch_secs: u64`
 5. `indexed_collection: String`
+6. `projection_filtered_noise_count: Option<usize>`
 
 Rules:
 1. `content_hash` is deterministic for identical snapshots.
 2. Same hash + session pair is idempotent.
+3. `projection_filtered_noise_count` records deterministic pre-emptive noise filtering volume when projection markdown is generated.
 
 ## DistillationRecord
 
@@ -48,14 +50,16 @@ Rules:
 ## Distill Trigger Contract
 
 Fields:
-1. `distill.mode: String` (`manual` or `idle`)
+1. `distill.mode: String` (`manual`, `idle`, or `daily`)
 2. `distill.idle_secs: u64`
 3. `distill.max_per_cycle: u64`
+4. `distill.residential_timezone: String` (IANA TZ; default `UTC`)
 
 Rules:
 1. `idle` mode starts only after the latest archive has been idle for `idle_secs`.
 2. Selection is deterministic: oldest pending archive day first, then up to `max_per_cycle`.
-3. Internal watcher trigger model is extensible for future modes (for example archive-event), while current public config remains `manual|idle`.
+3. `daily` mode attempts layer-2 distillation once per residential day after the latest archive has been idle for `idle_secs`.
+4. `manual` mode disables automatic layer-2 distillation; manual trigger is `moon-watch --once --distill-now`.
 
 ## ContinuityMap
 

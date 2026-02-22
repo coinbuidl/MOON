@@ -109,7 +109,7 @@ fn moon_index_registers_history_collection() {
     let log = fs::read_to_string(&log_path).expect("read log");
     assert!(log.contains("collection add"));
     assert!(log.contains("--name history"));
-    assert!(log.contains("--mask **/*.md"));
+    assert!(log.contains("--mask mlib/**/*.md"));
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn moon_index_updates_when_collection_already_exists() {
 
     let log = fs::read_to_string(&log_path).expect("read log");
     assert!(log.contains("collection add"));
-    assert!(log.contains("--mask **/*.md"));
+    assert!(log.contains("--mask mlib/**/*.md"));
     assert!(log.contains("update"));
 }
 
@@ -165,6 +165,6 @@ fn moon_index_recreates_collection_when_mask_mismatches() {
     assert!(log.contains("collection add"));
     assert!(log.contains("collection list"));
     assert!(log.contains("collection remove history"));
-    assert!(log.contains("--mask **/*.md"));
+    assert!(log.contains("--mask mlib/**/*.md"));
     assert!(!log.contains("update"));
 }

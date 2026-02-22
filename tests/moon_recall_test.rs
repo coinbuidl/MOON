@@ -44,6 +44,36 @@ fn moon_recall_returns_matches() {
 
 #[test]
 #[cfg(not(windows))]
+fn moon_recall_maps_qmd_file_uri_to_archive_path() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let archives = moon_home.join("archives");
+    fs::create_dir_all(archives.join("raw")).expect("mkdir archives/raw");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd(
+        &qmd,
+        r#"[{"file":"qmd://history/mlib/test-session-1771470000.md","snippet":"timeline hit","score":0.8}]"#,
+    );
+
+    let expected = archives.join("raw/test-session-1771470000.jsonl");
+    let assert = assert_cmd::cargo::cargo_bin_cmd!("MOON")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("QMD_BIN", &qmd)
+        .arg("moon-recall")
+        .args(["--query", "timeline"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(stdout.contains(&format!("match[0].archive={}", expected.display())));
+}
+
+#[test]
+#[cfg(not(windows))]
 fn moon_recall_prefers_exact_channel_archive_match() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");

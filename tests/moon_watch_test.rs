@@ -84,6 +84,14 @@ fn read_distilled_archive_paths(state_file: &Path) -> Vec<String> {
     map.keys().cloned().collect()
 }
 
+fn read_last_distill_trigger_epoch(state_file: &Path) -> Option<u64> {
+    let raw = fs::read_to_string(state_file).expect("read state");
+    let parsed: Value = serde_json::from_str(&raw).expect("parse state");
+    parsed
+        .get("last_distill_trigger_epoch_secs")
+        .and_then(Value::as_u64)
+}
+
 #[test]
 #[cfg(not(windows))]
 fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
@@ -111,8 +119,7 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
         .env("QMD_BIN", &qmd)
         .env("OPENCLAW_BIN", &openclaw)
-        .env("MOON_THRESHOLD_ARCHIVE_RATIO", "0.00001")
-        .env("MOON_THRESHOLD_COMPACTION_RATIO", "0.00002")
+        .env("MOON_TRIGGER_RATIO", "0.00002")
         .arg("moon-watch")
         .arg("--once")
         .assert()
@@ -156,8 +163,7 @@ fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
         .env("QMD_BIN", &qmd)
         .env("OPENCLAW_BIN", &openclaw)
         .env("MOON_TEST_EVENT_LOG", &event_log)
-        .env("MOON_THRESHOLD_ARCHIVE_RATIO", "0.00001")
-        .env("MOON_THRESHOLD_COMPACTION_RATIO", "0.00002")
+        .env("MOON_TRIGGER_RATIO", "0.00002")
         .env("MOON_INBOUND_WATCH_ENABLED", "true")
         .env(
             "MOON_INBOUND_WATCH_PATHS",
@@ -239,8 +245,7 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
             r#"{"sessionId":"agent:main:main","usage":{"totalTokens":120},"limits":{"maxTokens":10000}}"#,
         )
         .env("MOON_TEST_COMPACT_LOG", &compact_log)
-        .env("MOON_THRESHOLD_ARCHIVE_RATIO", "0.80")
-        .env("MOON_THRESHOLD_COMPACTION_RATIO", "0.85")
+        .env("MOON_TRIGGER_RATIO", "0.85")
         .env("MOON_COOLDOWN_SECS", "0")
         .arg("moon-watch")
         .arg("--once")
@@ -261,9 +266,9 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
     assert!(ledger.contains("\"projection_path\":"));
     assert!(ledger.contains(".md"));
 
-    let raw_archives_dir = moon_home.join("archives/raw");
-    let projection_count = fs::read_dir(&raw_archives_dir)
-        .expect("read raw archives dir")
+    let mlib_archives_dir = moon_home.join("archives/mlib");
+    let projection_count = fs::read_dir(&mlib_archives_dir)
+        .expect("read mlib archives dir")
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
@@ -437,6 +442,129 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
 
 #[test]
 #[cfg(not(windows))]
+fn moon_watch_once_distill_now_runs_in_manual_mode() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(moon_home.join("archives/raw")).expect("mkdir archives raw");
+    fs::create_dir_all(moon_home.join("archives/mlib")).expect("mkdir archives mlib");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    fs::write(
+        sessions_dir.join("s1.json"),
+        "{\"decision\":\"manual distill trigger\"}\n",
+    )
+    .expect("write session");
+
+    let archive_path = moon_home.join("archives/raw/manual.jsonl");
+    let projection_path = moon_home.join("archives/mlib/manual.md");
+    fs::write(&archive_path, "{\"session\":\"manual\"}\n").expect("write archive");
+    fs::write(
+        &projection_path,
+        "- [user] Decision: keep mlib as primary source.\n",
+    )
+    .expect("write projection");
+
+    let ledger = format!(
+        "{{\"session_id\":\"manual\",\"source_path\":\"/tmp/manual.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"abc\",\"created_at_epoch_secs\":86400,\"indexed_collection\":\"history\",\"indexed\":true}}\n",
+        archive_path.display()
+    );
+    fs::write(moon_home.join("archives/ledger.jsonl"), ledger).expect("write ledger");
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd(&qmd);
+    let openclaw = tmp.path().join("openclaw");
+    write_fake_openclaw(&openclaw);
+
+    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
+        .env("QMD_BIN", &qmd)
+        .env("OPENCLAW_BIN", &openclaw)
+        .env("MOON_DISTILL_MODE", "manual")
+        .env("MOON_DISTILL_PROVIDER", "local")
+        .env("MOON_DISTILL_MAX_PER_CYCLE", "1")
+        .arg("moon-watch")
+        .arg("--once")
+        .arg("--distill-now")
+        .assert()
+        .success();
+
+    let distilled = read_distilled_archive_paths(&moon_home.join("state/moon_state.json"));
+    assert_eq!(distilled.len(), 1);
+    assert!(distilled.contains(&archive_path.to_string_lossy().to_string()));
+}
+
+#[test]
+#[cfg(not(windows))]
+fn moon_watch_daily_mode_waits_for_idle_window_before_attempt() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let sessions_dir = tmp.path().join("sessions");
+    fs::create_dir_all(moon_home.join("archives/raw")).expect("mkdir archives raw");
+    fs::create_dir_all(moon_home.join("archives/mlib")).expect("mkdir archives mlib");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    fs::write(
+        sessions_dir.join("s1.json"),
+        "{\"decision\":\"daily idle guard\"}\n",
+    )
+    .expect("write session");
+
+    let archive_path = moon_home.join("archives/raw/fresh.jsonl");
+    let projection_path = moon_home.join("archives/mlib/fresh.md");
+    fs::write(&archive_path, "{\"session\":\"fresh\"}\n").expect("write archive");
+    fs::write(
+        &projection_path,
+        "- [user] Decision: wait for idle window before daily distill.\n",
+    )
+    .expect("write projection");
+
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs();
+    let ledger = format!(
+        "{{\"session_id\":\"fresh\",\"source_path\":\"/tmp/fresh.jsonl\",\"archive_path\":\"{}\",\"content_hash\":\"abc\",\"created_at_epoch_secs\":{},\"indexed_collection\":\"history\",\"indexed\":true}}\n",
+        archive_path.display(),
+        now_epoch
+    );
+    fs::write(moon_home.join("archives/ledger.jsonl"), ledger).expect("write ledger");
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd(&qmd);
+    let openclaw = tmp.path().join("openclaw");
+    write_fake_openclaw(&openclaw);
+
+    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
+        .env("QMD_BIN", &qmd)
+        .env("OPENCLAW_BIN", &openclaw)
+        .env("MOON_DISTILL_MODE", "daily")
+        .env("MOON_DISTILL_IDLE_SECS", "180")
+        .env("MOON_RESIDENTIAL_TIMEZONE", "UTC")
+        .env("MOON_DISTILL_PROVIDER", "local")
+        .env("MOON_DISTILL_MAX_PER_CYCLE", "1")
+        .env("MOON_COOLDOWN_SECS", "0")
+        .env("MOON_RETENTION_COLD_DAYS", "99999")
+        .arg("moon-watch")
+        .arg("--once")
+        .assert()
+        .success();
+
+    let state_file = moon_home.join("state/moon_state.json");
+    let distilled = read_distilled_archive_paths(&state_file);
+    assert!(distilled.is_empty());
+    assert!(read_last_distill_trigger_epoch(&state_file).is_none());
+}
+
+#[test]
+#[cfg(not(windows))]
 fn moon_watch_once_emits_ai_warning_when_ledger_is_invalid() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
@@ -537,7 +665,6 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
             r#"{"sessionId":"agent:main:main","usage":{"totalTokens":120},"limits":{"maxTokens":100000}}"#,
         )
         .env("MOON_DISTILL_MODE", "manual")
-        .env("MOON_DISTILL_ARCHIVE_GRACE_HOURS", "60")
         .arg("moon-watch")
         .arg("--once")
         .assert()

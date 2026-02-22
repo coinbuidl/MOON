@@ -1,6 +1,6 @@
 use crate::moon::audit;
 use crate::moon::paths::MoonPaths;
-use crate::moon::util::now_epoch_secs;
+use crate::moon::util::{now_epoch_secs, truncate_with_ellipsis};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, TimeZone};
 use reqwest::blocking::Client;
@@ -11,7 +11,6 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::sync::OnceLock;
-
 
 #[derive(Debug, Clone)]
 pub struct DistillInput {
@@ -51,6 +50,7 @@ pub struct ProjectionData {
     pub time_start_epoch: Option<u64>,
     pub time_end_epoch: Option<u64>,
     pub message_count: usize,
+    pub filtered_noise_count: usize,
     pub truncated: bool,
     pub compaction_anchors: Vec<CompactionAnchor>,
 }
@@ -146,9 +146,17 @@ const AUTO_CHUNK_BYTES_PER_TOKEN: f64 = 3.0;
 const AUTO_CHUNK_SAFETY_RATIO: f64 = 0.60;
 const MAX_ROLLUP_LINES_PER_SECTION: usize = 30;
 const MAX_ROLLUP_TOTAL_LINES: usize = 120;
-const MAX_ARCHIVE_SCAN_BYTES: usize = 4 * 1024 * 1024;
-const MAX_ARCHIVE_SCAN_LINES: usize = 50_000;
-const MAX_ARCHIVE_CANDIDATES: usize = 400;
+const MAX_ARCHIVE_SCAN_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ARCHIVE_SCAN_LINES: usize = 200_000;
+const MAX_ARCHIVE_CANDIDATES: usize = 2_000;
+const ENTITY_ANCHORS_BEGIN: &str = "<!-- MOON_ENTITY_ANCHORS_BEGIN -->";
+const ENTITY_ANCHORS_END: &str = "<!-- MOON_ENTITY_ANCHORS_END -->";
+const TOPIC_STOPWORDS: [&str; 38] = [
+    "the", "and", "for", "with", "that", "this", "from", "into", "about", "after", "before",
+    "were", "was", "are", "is", "be", "been", "being", "have", "has", "had", "will", "would",
+    "should", "could", "can", "did", "done", "not", "you", "your", "our", "their", "they", "them",
+    "then", "than", "there",
+];
 
 static AUTO_CHUNK_BYTES_CACHE: OnceLock<usize> = OnceLock::new();
 
@@ -302,8 +310,6 @@ fn resolve_remote_config() -> Option<RemoteModelConfig> {
         base_url,
     })
 }
-
-
 
 fn token_limit_to_chunk_bytes(tokens: u64) -> usize {
     let estimated = (tokens as f64) * AUTO_CHUNK_BYTES_PER_TOKEN * AUTO_CHUNK_SAFETY_RATIO;
@@ -496,24 +502,6 @@ pub fn archive_file_size(path: &str) -> Result<u64> {
         .len())
 }
 
-fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    if max_chars <= 3 {
-        return "...".chars().take(max_chars).collect();
-    }
-    let mut out = String::new();
-    for (idx, ch) in input.chars().enumerate() {
-        if idx >= max_chars - 3 {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
-}
-
 fn unescape_json_noise(input: &str) -> String {
     input
         .replace("\\\\\"", "\"")
@@ -616,19 +604,219 @@ fn extract_candidate_lines(raw: &str) -> Vec<String> {
     out
 }
 
+fn normalize_epoch_units(raw: u64) -> u64 {
+    if raw >= 100_000_000_000_000 {
+        // microseconds -> seconds
+        raw / 1_000_000
+    } else if raw >= 100_000_000_000 {
+        // milliseconds -> seconds
+        raw / 1_000
+    } else {
+        raw
+    }
+}
+
+fn parse_timestamp_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| {
+                number
+                    .as_i64()
+                    .and_then(|v| if v >= 0 { Some(v as u64) } else { None })
+            })
+            .map(normalize_epoch_units),
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Ok(numeric) = trimmed.parse::<u64>() {
+                return Some(normalize_epoch_units(numeric));
+            }
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+                let secs = parsed.timestamp();
+                if secs >= 0 {
+                    return Some(secs as u64);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn resolve_entry_timestamp_epoch(entry: &Value, message: &Value) -> Option<u64> {
+    for candidate in [
+        message.get("createdAt"),
+        message.get("timestamp"),
+        entry.get("timestamp_epoch"),
+        entry.get("timestamp"),
+        entry.get("createdAt"),
+        entry.get("created_at"),
+    ] {
+        let Some(value) = candidate else {
+            continue;
+        };
+        if let Some(epoch) = parse_timestamp_value(value) {
+            return Some(epoch);
+        }
+    }
+    None
+}
+
+fn is_useful_text_signal(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 4 {
+        return false;
+    }
+    if trimmed.len() > 300 {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("file://")
+        || lower.starts_with('/')
+        || lower.starts_with("~/")
+        || lower.contains("/users/")
+    {
+        return false;
+    }
+    trimmed.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+fn should_collect_tool_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "prompt"
+            | "query"
+            | "text"
+            | "description"
+            | "caption"
+            | "instruction"
+            | "instructions"
+            | "keywords"
+            | "title"
+            | "style"
+            | "task"
+            | "negative_prompt"
+    ) || lower.contains("prompt")
+        || lower.contains("query")
+        || lower.contains("caption")
+}
+
+fn extract_flag_value(raw: &str, flag: &str) -> Option<String> {
+    let pos = raw.find(flag)?;
+    let mut rest = raw.get(pos + flag.len()..)?.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let mut out = String::new();
+        let mut escaped = false;
+        for ch in stripped.chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                break;
+            }
+            out.push(ch);
+        }
+        return Some(out);
+    }
+
+    if let Some(stripped) = rest.strip_prefix('\'') {
+        let mut out = String::new();
+        for ch in stripped.chars() {
+            if ch == '\'' {
+                break;
+            }
+            out.push(ch);
+        }
+        return Some(out);
+    }
+
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    rest = &rest[..end];
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+fn collect_tool_input_signals(value: &Value, out: &mut BTreeSet<String>, depth: usize) {
+    if depth > 4 || out.len() >= 12 {
+        return;
+    }
+
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if out.len() >= 12 {
+                    break;
+                }
+                if should_collect_tool_key(key)
+                    && let Some(raw) = child.as_str()
+                    && is_useful_text_signal(raw)
+                    && let Some(cleaned) = clean_candidate_text(raw)
+                {
+                    out.insert(cleaned);
+                }
+                if key.eq_ignore_ascii_case("command")
+                    && let Some(raw) = child.as_str()
+                {
+                    for flag in ["--prompt", "--query"] {
+                        if let Some(extracted) = extract_flag_value(raw, flag)
+                            && is_useful_text_signal(&extracted)
+                            && let Some(cleaned) = clean_candidate_text(&extracted)
+                        {
+                            out.insert(cleaned);
+                        }
+                    }
+                }
+                collect_tool_input_signals(child, out, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for child in items.iter().take(16) {
+                if out.len() >= 12 {
+                    break;
+                }
+                collect_tool_input_signals(child, out, depth + 1);
+            }
+        }
+        Value::String(raw) => {
+            if is_useful_text_signal(raw)
+                && let Some(cleaned) = clean_candidate_text(raw)
+            {
+                out.insert(cleaned);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn extract_message_entry(entry: &Value) -> Option<ProjectionEntry> {
     let message = entry.get("message")?;
-    let role = message.get("role").and_then(Value::as_str).unwrap_or("").to_string();
-    
-    let mut timestamp_epoch = None;
-    if let Some(ts_str) = message.get("createdAt").and_then(Value::as_str) {
-        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
-            timestamp_epoch = Some(ts.timestamp() as u64);
-        }
-    } else if let Some(ts_num) = entry.get("timestamp_epoch").and_then(Value::as_u64) {
-        timestamp_epoch = Some(ts_num);
-    }
-    
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let timestamp_epoch = resolve_entry_timestamp_epoch(entry, message);
+
     let content_arr = message.get("content").and_then(Value::as_array)?;
     let mut text_parts = Vec::new();
     let mut tool_name = None;
@@ -639,37 +827,58 @@ fn extract_message_entry(entry: &Value) -> Option<ProjectionEntry> {
         for part in content_arr {
             if part.get("type").and_then(Value::as_str) == Some("text")
                 && let Some(text) = part.get("text").and_then(Value::as_str)
-                    && let Some(cleaned) = clean_candidate_text(text)
-                        && cleaned.len() <= 1024 && !looks_like_json_blob(&cleaned) && !cleaned.contains("<<<EXTERNAL_UNTRUSTED_CONTENT>>>") {
-                            text_parts.push(cleaned);
-                        }
+                && let Some(cleaned) = clean_candidate_text(text)
+                && cleaned.len() <= 1024
+                && !looks_like_json_blob(&cleaned)
+                && !cleaned.contains("<<<EXTERNAL_UNTRUSTED_CONTENT>>>")
+            {
+                text_parts.push(cleaned);
+            }
         }
     } else {
         for part in content_arr {
             let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
             if part_type == "text" {
                 if let Some(text) = part.get("text").and_then(Value::as_str)
-                    && let Some(cleaned) = clean_candidate_text(text) {
-                        text_parts.push(cleaned);
-                    }
-            } else if part_type == "toolUse"
-                && let Some(name) = part.get("name").and_then(Value::as_str) {
-                    tool_name = Some(name.to_string());
-                    priority = Some(match name {
-                        "write_to_file" | "exec" | "edit" | "gateway" => ToolPriority::High,
-                        _ => ToolPriority::Normal,
-                    });
-                    
-                    if let Some(input) = part.get("input").and_then(Value::as_object) {
-                        if let Some(cmd) = input.get("command").and_then(Value::as_str) {
-                            tool_target = Some(cmd.to_string());
-                        } else if let Some(path) = input.get("path").or_else(|| input.get("file")).and_then(Value::as_str) {
-                            tool_target = Some(path.to_string());
-                        } else if let Ok(dump) = serde_json::to_string(input) {
-                            tool_target = Some(truncate_with_ellipsis(&dump, 64));
-                        }
+                    && let Some(cleaned) = clean_candidate_text(text)
+                {
+                    text_parts.push(cleaned);
+                }
+            } else if (part_type == "toolUse" || part_type == "toolCall")
+                && let Some(name) = part.get("name").and_then(Value::as_str)
+            {
+                tool_name = Some(name.to_string());
+                priority = Some(match name {
+                    "write_to_file" | "exec" | "edit" | "gateway" => ToolPriority::High,
+                    _ => ToolPriority::Normal,
+                });
+
+                if let Some(input) = part
+                    .get("input")
+                    .or_else(|| part.get("arguments"))
+                    .and_then(Value::as_object)
+                {
+                    if let Some(cmd) = input.get("command").and_then(Value::as_str) {
+                        tool_target = Some(cmd.to_string());
+                    } else if let Some(path) = input
+                        .get("path")
+                        .or_else(|| input.get("file"))
+                        .and_then(Value::as_str)
+                    {
+                        tool_target = Some(path.to_string());
+                    } else if let Ok(dump) = serde_json::to_string(input) {
+                        tool_target = Some(truncate_with_ellipsis(&dump, 64));
                     }
                 }
+
+                if let Some(input_value) = part.get("input").or_else(|| part.get("arguments")) {
+                    let mut tool_signals = BTreeSet::new();
+                    collect_tool_input_signals(input_value, &mut tool_signals, 0);
+                    for signal in tool_signals {
+                        text_parts.push(format!("[tool-input] {signal}"));
+                    }
+                }
+            }
         }
     }
 
@@ -688,13 +897,77 @@ fn extract_message_entry(entry: &Value) -> Option<ProjectionEntry> {
     })
 }
 
+fn is_no_reply_marker(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("no_reply")
+}
+
+fn is_poll_heartbeat_noise(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("\"action\":\"poll\"")
+        || lower.contains("\"action\": \"poll\"")
+        || lower.contains("[tool-input] poll")
+        || lower.contains("command still running (session")
+        || lower.contains("(no new output) process still running")
+        || lower.contains("use process (list/poll/log/write/kill/clear/remove)")
+}
+
+fn is_status_echo_noise(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("command: moon-watch")
+        && lower.contains("moon watcher cycle completed")
+        && lower.contains("heartbeat_epoch_secs=")
+        && lower.contains("poll_interval_secs="))
+        || (lower.contains("threshold.trigger=")
+            && lower.contains("distill.mode=")
+            && lower.contains("retention.active_days="))
+}
+
+fn is_projection_noise_entry(entry: &ProjectionEntry) -> bool {
+    let combined = if entry.content.trim().is_empty() {
+        entry.tool_target.as_deref().unwrap_or_default().to_string()
+    } else if let Some(tool_target) = entry.tool_target.as_deref() {
+        format!("{} {}", entry.content, tool_target)
+    } else {
+        entry.content.clone()
+    };
+
+    if combined.trim().is_empty() {
+        return false;
+    }
+
+    if is_no_reply_marker(&combined) {
+        return true;
+    }
+    if is_poll_heartbeat_noise(&combined) {
+        return true;
+    }
+    if is_status_echo_noise(&combined) {
+        return true;
+    }
+
+    if entry.role == "assistant"
+        && entry
+            .tool_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("process"))
+        && is_poll_heartbeat_noise(&combined)
+    {
+        return true;
+    }
+
+    false
+}
+
 fn extract_keywords(entries: &[ProjectionEntry]) -> Vec<String> {
     let mut keywords = BTreeSet::new();
     for entry in entries {
         if entry.role != "user" && entry.role != "assistant" {
             continue;
         }
-        for word in entry.content.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.') {
+        for word in entry
+            .content
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.')
+        {
             if word.len() > 4 && word.len() < 24 && !word.chars().all(|c| c.is_numeric()) {
                 keywords.insert(word.to_lowercase());
             }
@@ -723,6 +996,7 @@ pub fn extract_projection_data(path: &str) -> Result<ProjectionData> {
     let mut entries: Vec<ProjectionEntry> = Vec::new();
     let mut tool_calls_set = BTreeSet::new();
     let mut compaction_anchors = Vec::new();
+    let mut filtered_noise_count = 0usize;
     let mut truncated = false;
 
     let mut pending_tool_uses: Vec<usize> = Vec::new();
@@ -742,25 +1016,39 @@ pub fn extract_projection_data(path: &str) -> Result<ProjectionData> {
             if let Some(note) = json_entry.get("compaction_summary").and_then(Value::as_str) {
                 compaction_anchors.push(CompactionAnchor {
                     note: note.to_string(),
-                    origin_message_id: json_entry.get("message_id").and_then(Value::as_str).map(|s| s.to_string()),
+                    origin_message_id: json_entry
+                        .get("message_id")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string()),
                 });
             }
 
             if let Some(entry) = extract_message_entry(&json_entry) {
+                if is_projection_noise_entry(&entry) {
+                    filtered_noise_count = filtered_noise_count.saturating_add(1);
+                    if entry.role == "toolResult" {
+                        let _ = pending_tool_uses.pop();
+                    }
+                    continue;
+                }
+
                 let idx = entries.len();
-                
+
                 if entry.role == "assistant" && entry.tool_name.is_some() {
                     tool_calls_set.insert(entry.tool_name.clone().unwrap());
                     pending_tool_uses.push(idx);
                 } else if entry.role == "toolResult"
-                    && let Some(use_idx) = pending_tool_uses.pop() {
-                        entries[use_idx].coupled_result = Some(entry.content.clone());
-                    }
-                
+                    && let Some(use_idx) = pending_tool_uses.pop()
+                {
+                    entries[use_idx].coupled_result = Some(entry.content.clone());
+                }
+
                 entries.push(entry);
             }
-        } else if !looks_like_json_blob(trimmed) && let Some(cleaned) = clean_candidate_text(trimmed) {
-            entries.push(ProjectionEntry {
+        } else if !looks_like_json_blob(trimmed)
+            && let Some(cleaned) = clean_candidate_text(trimmed)
+        {
+            let entry = ProjectionEntry {
                 timestamp_epoch: None,
                 role: "system".to_string(),
                 content: cleaned,
@@ -768,7 +1056,12 @@ pub fn extract_projection_data(path: &str) -> Result<ProjectionData> {
                 tool_target: None,
                 priority: None,
                 coupled_result: None,
-            });
+            };
+            if is_projection_noise_entry(&entry) {
+                filtered_noise_count = filtered_noise_count.saturating_add(1);
+            } else {
+                entries.push(entry);
+            }
         }
 
         if entries.len() >= MAX_ARCHIVE_CANDIDATES
@@ -781,8 +1074,14 @@ pub fn extract_projection_data(path: &str) -> Result<ProjectionData> {
     }
 
     let message_count = entries.len();
-    let time_start_epoch = entries.first().and_then(|e| e.timestamp_epoch);
-    let time_end_epoch = entries.last().and_then(|e| e.timestamp_epoch);
+    let time_start_epoch = entries
+        .iter()
+        .filter_map(|entry| entry.timestamp_epoch)
+        .min();
+    let time_end_epoch = entries
+        .iter()
+        .filter_map(|entry| entry.timestamp_epoch)
+        .max();
     let keywords = extract_keywords(&entries);
     let topics = infer_topics(&entries, &keywords);
 
@@ -794,6 +1093,7 @@ pub fn extract_projection_data(path: &str) -> Result<ProjectionData> {
         time_start_epoch,
         time_end_epoch,
         message_count,
+        filtered_noise_count,
         truncated,
         compaction_anchors,
     })
@@ -821,7 +1121,7 @@ impl ProjectionData {
                         s.push_str(&format!("\n[toolResult] {}", r));
                     }
                     s
-                },
+                }
                 _ => entry.content.clone(),
             };
             if !candidate.trim().is_empty() {
@@ -1242,7 +1542,298 @@ fn distill_summary(input: &DistillInput) -> Result<(String, String)> {
     } else {
         ("local".to_string(), local_summary()?)
     };
-    Ok((provider_used, clamp_summary(&generated_summary)))
+    let deduped = apply_semantic_dedup(&generated_summary);
+    Ok((provider_used, clamp_summary(&deduped)))
+}
+
+fn topic_discovery_enabled() -> bool {
+    match env::var("MOON_TOPIC_DISCOVERY") {
+        Ok(raw) => matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on"),
+        Err(_) => false,
+    }
+}
+
+fn is_valid_topic_key(key: &str) -> bool {
+    if key.len() < 3 || key.len() > 32 {
+        return false;
+    }
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    let digit_count = key.chars().filter(|c| c.is_ascii_digit()).count();
+    if digit_count > 2 {
+        return false;
+    }
+    !matches!(
+        key,
+        "session"
+            | "sessions"
+            | "summary"
+            | "decision"
+            | "decisions"
+            | "rules"
+            | "rule"
+            | "milestone"
+            | "milestones"
+            | "tasks"
+            | "task"
+            | "archive"
+            | "archive_path"
+            | "archive_jsonl_path"
+            | "content_hash"
+            | "time_range_utc"
+            | "time_range_local"
+            | "local_timezone"
+    )
+}
+
+fn normalize_semantic_key_fragment(fragment: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    for token in fragment
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+        .map(|t| t.trim().to_ascii_lowercase())
+    {
+        if token.len() < 2 || token.len() > 32 {
+            continue;
+        }
+        if token.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if TOPIC_STOPWORDS.contains(&token.as_str()) {
+            continue;
+        }
+        tokens.push(token);
+        if tokens.len() >= 6 {
+            break;
+        }
+    }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join("_"))
+    }
+}
+
+fn semantic_key_for_bullet(section: &str, bullet: &str) -> Option<String> {
+    let cleaned = bullet
+        .trim_start_matches("- ")
+        .trim_start_matches("* ")
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let lower = cleaned.to_ascii_lowercase();
+
+    if let Some((lhs, _)) = lower.split_once(':')
+        && lhs.split_whitespace().count() <= 8
+        && let Some(key) = normalize_semantic_key_fragment(lhs)
+    {
+        return Some(format!("{section}|{key}"));
+    }
+    if let Some((lhs, _)) = lower.split_once('=')
+        && lhs.split_whitespace().count() <= 8
+        && let Some(key) = normalize_semantic_key_fragment(lhs)
+    {
+        return Some(format!("{section}|{key}"));
+    }
+
+    for prefix in [
+        "set ",
+        "updated ",
+        "update ",
+        "switched ",
+        "switch ",
+        "enabled ",
+        "enable ",
+        "disabled ",
+        "disable ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let lhs = rest
+                .split(" to ")
+                .next()
+                .unwrap_or(rest)
+                .split(" for ")
+                .next()
+                .unwrap_or(rest);
+            if let Some(key) = normalize_semantic_key_fragment(lhs) {
+                return Some(format!("{section}|{key}"));
+            }
+        }
+    }
+
+    None
+}
+
+fn apply_semantic_dedup(summary: &str) -> String {
+    let mut section = "root".to_string();
+    let lines = summary
+        .lines()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let mut last_index_for_key = BTreeMap::<String, usize>::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            section = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+            continue;
+        }
+        if !(trimmed.starts_with("- ") || trimmed.starts_with("* ")) {
+            continue;
+        }
+        if let Some(key) = semantic_key_for_bullet(&section, trimmed) {
+            last_index_for_key.insert(key, idx);
+        }
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    section.clear();
+    section.push_str("root");
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            section = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+            out.push(line.clone());
+            continue;
+        }
+        if !(trimmed.starts_with("- ") || trimmed.starts_with("* ")) {
+            out.push(line.clone());
+            continue;
+        }
+        if let Some(key) = semantic_key_for_bullet(&section, trimmed)
+            && let Some(last_idx) = last_index_for_key.get(&key)
+            && *last_idx != idx
+        {
+            continue;
+        }
+        out.push(line.clone());
+    }
+
+    out.join("\n")
+}
+
+fn discover_topic_tags(summary: &str) -> Vec<String> {
+    let mut counts = BTreeMap::<String, usize>::new();
+
+    for token in summary.split_whitespace() {
+        let trimmed = token
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '#' && c != '_' && c != '-');
+        if let Some(tag_body) = trimmed.strip_prefix('#') {
+            let lower = tag_body.to_ascii_lowercase();
+            if let Some(key) = normalize_semantic_key_fragment(&lower)
+                && is_valid_topic_key(&key)
+            {
+                *counts.entry(key).or_insert(0) += 3;
+            }
+            continue;
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        if matches!(
+            lower.as_str(),
+            "session"
+                | "summary"
+                | "decision"
+                | "decisions"
+                | "rule"
+                | "rules"
+                | "milestone"
+                | "milestones"
+                | "task"
+                | "tasks"
+                | "archive"
+                | "path"
+                | "distilled"
+        ) {
+            continue;
+        }
+        if let Some(key) = normalize_semantic_key_fragment(&lower)
+            && is_valid_topic_key(&key)
+        {
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut ranked = counts.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(8)
+        .map(|(topic, _)| format!("#{topic}"))
+        .collect()
+}
+
+fn build_entity_anchor_line(
+    session_id: &str,
+    archive_path: &str,
+    tags: &[String],
+) -> Option<String> {
+    if tags.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "- session_id={} archive_path={} topics={}",
+        session_id,
+        archive_path,
+        tags.join(" ")
+    ))
+}
+
+fn upsert_entity_anchors_block(
+    existing: &str,
+    session_id: &str,
+    archive_path: &str,
+    tags: &[String],
+) -> String {
+    let Some(new_line) = build_entity_anchor_line(session_id, archive_path, tags) else {
+        return existing.to_string();
+    };
+
+    let mut anchor_lines = Vec::<String>::new();
+    let mut body = existing.to_string();
+
+    if let Some(start) = existing.find(ENTITY_ANCHORS_BEGIN)
+        && let Some(end_rel) = existing[start..].find(ENTITY_ANCHORS_END)
+    {
+        let end = start + end_rel + ENTITY_ANCHORS_END.len();
+        let block = &existing[start..end];
+        for line in block.lines() {
+            let trimmed = line.trim();
+            if !trimmed.starts_with("- ") {
+                continue;
+            }
+            if trimmed.contains(&format!("session_id={}", session_id)) {
+                continue;
+            }
+            anchor_lines.push(trimmed.to_string());
+        }
+        body = format!("{}{}", &existing[..start], &existing[end..]);
+    }
+
+    anchor_lines.push(new_line);
+    anchor_lines.sort();
+
+    let mut block = String::new();
+    block.push_str(ENTITY_ANCHORS_BEGIN);
+    block.push('\n');
+    block.push_str("## Entity Anchors\n");
+    for line in anchor_lines {
+        block.push_str(&line);
+        block.push('\n');
+    }
+    block.push_str(ENTITY_ANCHORS_END);
+    block.push('\n');
+    block.push('\n');
+
+    format!("{}{}", block, body.trim_start())
 }
 
 fn append_distilled_summary(
@@ -1252,26 +1843,41 @@ fn append_distilled_summary(
     summary: String,
 ) -> Result<DistillOutput> {
     let summary_path = daily_memory_path(paths, input.archive_epoch_secs);
-    let mut text = String::new();
-    text.push_str(&format!("\n\n### {}\n", input.session_id));
-    text.push_str(&summary);
-    text.push('\n');
+    let mut full_text = fs::read_to_string(&summary_path).unwrap_or_default();
+    let topic_tags = if topic_discovery_enabled() {
+        discover_topic_tags(&summary)
+    } else {
+        Vec::new()
+    };
+    if !topic_tags.is_empty() {
+        full_text = upsert_entity_anchors_block(
+            &full_text,
+            &input.session_id,
+            &input.archive_path,
+            &topic_tags,
+        );
+    }
 
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&summary_path)
-        .with_context(|| format!("failed to open {}", summary_path))?;
-    file.write_all(text.as_bytes())?;
+    if !full_text.is_empty() && !full_text.ends_with('\n') {
+        full_text.push('\n');
+    }
+    full_text.push_str(&format!("\n### {}\n", input.session_id));
+    full_text.push_str(&summary);
+    full_text.push('\n');
+
+    fs::write(&summary_path, full_text)
+        .with_context(|| format!("failed to write {}", summary_path))?;
 
     audit::append_event(
         paths,
         "distill",
         "ok",
         &format!(
-            "distilled session {} into {} provider={}",
-            input.session_id, summary_path, provider_used
+            "distilled session {} into {} provider={} topic_count={}",
+            input.session_id,
+            summary_path,
+            provider_used,
+            topic_tags.len()
         ),
     )?;
 
@@ -1730,7 +2336,201 @@ mod tests {
         assert!(label.contains("gemini:3"));
     }
 
+    #[test]
+    fn extract_projection_data_uses_min_max_timestamps() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("moon-projection-time-test-{stamp}.jsonl"));
+        let path_str = path.to_string_lossy().to_string();
 
+        let line1 = json!({
+            "message": {
+                "role": "assistant",
+                "createdAt": "2026-02-21T10:00:00Z",
+                "content": [{"type":"text","text":"later event"}]
+            }
+        });
+        let line2 = json!({
+            "message": {
+                "role": "user",
+                "createdAt": "2026-02-21T09:00:00Z",
+                "content": [{"type":"text","text":"earlier event"}]
+            }
+        });
+        let line3 = "non-json system text";
+        fs::write(&path, format!("{line1}\n{line2}\n{line3}\n")).expect("write test file");
+
+        let data = super::extract_projection_data(&path_str).expect("extract projection data");
+        let _ = fs::remove_file(&path);
+
+        let early = chrono::DateTime::parse_from_rfc3339("2026-02-21T09:00:00Z")
+            .expect("parse early")
+            .timestamp() as u64;
+        let late = chrono::DateTime::parse_from_rfc3339("2026-02-21T10:00:00Z")
+            .expect("parse late")
+            .timestamp() as u64;
+
+        assert_eq!(data.time_start_epoch, Some(early));
+        assert_eq!(data.time_end_epoch, Some(late));
+    }
+
+    #[test]
+    fn extract_projection_data_accepts_numeric_and_top_level_timestamps() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("moon-projection-ts-shapes-{stamp}.jsonl"));
+        let path_str = path.to_string_lossy().to_string();
+
+        let line1 = json!({
+            "timestamp": "2026-02-18T05:23:52.625Z",
+            "message": {
+                "role": "assistant",
+                "timestamp": 1771392232624u64,
+                "content": [{"type":"text","text":"from numeric milliseconds"}]
+            }
+        });
+        let line2 = json!({
+            "timestamp": "2026-02-18T05:24:12.000Z",
+            "message": {
+                "role": "user",
+                "content": [{"type":"text","text":"from top-level RFC3339"}]
+            }
+        });
+        fs::write(&path, format!("{line1}\n{line2}\n")).expect("write test file");
+
+        let data = super::extract_projection_data(&path_str).expect("extract projection data");
+        let _ = fs::remove_file(&path);
+
+        let early = 1_771_392_232u64;
+        let late = chrono::DateTime::parse_from_rfc3339("2026-02-18T05:24:12Z")
+            .expect("parse late")
+            .timestamp() as u64;
+        assert_eq!(data.time_start_epoch, Some(early));
+        assert_eq!(data.time_end_epoch, Some(late));
+    }
+
+    #[test]
+    fn extract_projection_data_keeps_tool_input_lexical_signals() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("moon-projection-tool-signal-{stamp}.jsonl"));
+        let path_str = path.to_string_lossy().to_string();
+
+        let line = json!({
+            "message": {
+                "role": "assistant",
+                "timestamp": 1771392232624u64,
+                "content": [{
+                    "type": "toolUse",
+                    "name": "image_gen",
+                    "input": {
+                        "prompt": "Michelle pink luxury tweed suit with pearl buttons"
+                    }
+                }]
+            }
+        });
+        fs::write(&path, format!("{line}\n")).expect("write test file");
+
+        let data = super::extract_projection_data(&path_str).expect("extract projection data");
+        let _ = fs::remove_file(&path);
+
+        let merged = data
+            .entries
+            .iter()
+            .map(|entry| entry.content.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(merged.contains("pink luxury tweed suit"));
+    }
+
+    #[test]
+    fn extract_projection_data_keeps_tool_call_command_prompt_signal() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("moon-projection-toolcall-signal-{stamp}.jsonl"));
+        let path_str = path.to_string_lossy().to_string();
+
+        let line = json!({
+            "message": {
+                "role": "assistant",
+                "timestamp": 1771392232624u64,
+                "content": [{
+                    "type": "toolCall",
+                    "name": "exec",
+                    "arguments": {
+                        "command": "uv run generate_image.py --prompt \"Michelle in a pink luxury tweed suit, studio fashion lighting\" --resolution 2K"
+                    }
+                }]
+            }
+        });
+        fs::write(&path, format!("{line}\n")).expect("write test file");
+
+        let data = super::extract_projection_data(&path_str).expect("extract projection data");
+        let _ = fs::remove_file(&path);
+
+        let merged = data
+            .entries
+            .iter()
+            .map(|entry| entry.content.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(merged.contains("pink luxury tweed suit"));
+    }
+
+    #[test]
+    fn extract_projection_data_filters_noise_markers_and_poll_chatter() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("moon-projection-noise-filter-{stamp}.jsonl"));
+        let path_str = path.to_string_lossy().to_string();
+
+        let no_reply = json!({
+            "message": {
+                "role": "assistant",
+                "content": [{"type":"text","text":"NO_REPLY"}]
+            }
+        });
+        let poll_noise = json!({
+            "message": {
+                "role": "toolResult",
+                "content": [{
+                    "type":"text",
+                    "text":"Command still running (session quiet-orbit, pid 86331). Use process (list/poll/log/write/kill/clear/remove) for follow-up."
+                }]
+            }
+        });
+        let meaningful = json!({
+            "message": {
+                "role": "user",
+                "content": [{"type":"text","text":"Decision: keep trigger ratio at 1.0."}]
+            }
+        });
+        fs::write(&path, format!("{no_reply}\n{poll_noise}\n{meaningful}\n"))
+            .expect("write test file");
+
+        let data = super::extract_projection_data(&path_str).expect("extract projection data");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(data.filtered_noise_count, 2);
+        assert_eq!(data.entries.len(), 1);
+        assert_eq!(data.entries[0].role, "user");
+        assert!(
+            data.entries[0]
+                .content
+                .contains("Decision: keep trigger ratio")
+        );
+    }
 
     #[test]
     fn test_extract_keywords() {
@@ -1745,6 +2545,51 @@ mod tests {
             coupled_result: None,
         };
         let keywords = super::extract_keywords(&[entry]);
-        assert!(keywords.contains(&"webgl".to_string()) || keywords.contains(&"safari".to_string()) || keywords.contains(&"auth-token".to_string()));
+        assert!(
+            keywords.contains(&"webgl".to_string())
+                || keywords.contains(&"safari".to_string())
+                || keywords.contains(&"auth-token".to_string())
+        );
+    }
+
+    #[test]
+    fn semantic_dedup_keeps_latest_state_line() {
+        let raw =
+            "## Decisions\n- Trigger ratio: 0.85\n- Trigger ratio: 1.0\n- Keep archive snapshots\n";
+        let deduped = super::apply_semantic_dedup(raw);
+        assert!(!deduped.contains("Trigger ratio: 0.85"));
+        assert!(deduped.contains("Trigger ratio: 1.0"));
+        assert!(deduped.contains("Keep archive snapshots"));
+    }
+
+    #[test]
+    fn upsert_entity_anchor_block_replaces_session_line() {
+        let existing = "\
+<!-- MOON_ENTITY_ANCHORS_BEGIN -->
+## Entity Anchors
+- session_id=s1 archive_path=/tmp/a topics=#moon #qmd
+<!-- MOON_ENTITY_ANCHORS_END -->
+
+### s1
+## Distilled Session Summary
+";
+        let updated = super::upsert_entity_anchors_block(
+            existing,
+            "s1",
+            "/tmp/a",
+            &["#moon".to_string(), "#memory".to_string()],
+        );
+        assert!(updated.contains("topics=#moon #memory"));
+        assert!(!updated.contains("topics=#moon #qmd"));
+    }
+
+    #[test]
+    fn discover_topic_tags_filters_timestamp_noise() {
+        let summary = "Decision: Keep MOON trigger ratio at 1.0. archive_jsonl_path /tmp/x. 2026-02-21T10:00:00Z. QMD indexing stable.";
+        let tags = super::discover_topic_tags(summary);
+        assert!(tags.iter().any(|t| t == "#moon"));
+        assert!(tags.iter().any(|t| t == "#qmd"));
+        assert!(!tags.iter().any(|t| t.contains("2026")));
+        assert!(!tags.iter().any(|t| t.contains("archive_jsonl_path")));
     }
 }

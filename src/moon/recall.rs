@@ -9,6 +9,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallMatch {
@@ -25,11 +26,13 @@ pub struct RecallResult {
     pub generated_at_epoch_secs: u64,
 }
 
-
-
 fn boost_score_for_priority(snippet: &str, base_score: f64) -> f64 {
     let lower = snippet.to_ascii_lowercase();
-    if lower.contains("write_to_file") || lower.contains("exec") || lower.contains("edit") || lower.contains("gateway") {
+    if lower.contains("write_to_file")
+        || lower.contains("exec")
+        || lower.contains("edit")
+        || lower.contains("gateway")
+    {
         // High priority side-effects
         base_score * 1.30
     } else if lower.contains("read_file") || lower.contains("web_search") || lower.contains("ls") {
@@ -40,7 +43,71 @@ fn boost_score_for_priority(snippet: &str, base_score: f64) -> f64 {
     }
 }
 
-fn parse_matches(raw: &str) -> Vec<RecallMatch> {
+fn archive_path_from_projection_path(path: &Path) -> PathBuf {
+    let Some(file_name) = path.file_name() else {
+        return path.with_extension("jsonl");
+    };
+    if path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "mlib" || name == "lib")
+        && let Some(archives_root) = path.parent().and_then(Path::parent)
+    {
+        let mut archive_name = PathBuf::from(file_name);
+        archive_name.set_extension("jsonl");
+        return archives_root.join("raw").join(archive_name);
+    }
+    path.with_extension("jsonl")
+}
+
+fn normalize_archive_path(candidate: &str) -> String {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("qmd://") {
+        return trimmed
+            .strip_suffix(".md")
+            .map(|v| format!("{v}.jsonl"))
+            .unwrap_or_else(|| trimmed.to_string());
+    }
+    if Path::new(trimmed)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        return archive_path_from_projection_path(Path::new(trimmed))
+            .display()
+            .to_string();
+    }
+    trimmed.to_string()
+}
+
+fn resolve_archive_path(paths: &MoonPaths, item: &Value) -> String {
+    if let Some(path) = item.get("path").and_then(Value::as_str) {
+        return normalize_archive_path(path);
+    }
+    if let Some(source) = item.get("source").and_then(Value::as_str) {
+        return normalize_archive_path(source);
+    }
+    if let Some(file) = item.get("file").and_then(Value::as_str) {
+        if let Some(uri_body) = file.strip_prefix("qmd://") {
+            let mut parts = uri_body.splitn(2, '/');
+            let _collection = parts.next();
+            if let Some(relative_path) = parts.next() {
+                let local_projection = paths.archives_dir.join(relative_path);
+                return archive_path_from_projection_path(&local_projection)
+                    .display()
+                    .to_string();
+            }
+        }
+        return normalize_archive_path(file);
+    }
+    String::new()
+}
+
+fn parse_matches(paths: &MoonPaths, raw: &str) -> Vec<RecallMatch> {
     let mut out = Vec::new();
     let parsed = serde_json::from_str::<Value>(raw);
     let Ok(v) = parsed else {
@@ -60,12 +127,7 @@ fn parse_matches(raw: &str) -> Vec<RecallMatch> {
             .or_else(|| item.get("text").and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
-        let archive_path = item
-            .get("path")
-            .and_then(Value::as_str)
-            .or_else(|| item.get("source").and_then(Value::as_str))
-            .unwrap_or("")
-            .to_string();
+        let archive_path = resolve_archive_path(paths, &item);
         let base_score = item
             .get("score")
             .and_then(Value::as_f64)
@@ -97,7 +159,10 @@ fn snippet_from_archive(path: &str) -> String {
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed == "## Conversations" || trimmed == "## Timeline" || trimmed == "## Tool Activity" {
+            if trimmed == "## Conversations"
+                || trimmed == "## Timeline"
+                || trimmed == "## Tool Activity"
+            {
                 in_v2_content = true;
                 continue;
             }
@@ -126,7 +191,7 @@ fn snippet_from_archive(path: &str) -> String {
             if normalized.is_empty() {
                 continue;
             }
-            
+
             if fallback.is_empty() {
                 fallback = normalized.chars().take(280).collect();
             }
@@ -190,14 +255,17 @@ pub fn recall(
     // Timezone-aware query pre-processing (Lilac)
     // Basic heuristic: append UTC version if query contains a time-like pattern
     let mut enhanced_query = query.to_string();
-    if query.contains(':') || query.to_lowercase().contains("am") || query.to_lowercase().contains("pm") {
+    if query.contains(':')
+        || query.to_lowercase().contains("am")
+        || query.to_lowercase().contains("pm")
+    {
         use chrono::Local;
         let offset = Local::now().offset().to_string();
         enhanced_query.push_str(&format!(" UTC {}", offset));
     }
 
     let raw = qmd::search(&paths.qmd_bin, collection_name, &enhanced_query)?;
-    matches.extend(parse_matches(&raw));
+    matches.extend(parse_matches(paths, &raw));
 
     let mut deduped = Vec::with_capacity(matches.len());
     let mut seen_paths = BTreeSet::new();

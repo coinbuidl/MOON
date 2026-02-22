@@ -6,23 +6,13 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoonThresholds {
-    pub archive_ratio: f64,
-    #[serde(default = "default_archive_ratio_trigger_enabled")]
-    pub archive_ratio_trigger_enabled: bool,
-    #[serde(alias = "prune_ratio")]
-    pub compaction_ratio: f64,
-}
-
-fn default_archive_ratio_trigger_enabled() -> bool {
-    true
+    pub trigger_ratio: f64,
 }
 
 impl Default for MoonThresholds {
     fn default() -> Self {
         Self {
-            archive_ratio: 0.80,
-            archive_ratio_trigger_enabled: true,
-            compaction_ratio: 0.85,
+            trigger_ratio: 0.85,
         }
     }
 }
@@ -66,8 +56,12 @@ pub struct MoonDistillConfig {
     pub mode: String,
     pub idle_secs: u64,
     pub max_per_cycle: u64,
-    #[serde(alias = "grace_hours")]
-    pub archive_grace_hours: u64,
+    #[serde(default = "default_residential_timezone")]
+    pub residential_timezone: String,
+}
+
+fn default_residential_timezone() -> String {
+    "UTC".to_string()
 }
 
 impl Default for MoonDistillConfig {
@@ -76,7 +70,7 @@ impl Default for MoonDistillConfig {
             mode: "manual".to_string(),
             idle_secs: 360,
             max_per_cycle: 1,
-            archive_grace_hours: 60,
+            residential_timezone: "UTC".to_string(),
         }
     }
 }
@@ -109,18 +103,21 @@ pub struct MoonConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PartialMoonConfig {
-    thresholds: Option<MoonThresholds>,
+    thresholds: Option<PartialMoonThresholds>,
     watcher: Option<MoonWatcherConfig>,
     inbound_watch: Option<MoonInboundWatchConfig>,
     distill: Option<MoonDistillConfig>,
     retention: Option<MoonRetentionConfig>,
 }
 
-fn env_or_f64(var: &str, fallback: f64) -> f64 {
-    match env::var(var) {
-        Ok(v) => v.trim().parse::<f64>().ok().unwrap_or(fallback),
-        Err(_) => fallback,
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PartialMoonThresholds {
+    trigger_ratio: Option<f64>,
+    archive_ratio: Option<f64>,
+    #[serde(alias = "prune_ratio")]
+    compaction_ratio: Option<f64>,
+    #[serde(rename = "archive_ratio_trigger_enabled")]
+    _archive_ratio_trigger_enabled: Option<bool>,
 }
 
 fn env_or_f64_first(vars: &[&str], fallback: f64) -> f64 {
@@ -186,20 +183,9 @@ fn env_or_csv_paths(var: &str, fallback: &[String]) -> Vec<String> {
 }
 
 fn validate(cfg: &MoonConfig) -> Result<()> {
-    let a = cfg.thresholds.archive_ratio;
-    let c = cfg.thresholds.compaction_ratio;
-    if !(c > 0.0 && c <= 1.0) {
-        return Err(anyhow!(
-            "invalid compaction ratio: require 0 < compaction <= 1.0"
-        ));
-    }
-    if !(a > 0.0 && a <= 1.0) {
-        return Err(anyhow!("invalid archive ratio: require 0 < archive <= 1.0"));
-    }
-    if cfg.thresholds.archive_ratio_trigger_enabled && c <= a {
-        return Err(anyhow!(
-            "invalid moon thresholds: require 0 < archive < compaction <= 1.0"
-        ));
+    let trigger = cfg.thresholds.trigger_ratio;
+    if !(trigger > 0.0 && trigger <= 1.0) {
+        return Err(anyhow!("invalid trigger ratio: require 0 < trigger <= 1.0"));
     }
     if cfg.watcher.poll_interval_secs == 0 {
         return Err(anyhow!(
@@ -209,17 +195,16 @@ fn validate(cfg: &MoonConfig) -> Result<()> {
     if cfg.inbound_watch.event_mode.trim().is_empty() {
         return Err(anyhow!("invalid inbound event mode: cannot be empty"));
     }
-    if cfg.distill.mode != "manual" && cfg.distill.mode != "idle" {
-        return Err(anyhow!("invalid distill mode: use `manual` or `idle`"));
+    if cfg.distill.mode != "manual" && cfg.distill.mode != "idle" && cfg.distill.mode != "daily" {
+        return Err(anyhow!(
+            "invalid distill mode: use `manual`, `idle`, or `daily`"
+        ));
     }
     if cfg.distill.max_per_cycle == 0 {
         return Err(anyhow!("invalid distill max per cycle: must be >= 1"));
     }
     if cfg.distill.idle_secs == 0 {
         return Err(anyhow!("invalid distill idle secs: must be >= 1"));
-    }
-    if cfg.distill.archive_grace_hours == 0 {
-        return Err(anyhow!("invalid distill archive grace hours: must be >= 1"));
     }
     if cfg.retention.active_days == 0 {
         return Err(anyhow!("invalid retention active days: must be >= 1"));
@@ -260,8 +245,13 @@ fn merge_file_config(base: &mut MoonConfig) -> Result<()> {
     let raw = fs::read_to_string(&path)?;
     let parsed: PartialMoonConfig = toml::from_str(&raw)
         .map_err(|err| anyhow!("failed to parse moon config {}: {err}", path.display()))?;
-    if let Some(thresholds) = parsed.thresholds {
-        base.thresholds = thresholds;
+    if let Some(thresholds) = parsed.thresholds
+        && let Some(trigger_ratio) = thresholds
+            .trigger_ratio
+            .or(thresholds.compaction_ratio)
+            .or(thresholds.archive_ratio)
+    {
+        base.thresholds.trigger_ratio = trigger_ratio;
     }
     if let Some(watcher) = parsed.watcher {
         base.watcher = watcher;
@@ -282,18 +272,14 @@ pub fn load_config() -> Result<MoonConfig> {
     let mut cfg = MoonConfig::default();
     merge_file_config(&mut cfg)?;
 
-    cfg.thresholds.archive_ratio =
-        env_or_f64("MOON_THRESHOLD_ARCHIVE_RATIO", cfg.thresholds.archive_ratio);
-    cfg.thresholds.archive_ratio_trigger_enabled = env_or_bool(
-        "MOON_ENABLE_ARCHIVE_RATIO_TRIGGER",
-        cfg.thresholds.archive_ratio_trigger_enabled,
-    );
-    cfg.thresholds.compaction_ratio = env_or_f64_first(
+    cfg.thresholds.trigger_ratio = env_or_f64_first(
         &[
+            "MOON_TRIGGER_RATIO",
             "MOON_THRESHOLD_COMPACTION_RATIO",
             "MOON_THRESHOLD_PRUNE_RATIO",
+            "MOON_THRESHOLD_ARCHIVE_RATIO",
         ],
-        cfg.thresholds.compaction_ratio,
+        cfg.thresholds.trigger_ratio,
     );
     cfg.watcher.poll_interval_secs =
         env_or_u64("MOON_POLL_INTERVAL_SECS", cfg.watcher.poll_interval_secs);
@@ -309,9 +295,9 @@ pub fn load_config() -> Result<MoonConfig> {
     cfg.distill.mode = env_or_string("MOON_DISTILL_MODE", &cfg.distill.mode);
     cfg.distill.idle_secs = env_or_u64("MOON_DISTILL_IDLE_SECS", cfg.distill.idle_secs);
     cfg.distill.max_per_cycle = env_or_u64("MOON_DISTILL_MAX_PER_CYCLE", cfg.distill.max_per_cycle);
-    cfg.distill.archive_grace_hours = env_or_u64(
-        "MOON_DISTILL_ARCHIVE_GRACE_HOURS",
-        cfg.distill.archive_grace_hours,
+    cfg.distill.residential_timezone = env_or_string(
+        "MOON_RESIDENTIAL_TIMEZONE",
+        &cfg.distill.residential_timezone,
     );
     cfg.retention.active_days = env_or_u64("MOON_RETENTION_ACTIVE_DAYS", cfg.retention.active_days);
     cfg.retention.warm_days = env_or_u64("MOON_RETENTION_WARM_DAYS", cfg.retention.warm_days);

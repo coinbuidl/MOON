@@ -1,4 +1,4 @@
-use crate::moon::distill::{extract_projection_data, ProjectionData};
+use crate::moon::distill::{ProjectionData, extract_projection_data};
 use crate::moon::paths::MoonPaths;
 use crate::moon::qmd;
 use crate::moon::snapshot::write_snapshot;
@@ -18,6 +18,8 @@ pub struct ArchiveRecord {
     pub source_path: String,
     pub archive_path: String,
     pub projection_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_filtered_noise_count: Option<usize>,
     pub content_hash: String,
     pub created_at_epoch_secs: u64,
     pub indexed_collection: String,
@@ -61,6 +63,17 @@ fn ledger_path(paths: &MoonPaths) -> PathBuf {
 }
 
 pub fn projection_path_for_archive_path(archive_path: &Path) -> PathBuf {
+    if let (Some(parent), Some(file_name)) = (archive_path.parent(), archive_path.file_name())
+        && parent
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|name| name == "raw")
+        && let Some(archives_root) = parent.parent()
+    {
+        let mut projection_name = PathBuf::from(file_name);
+        projection_name.set_extension("md");
+        return archives_root.join("mlib").join(projection_name);
+    }
     archive_path.with_extension("md")
 }
 
@@ -70,6 +83,31 @@ pub fn projection_path_for_archive(archive_path: &str) -> PathBuf {
 
 fn raw_archives_dir(paths: &MoonPaths) -> PathBuf {
     paths.archives_dir.join("raw")
+}
+
+fn mlib_archives_dir(paths: &MoonPaths) -> PathBuf {
+    paths.archives_dir.join("mlib")
+}
+
+fn legacy_projection_path_for_archive_path(archive_path: &Path) -> PathBuf {
+    archive_path.with_extension("md")
+}
+
+fn legacy_lib_projection_path_for_archive_path(archive_path: &Path) -> Option<PathBuf> {
+    let (Some(parent), Some(file_name)) = (archive_path.parent(), archive_path.file_name()) else {
+        return None;
+    };
+    if parent
+        .file_name()
+        .and_then(|v| v.to_str())
+        .is_some_and(|name| name == "raw")
+        && let Some(archives_root) = parent.parent()
+    {
+        let mut projection_name = PathBuf::from(file_name);
+        projection_name.set_extension("md");
+        return Some(archives_root.join("lib").join(projection_name));
+    }
+    None
 }
 
 fn move_file(from: &Path, to: &Path) -> Result<()> {
@@ -110,6 +148,56 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn conflict_projection_target(base_target: &Path, source_hash: &str, index: usize) -> PathBuf {
+    let short_hash = source_hash
+        .get(..8.min(source_hash.len()))
+        .unwrap_or(source_hash);
+    let stem = base_target
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("projection");
+    let ext = base_target.extension().and_then(|v| v.to_str());
+    let suffix = if index == 0 {
+        format!("{stem}-legacy-{short_hash}")
+    } else {
+        format!("{stem}-legacy-{short_hash}-{index}")
+    };
+    match ext {
+        Some(ext) if !ext.is_empty() => base_target.with_file_name(format!("{suffix}.{ext}")),
+        _ => base_target.with_file_name(suffix),
+    }
+}
+
+fn move_projection_file(from: &Path, to: &Path) -> Result<()> {
+    if to.exists() {
+        let from_hash = file_hash(from)?;
+        let to_hash = file_hash(to)?;
+        if from_hash == to_hash {
+            fs::remove_file(from)
+                .with_context(|| format!("failed to remove {}", from.display()))?;
+            return Ok(());
+        }
+
+        let mut index = 0usize;
+        loop {
+            let candidate = conflict_projection_target(to, &from_hash, index);
+            if !candidate.exists() {
+                move_file(from, &candidate)?;
+                return Ok(());
+            }
+            let candidate_hash = file_hash(&candidate)?;
+            if candidate_hash == from_hash {
+                fs::remove_file(from)
+                    .with_context(|| format!("failed to remove {}", from.display()))?;
+                return Ok(());
+            }
+            index = index.saturating_add(1);
+        }
+    }
+
+    move_file(from, to)
+}
+
 fn read_ledger(path: &Path) -> Result<Vec<ArchiveRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -144,6 +232,40 @@ fn truncate_preview(text: &str, max: usize) -> String {
     }
 }
 
+fn render_search_capsule(entry: &crate::moon::distill::ProjectionEntry) -> Option<String> {
+    let mut parts = Vec::new();
+    if !entry.content.trim().is_empty() {
+        parts.push(entry.content.trim().to_string());
+    }
+    if let Some(target) = entry.tool_target.as_deref() {
+        let trimmed = target.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if let Some(result) = entry.coupled_result.as_deref() {
+        let trimmed = result.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+
+    let role = if let Some(tool) = entry.tool_name.as_deref() {
+        format!("{}:{}", entry.role, tool)
+    } else {
+        entry.role.clone()
+    };
+    let text = truncate_preview(&parts.join(" | "), 360);
+    if text.is_empty() {
+        None
+    } else {
+        Some(format!("- [{}] {}\n", role, text))
+    }
+}
+
 fn render_projection_markdown_v2(
     session_id: &str,
     source_path: &Path,
@@ -152,7 +274,9 @@ fn render_projection_markdown_v2(
     created_at_epoch_secs: u64,
     data: &ProjectionData,
 ) -> String {
-    use chrono::{DateTime, Utc, TimeZone, Local};
+    use chrono::{DateTime, Local, TimeZone, Utc};
+    const TIMELINE_ENTRY_LIMIT: usize = 400;
+    const SEARCH_CAPSULE_LIMIT: usize = 1_600;
 
     let mut out = String::new();
     out.push_str("---\n");
@@ -169,50 +293,92 @@ fn render_projection_markdown_v2(
     out.push_str(&format!("content_hash: {}\n", yaml_quote(content_hash)));
     out.push_str(&format!("created_at_epoch_secs: {created_at_epoch_secs}\n"));
 
-    let start_utc = data.time_start_epoch.map(|t| Utc.timestamp_opt(t as i64, 0).unwrap()).unwrap_or_else(Utc::now);
-    let end_utc = data.time_end_epoch.map(|t| Utc.timestamp_opt(t as i64, 0).unwrap()).unwrap_or_else(Utc::now);
-    
-    let local_offset = std::env::var("MOON_LOCAL_TIMEZONE").unwrap_or_else(|_| Local::now().offset().to_string());
-    
+    let fallback_utc = Utc
+        .timestamp_opt(created_at_epoch_secs as i64, 0)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let start_utc = data
+        .time_start_epoch
+        .and_then(|t| Utc.timestamp_opt(t as i64, 0).single())
+        .unwrap_or(fallback_utc);
+    let end_utc = data
+        .time_end_epoch
+        .and_then(|t| Utc.timestamp_opt(t as i64, 0).single())
+        .unwrap_or(start_utc);
+
+    let local_offset =
+        std::env::var("MOON_LOCAL_TIMEZONE").unwrap_or_else(|_| Local::now().offset().to_string());
+
     let start_local: DateTime<Local> = start_utc.with_timezone(&Local);
     let end_local: DateTime<Local> = end_utc.with_timezone(&Local);
 
-    out.push_str(&format!("time_range_utc: \"{} — {}\"\n", start_utc.format("%Y-%m-%dT%H:%M:%SZ"), end_utc.format("%Y-%m-%dT%H:%M:%SZ")));
-    out.push_str(&format!("time_range_local: \"{} — {}\"\n", start_local.format("%Y-%m-%dT%H:%M:%S%:z"), end_local.format("%Y-%m-%dT%H:%M:%S%:z")));
+    out.push_str(&format!(
+        "time_range_utc: \"{} — {}\"\n",
+        start_utc.format("%Y-%m-%dT%H:%M:%SZ"),
+        end_utc.format("%Y-%m-%dT%H:%M:%SZ")
+    ));
+    out.push_str(&format!(
+        "time_range_local: \"{} — {}\"\n",
+        start_local.format("%Y-%m-%dT%H:%M:%S%:z"),
+        end_local.format("%Y-%m-%dT%H:%M:%S%:z")
+    ));
     out.push_str(&format!("local_timezone: {}\n", yaml_quote(&local_offset)));
     out.push_str(&format!("message_count: {}\n", data.entries.len()));
-    
+    out.push_str(&format!(
+        "filtered_noise_count: {}\n",
+        data.filtered_noise_count
+    ));
+
     let tools_str = serde_json::to_string(&data.tool_calls).unwrap_or_else(|_| "[]".to_string());
     out.push_str(&format!("tool_calls: {}\n", tools_str));
-    
+
     let keywords_str = serde_json::to_string(&data.keywords).unwrap_or_else(|_| "[]".to_string());
     out.push_str(&format!("keywords: {}\n", keywords_str));
-    
+
     let topics_str = serde_json::to_string(&data.topics).unwrap_or_else(|_| "[]".to_string());
     out.push_str(&format!("topics: {}\n", topics_str));
-    
+
     out.push_str("---\n\n");
-    
+
     out.push_str(&format!("# Archive Projection — {}\n\n", session_id));
-    out.push_str(&format!("> Session: {}–{} {} ({}–{} UTC)\n", start_local.format("%Y-%m-%d %H:%M"), end_local.format("%H:%M"), local_offset, start_utc.format("%Y-%m-%d %H:%M"), end_utc.format("%H:%M")));
-    out.push_str(&format!("> Messages: {} | Tools used: {}\n\n", data.entries.len(), data.tool_calls.join(", ")));
-    
+    out.push_str(&format!(
+        "> Session: {}–{} {} ({}–{} UTC)\n",
+        start_local.format("%Y-%m-%d %H:%M"),
+        end_local.format("%H:%M"),
+        local_offset,
+        start_utc.format("%Y-%m-%d %H:%M"),
+        end_utc.format("%H:%M")
+    ));
+    out.push_str(&format!(
+        "> Messages: {} | Noise filtered: {} | Timeline rows: up to {} | Tools used: {}\n\n",
+        data.entries.len(),
+        data.filtered_noise_count,
+        TIMELINE_ENTRY_LIMIT,
+        data.tool_calls.join(", ")
+    ));
+
     out.push_str("## Timeline\n\n");
     out.push_str("| # | Time (UTC) | Time (Local) | Role | Summary |\n");
     out.push_str("|---|---|---|---|---|\n");
-    
+
     let mut convs_user = String::new();
     let mut convs_asst = String::new();
-    let mut tool_sections: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
-    
-    for (i, entry) in data.entries.iter().enumerate() {
-        let ts_utc = entry.timestamp_epoch.map(|t| Utc.timestamp_opt(t as i64, 0).unwrap()).unwrap_or_else(Utc::now);
+    let mut tool_sections: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+
+    let mut last_known_ts_utc = start_utc;
+    for (i, entry) in data.entries.iter().take(TIMELINE_ENTRY_LIMIT).enumerate() {
+        let ts_utc = entry
+            .timestamp_epoch
+            .and_then(|t| Utc.timestamp_opt(t as i64, 0).single())
+            .unwrap_or(last_known_ts_utc);
+        last_known_ts_utc = ts_utc;
         let ts_local: DateTime<Local> = ts_utc.with_timezone(&Local);
         let time_str_utc = ts_utc.format("%H:%M:%SZ").to_string();
         let time_str_local = ts_local.format("%H:%M:%S").to_string();
-        
+
         let preview = truncate_preview(&entry.content, 60);
-        
+
         // NL injection every 15 entries for Lilac §4
         if i > 0 && i % 15 == 0 {
             let nl_time = ts_local.format("%A %p").to_string();
@@ -224,32 +390,58 @@ fn render_projection_markdown_v2(
         } else {
             entry.role.clone()
         };
-        out.push_str(&format!("| {} | {} | {} | {} | {} |\n", i + 1, time_str_utc, time_str_local, role_display, preview));
-        
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            i + 1,
+            time_str_utc,
+            time_str_local,
+            role_display,
+            preview
+        ));
+
         let conv_line = format!("- [{}] {}\n", time_str_utc, preview);
         if entry.role == "user" {
             convs_user.push_str(&conv_line);
         } else if entry.role == "assistant" {
-            convs_asst.push_str(&format!("- [{}] {}\n", time_str_utc, truncate_preview(&entry.content, 120)));
+            convs_asst.push_str(&format!(
+                "- [{}] {}\n",
+                time_str_utc,
+                truncate_preview(&entry.content, 120)
+            ));
         }
-        
+
         if let Some(ref tool) = entry.tool_name {
             let list = tool_sections.entry(tool.clone()).or_default();
             let target = entry.tool_target.as_deref().unwrap_or("");
-            let result_preview = entry.coupled_result.as_deref().map(|r| truncate_preview(r, 60)).unwrap_or_default();
+            let result_preview = entry
+                .coupled_result
+                .as_deref()
+                .map(|r| truncate_preview(r, 60))
+                .unwrap_or_default();
             // Contextual stitching (Lilac §3)
-            list.push(format!("- [{}] `{}` → {}\n", time_str_utc, target, result_preview));
+            list.push(format!(
+                "- [{}] `{}` → {}\n",
+                time_str_utc, target, result_preview
+            ));
         } else if entry.role == "toolResult" && entry.coupled_result.is_none() {
             let list = tool_sections.entry("unknown_tool".to_string()).or_default();
             list.push(format!("- [{}] {}\n", time_str_utc, preview));
         }
     }
-    
+
     out.push_str("\n## Conversations\n\n### User Queries\n");
-    if convs_user.is_empty() { out.push_str("- None\n"); } else { out.push_str(&convs_user); }
+    if convs_user.is_empty() {
+        out.push_str("- None\n");
+    } else {
+        out.push_str(&convs_user);
+    }
     out.push_str("\n### Assistant Responses\n");
-    if convs_asst.is_empty() { out.push_str("- None\n"); } else { out.push_str(&convs_asst); }
-    
+    if convs_asst.is_empty() {
+        out.push_str("- None\n");
+    } else {
+        out.push_str(&convs_asst);
+    }
+
     out.push_str("\n## Tool Activity\n\n");
     if tool_sections.is_empty() {
         out.push_str("- None\n");
@@ -262,13 +454,32 @@ fn render_projection_markdown_v2(
             out.push('\n');
         }
     }
-    
+
+    out.push_str("## Search Capsules\n");
+    out.push_str("<!-- High-recall lexical anchors for QMD exact/keyword retrieval -->\n");
+    let mut capsule_count = 0usize;
+    for entry in &data.entries {
+        let Some(line) = render_search_capsule(entry) else {
+            continue;
+        };
+        out.push_str(&line);
+        capsule_count += 1;
+        if capsule_count >= SEARCH_CAPSULE_LIMIT {
+            out.push_str("- [search capsules truncated]\n");
+            break;
+        }
+    }
+    if capsule_count == 0 {
+        out.push_str("- None\n");
+    }
+    out.push('\n');
+
     out.push_str("## Decisions & Outcomes\n- (Extracted via periodic compaction)\n\n");
-    
+
     out.push_str("## Keywords & Topics\n");
     out.push_str(&format!("- **Keywords**: {}\n", data.keywords.join(", ")));
     out.push_str(&format!("- **Topics**: {}\n\n", data.topics.join(", ")));
-    
+
     out.push_str("## Compaction Notes\n");
     if data.compaction_anchors.is_empty() {
         out.push_str("- No compactions recorded in this session.\n");
@@ -278,8 +489,14 @@ fn render_projection_markdown_v2(
             out.push_str(&format!("- {} (Origin: `{}`)\n", anchor.note, origin_ref));
         }
     }
-    
+
     out
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionWriteOutcome {
+    path: PathBuf,
+    filtered_noise_count: usize,
 }
 
 fn write_archive_projection(
@@ -288,12 +505,16 @@ fn write_archive_projection(
     archive_path: &Path,
     content_hash: &str,
     created_at_epoch_secs: u64,
-) -> Result<PathBuf> {
+) -> Result<ProjectionWriteOutcome> {
     let projection_path = projection_path_for_archive_path(archive_path);
     let archive_path_str = archive_path.display().to_string();
-    let proj_data = extract_projection_data(&archive_path_str)
-        .with_context(|| format!("failed to extract projection data from {}", archive_path.display()))?;
-    
+    let proj_data = extract_projection_data(&archive_path_str).with_context(|| {
+        format!(
+            "failed to extract projection data from {}",
+            archive_path.display()
+        )
+    })?;
+
     let markdown = render_projection_markdown_v2(
         session_id,
         source_path,
@@ -302,10 +523,17 @@ fn write_archive_projection(
         created_at_epoch_secs,
         &proj_data,
     );
-    
+
+    if let Some(parent) = projection_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
     fs::write(&projection_path, markdown)
         .with_context(|| format!("failed to write {}", projection_path.display()))?;
-    Ok(projection_path)
+    Ok(ProjectionWriteOutcome {
+        path: projection_path,
+        filtered_noise_count: proj_data.filtered_noise_count,
+    })
 }
 
 pub fn read_ledger_records(paths: &MoonPaths) -> Result<Vec<ArchiveRecord>> {
@@ -356,6 +584,9 @@ pub fn normalize_archive_layout(paths: &MoonPaths) -> Result<ArchiveLayoutMigrat
     let raw_dir = raw_archives_dir(paths);
     fs::create_dir_all(&raw_dir)
         .with_context(|| format!("failed to create {}", raw_dir.display()))?;
+    let mlib_dir = mlib_archives_dir(paths);
+    fs::create_dir_all(&mlib_dir)
+        .with_context(|| format!("failed to create {}", mlib_dir.display()))?;
 
     let mut out = ArchiveLayoutMigrationOutcome::default();
     let mut changed = false;
@@ -364,13 +595,6 @@ pub fn normalize_archive_layout(paths: &MoonPaths) -> Result<ArchiveLayoutMigrat
         out.scanned += 1;
 
         let old_archive = PathBuf::from(&record.archive_path);
-        if old_archive
-            .parent()
-            .is_some_and(|parent| parent == raw_dir.as_path())
-        {
-            continue;
-        }
-
         let Some(file_name) = old_archive.file_name().map(|v| v.to_owned()) else {
             out.failed += 1;
             continue;
@@ -407,29 +631,25 @@ pub fn normalize_archive_layout(paths: &MoonPaths) -> Result<ArchiveLayoutMigrat
             }
         }
 
-        let old_projection = record
-            .projection_path
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| projection_path_for_archive_path(&old_archive));
+        let mut candidate_projections = Vec::new();
+        if let Some(path) = record.projection_path.as_deref() {
+            candidate_projections.push(PathBuf::from(path));
+        }
+        candidate_projections.push(projection_path_for_archive_path(&old_archive));
+        candidate_projections.push(legacy_projection_path_for_archive_path(&old_archive));
+        if let Some(path) = legacy_lib_projection_path_for_archive_path(&old_archive) {
+            candidate_projections.push(path);
+        }
+        candidate_projections.sort();
+        candidate_projections.dedup();
+
+        let old_projection = candidate_projections.into_iter().find(|path| path.exists());
         let new_projection = projection_path_for_archive_path(Path::new(&record.archive_path));
 
-        if old_projection.exists() {
+        if let Some(old_projection) = old_projection {
             if old_projection != new_projection {
-                if new_projection.exists() {
-                    let from_hash = file_hash(&old_projection)?;
-                    let to_hash = file_hash(&new_projection)?;
-                    if from_hash == to_hash {
-                        fs::remove_file(&old_projection).with_context(|| {
-                            format!("failed to remove {}", old_projection.display())
-                        })?;
-                    } else {
-                        out.failed += 1;
-                        continue;
-                    }
-                } else {
-                    move_file(&old_projection, &new_projection)?;
-                }
+                move_projection_file(&old_projection, &new_projection)?;
+                out.moved += 1;
             }
 
             let projection_str = new_projection.display().to_string();
@@ -443,6 +663,54 @@ pub fn normalize_archive_layout(paths: &MoonPaths) -> Result<ArchiveLayoutMigrat
         }
     }
 
+    if raw_dir.exists() {
+        for entry in fs::read_dir(&raw_dir)? {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_md = path
+                .extension()
+                .and_then(|v| v.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+            if !is_md {
+                continue;
+            }
+            let Some(file_name) = path.file_name().map(|v| v.to_owned()) else {
+                continue;
+            };
+            let target = mlib_dir.join(file_name);
+            if target == path {
+                continue;
+            }
+            move_projection_file(&path, &target)?;
+            out.moved += 1;
+        }
+    }
+
+    let legacy_lib_dir = paths.archives_dir.join("lib");
+    if legacy_lib_dir.exists() {
+        for entry in fs::read_dir(&legacy_lib_dir)? {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_md = path
+                .extension()
+                .and_then(|v| v.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+            if !is_md {
+                continue;
+            }
+            let Some(file_name) = path.file_name().map(|v| v.to_owned()) else {
+                continue;
+            };
+            let target = mlib_dir.join(file_name);
+            move_projection_file(&path, &target)?;
+            out.moved += 1;
+        }
+    }
+
     if changed {
         write_ledger(&ledger, &records)?;
         out.ledger_updated = true;
@@ -451,7 +719,10 @@ pub fn normalize_archive_layout(paths: &MoonPaths) -> Result<ArchiveLayoutMigrat
     Ok(out)
 }
 
-pub fn backfill_archive_projections(paths: &MoonPaths, reproject: bool) -> Result<ProjectionBackfillOutcome> {
+pub fn backfill_archive_projections(
+    paths: &MoonPaths,
+    reproject: bool,
+) -> Result<ProjectionBackfillOutcome> {
     let ledger = ledger_path(paths);
     if !ledger.exists() {
         return Ok(ProjectionBackfillOutcome::default());
@@ -466,6 +737,9 @@ pub fn backfill_archive_projections(paths: &MoonPaths, reproject: bool) -> Resul
     let mut changed = false;
 
     let mut tracked_archives = BTreeSet::new();
+    let mlib_dir = mlib_archives_dir(paths);
+    fs::create_dir_all(&mlib_dir)
+        .with_context(|| format!("failed to create {}", mlib_dir.display()))?;
 
     for record in &mut records {
         out.scanned += 1;
@@ -475,22 +749,47 @@ pub fn backfill_archive_projections(paths: &MoonPaths, reproject: bool) -> Resul
         if !archive_path.exists() {
             continue;
         }
+        let expected_projection = projection_path_for_archive_path(archive_path);
 
-        if !reproject
-            && let Some(existing_projection) = record
+        if !reproject {
+            let existing_projection = record
                 .projection_path
                 .as_deref()
                 .map(PathBuf::from)
-                .filter(|path| path.exists())
-            {
-                let normalized = existing_projection.display().to_string();
+                .filter(|path| path.exists());
+            let legacy_projection = legacy_projection_path_for_archive_path(archive_path);
+            let projection_source = existing_projection.or_else(|| {
+                if legacy_projection.exists() {
+                    Some(legacy_projection)
+                } else {
+                    None
+                }
+            });
+            if let Some(existing) = projection_source {
+                if existing != expected_projection {
+                    if expected_projection.exists() {
+                        let from_hash = file_hash(&existing)?;
+                        let to_hash = file_hash(&expected_projection)?;
+                        if from_hash == to_hash {
+                            fs::remove_file(&existing).with_context(|| {
+                                format!("failed to remove {}", existing.display())
+                            })?;
+                        } else {
+                            out.failed += 1;
+                            continue;
+                        }
+                    } else {
+                        move_file(&existing, &expected_projection)?;
+                    }
+                }
+                let normalized = expected_projection.display().to_string();
                 if record.projection_path.as_deref() != Some(normalized.as_str()) {
                     record.projection_path = Some(normalized);
                     changed = true;
                 }
                 continue;
             }
-
+        }
 
         match write_archive_projection(
             &record.session_id,
@@ -499,9 +798,10 @@ pub fn backfill_archive_projections(paths: &MoonPaths, reproject: bool) -> Resul
             &record.content_hash,
             record.created_at_epoch_secs,
         ) {
-            Ok(path) => {
+            Ok(outcome) => {
                 out.created += 1;
-                record.projection_path = Some(path.display().to_string());
+                record.projection_path = Some(outcome.path.display().to_string());
+                record.projection_filtered_noise_count = Some(outcome.filtered_noise_count);
                 changed = true;
             }
             Err(_) => {
@@ -631,7 +931,7 @@ pub fn archive_and_index(
         .unwrap_or("session")
         .to_string();
     let created_at_epoch_secs = epoch_now()?;
-    let projection_path = match write_archive_projection(
+    let projection_out = match write_archive_projection(
         &session_id,
         &write.source_path,
         &write.archive_path,
@@ -654,6 +954,10 @@ pub fn archive_and_index(
             None
         }
     };
+
+    let projection_path = projection_out.as_ref().map(|out| out.path.clone());
+    let projection_filtered_noise_count =
+        projection_out.as_ref().map(|out| out.filtered_noise_count);
 
     let mut indexed = projection_path.is_some();
     if let Err(err) =
@@ -682,6 +986,7 @@ pub fn archive_and_index(
         source_path: write.source_path.display().to_string(),
         archive_path: write.archive_path.display().to_string(),
         projection_path: projection_path.map(|p| p.display().to_string()),
+        projection_filtered_noise_count,
         content_hash: archive_hash,
         created_at_epoch_secs,
         indexed_collection: collection_name.to_string(),

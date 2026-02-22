@@ -29,7 +29,7 @@
 5. `LEDGER_READ_FAILED`: verify `archives/ledger.jsonl` exists and contains valid JSONL records.
 6. `INDEX_NOTE_FAILED`: verify gateway `chat.send` permissions and session key validity.
 7. `PROJECTION_WRITE_FAILED`: verify archive read permissions and projection markdown write permissions.
-8. `DISTILL_SOURCE_MISSING`: verify archive projection markdown exists (`archives/raw/*.md`) and rerun `moon-index --name history` to backfill.
+8. `DISTILL_SOURCE_MISSING`: verify archive projection markdown exists (`archives/mlib/*.md`) and rerun `moon-index --name history` to backfill.
 
 ## Stage Policies
 

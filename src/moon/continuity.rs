@@ -23,8 +23,6 @@ pub struct ContinuityOutcome {
     pub rollover_ok: bool,
 }
 
-
-
 fn try_rollover() -> Result<String> {
     let enabled = std::env::var("MOON_ENABLE_SESSION_ROLLOVER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))

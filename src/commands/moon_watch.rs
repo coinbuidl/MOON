@@ -7,6 +7,7 @@ use crate::moon::watcher;
 pub struct MoonWatchOptions {
     pub once: bool,
     pub daemon: bool,
+    pub distill_now: bool,
 }
 
 pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
@@ -16,6 +17,10 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
         report.issue("invalid flags: use only one of --once or --daemon");
         return Ok(report);
     }
+    if opts.daemon && opts.distill_now {
+        report.issue("invalid flags: --distill-now is only valid with --once");
+        return Ok(report);
+    }
 
     if opts.daemon {
         report.detail("starting moon watcher in daemon mode");
@@ -23,7 +28,13 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
         return Ok(report);
     }
 
-    let cycle = watcher::run_once()?;
+    let cycle = if opts.distill_now {
+        watcher::run_once_with_options(watcher::WatchRunOptions {
+            force_distill_now: true,
+        })?
+    } else {
+        watcher::run_once()?
+    };
     report.detail("moon watcher cycle completed");
     report.detail(format!("state_file={}", cycle.state_file));
     report.detail(format!(
@@ -31,24 +42,12 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
         cycle.heartbeat_epoch_secs
     ));
     report.detail(format!("poll_interval_secs={}", cycle.poll_interval_secs));
-    report.detail(format!("threshold.archive={}", cycle.archive_threshold));
-    report.detail(format!(
-        "threshold.archive_trigger_enabled={}",
-        cycle.archive_trigger_enabled
-    ));
-    report.detail(format!(
-        "threshold.compaction={}",
-        cycle.compaction_threshold
-    ));
+    report.detail(format!("threshold.trigger={}", cycle.trigger_threshold));
     report.detail(format!("distill.mode={}", cycle.distill_mode));
     report.detail(format!("distill.idle_secs={}", cycle.distill_idle_secs));
     report.detail(format!(
         "distill.max_per_cycle={}",
         cycle.distill_max_per_cycle
-    ));
-    report.detail(format!(
-        "distill.archive_grace_hours={}",
-        cycle.distill_archive_grace_hours
     ));
     report.detail(format!(
         "retention.active_days={}",
@@ -93,6 +92,11 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
         report.detail(format!("archive.path={}", archive.record.archive_path));
         if let Some(projection_path) = &archive.record.projection_path {
             report.detail(format!("archive.projection_path={projection_path}"));
+        }
+        if let Some(filtered_noise_count) = archive.record.projection_filtered_noise_count {
+            report.detail(format!(
+                "archive.filtered_noise_count={filtered_noise_count}"
+            ));
         }
         report.detail(format!("archive.indexed={}", archive.record.indexed));
         report.detail(format!("archive.deduped={}", archive.deduped));

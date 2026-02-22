@@ -8,6 +8,17 @@ pub enum TriggerKind {
     Compaction,
 }
 
+fn unified_layer1_last_trigger(state: &MoonState) -> Option<u64> {
+    match (
+        state.last_archive_trigger_epoch_secs,
+        state.last_compaction_trigger_epoch_secs,
+    ) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (None, None) => None,
+    }
+}
+
 fn should_fire(last_epoch: Option<u64>, now_epoch: u64, cooldown_secs: u64) -> bool {
     match last_epoch {
         None => true,
@@ -22,25 +33,15 @@ pub fn evaluate(
 ) -> Vec<TriggerKind> {
     let mut out = Vec::new();
     let now = usage.captured_at_epoch_secs;
-
-    if cfg.thresholds.archive_ratio_trigger_enabled
-        && usage.usage_ratio >= cfg.thresholds.archive_ratio
+    if usage.usage_ratio >= cfg.thresholds.trigger_ratio
         && should_fire(
-            state.last_archive_trigger_epoch_secs,
+            unified_layer1_last_trigger(state),
             now,
             cfg.watcher.cooldown_secs,
         )
     {
+        // Unified trigger: archive-before-compact protocol.
         out.push(TriggerKind::Archive);
-    }
-
-    if usage.usage_ratio >= cfg.thresholds.compaction_ratio
-        && should_fire(
-            state.last_compaction_trigger_epoch_secs,
-            now,
-            cfg.watcher.cooldown_secs,
-        )
-    {
         out.push(TriggerKind::Compaction);
     }
 
@@ -73,10 +74,8 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_skips_archive_when_archive_ratio_trigger_disabled() {
-        let mut cfg = MoonConfig::default();
-        cfg.thresholds.archive_ratio_trigger_enabled = false;
-
+    fn evaluate_respects_unified_cooldown() {
+        let cfg = MoonConfig::default();
         let state = MoonState::default();
         let usage = SessionUsageSnapshot {
             session_id: "s".into(),
@@ -88,6 +87,15 @@ mod tests {
         };
 
         let triggers = evaluate(&cfg, &state, &usage);
-        assert_eq!(triggers, vec![TriggerKind::Compaction]);
+        assert_eq!(
+            triggers,
+            vec![TriggerKind::Archive, TriggerKind::Compaction]
+        );
+
+        let mut state_in_cooldown = state.clone();
+        state_in_cooldown.last_archive_trigger_epoch_secs = Some(995);
+        state_in_cooldown.last_compaction_trigger_epoch_secs = Some(998);
+        let triggers_cooldown = evaluate(&cfg, &state_in_cooldown, &usage);
+        assert!(triggers_cooldown.is_empty());
     }
 }
