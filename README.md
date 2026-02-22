@@ -181,7 +181,7 @@ MOON moon-status
 
 Binary name: `MOON`
 
-It is strongly recommended to install the binary to your `$PATH` using `cargo install --path .` rather than relying on `cargo run -- <command>` in production scenarios.
+It is strongly recommended to install the binary to your `$PATH` using `cargo install --path .` rather than relying on `cargo run -- <command>` in production scenarios. You only need to run `cargo install --path .` again if you modify the Rust source code or plugin assets.
 
 ```bash
 MOON <command> [flags]
