@@ -1,8 +1,10 @@
 {
-  "name": "oc-token-optim",
+  "name": "moon",
   "version": "0.1.0",
   "description": "Persist-time token-aware tool result compaction plugin",
   "openclaw": {
-    "extensions": ["./index.js"]
+    "extensions": [
+      "./index.js"
+    ]
   }
 }

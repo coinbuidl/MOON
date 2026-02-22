@@ -1,11 +1,30 @@
 # MOON Repository Audit Report
 
-> **Date**: 2026-02-21  
-> **Scope**: Full source tree (`src/`) — dead code, duplicated utilities, clippy hygiene, unused imports
+> **Date**: 2026-02-23 (Update) / 2026-02-21 (Initial)  
+> **Scope**: Full source tree (`src/` and `tests/`) — dead code, duplicated utilities, clippy hygiene, unused imports, Windows test cleanliness
 
 ---
 
-## Executive Summary
+## Executive Summary (2026-02-23 Update)
+
+| Category | Items Found | Items Fixed |
+|---|---|---|
+| Clippy warnings | 14 (in test suite) | 14 |
+| Dead code | Several unused test helpers | Gated securely on Windows |
+| Unused imports | 4 test imports | Handled via compiler directives |
+
+### 1. Residual Windows test warnings
+The previous audit resolved integration tests failing on Windows by adding `#[cfg(not(windows))]` to individual test functions. However, this left several unused imports (e.g., `tempfile::tempdir`, `std::time::SystemTime`) and dead test helper functions (e.g., `write_fake_qmd`) triggering `clippy` and `dead_code` warnings when compiled on Windows environments.
+
+**Fix**: Applied module-level `#![cfg(not(windows))]` at the very top of the 4 affected test files (`moon_index_test.rs`, `moon_recall_test.rs`, `moon_watch_test.rs`, `post_upgrade_test.rs`). This cleanly excluded all Unix-specific test fixtures and functions from compilation on Windows, instantly resolving all 14 clippy/dead-code warnings.
+
+### 2. Codebase Check
+- `cargo fmt -- --check`: Passed, zero deviations.
+- `cargo test --all-features`: Passed cleanly.
+
+---
+
+## Executive Summary (2026-02-21 Initial)
 
 | Category | Items Found | Items Fixed |
 |---|---|---|

@@ -1,3 +1,4 @@
+#![cfg(not(windows))]
 use predicates::str::contains;
 use serde_json::Value;
 use std::fs;

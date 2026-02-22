@@ -1,5 +1,5 @@
 [package]
-name = "oc-token-optim"
+name = "moon"
 version = "0.1.0"
 edition = "2024"
 description = "Rust CLI for OpenClaw session lifecycle automation: archive, index, recall, and low-cost distillation."

@@ -1,6 +1,6 @@
-# oc-token-optim plugin
+# MOON plugin
 
-`oc-token-optim` compacts large `toolResult` text blocks at persist time using the `tool_result_persist` hook.
+`MOON` compacts large `toolResult` text blocks at persist time using the `tool_result_persist` hook.
 
 ## Stage 2 behavior
 

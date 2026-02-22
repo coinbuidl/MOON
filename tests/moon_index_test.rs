@@ -1,3 +1,4 @@
+#![cfg(not(windows))]
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;

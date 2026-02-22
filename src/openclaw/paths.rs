@@ -3,7 +3,7 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub const PLUGIN_ID: &str = "oc-token-optim";
+pub const PLUGIN_ID: &str = "MOON";
 
 #[derive(Debug, Clone)]
 pub struct OpenClawPaths {

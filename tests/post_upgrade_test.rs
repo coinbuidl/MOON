@@ -1,10 +1,11 @@
+#![cfg(not(windows))]
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
 
 fn write_fake_openclaw(bin_path: &Path, log_path: &Path) {
     let script = format!(
-        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"id\":\"oc-token-optim\"}}]'\nfi\nexit 0\n",
+        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"id\":\"MOON\"}}]'\nfi\nexit 0\n",
         log_path.display()
     );
     fs::write(bin_path, script).expect("write fake openclaw");

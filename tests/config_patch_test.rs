@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 fn write_fake_openclaw(bin_path: &Path, log_path: &Path) {
     let script = format!(
-        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"id\":\"oc-token-optim\"}}]'\nfi\nexit 0\n",
+        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"id\":\"MOON\"}}]'\nfi\nexit 0\n",
         log_path.display()
     );
     fs::write(bin_path, script).expect("write fake openclaw");
@@ -31,7 +31,7 @@ fn patch_respects_existing_values_unless_forced() {
   "agents": {"defaults": {"compaction": {"reserveTokensFloor": 123}}},
   "plugins": {
     "entries": {
-      "oc-token-optim": {"config": {"maxTokens": 999}}
+      "MOON": {"config": {"maxTokens": 999}}
     }
   }
 }"#,
@@ -67,7 +67,7 @@ fn patch_respects_existing_values_unless_forced() {
         cfg_1
             .get("plugins")
             .and_then(|v| v.get("entries"))
-            .and_then(|v| v.get("oc-token-optim"))
+            .and_then(|v| v.get("MOON"))
             .and_then(|v| v.get("config"))
             .and_then(|v| v.get("maxTokens"))
             .and_then(Value::as_i64),
@@ -107,7 +107,7 @@ fn patch_respects_existing_values_unless_forced() {
         cfg_2
             .get("plugins")
             .and_then(|v| v.get("entries"))
-            .and_then(|v| v.get("oc-token-optim"))
+            .and_then(|v| v.get("MOON"))
             .and_then(|v| v.get("config"))
             .and_then(|v| v.get("maxTokens"))
             .and_then(Value::as_i64),
