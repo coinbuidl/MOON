@@ -252,7 +252,7 @@ pub fn recall(
         });
     }
 
-    // Timezone-aware query pre-processing (Lilac)
+    // Timezone-aware query pre-processing
     // Basic heuristic: append UTC version if query contains a time-like pattern
     let mut enhanced_query = query.to_string();
     if query.contains(':')

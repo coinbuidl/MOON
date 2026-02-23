@@ -20,22 +20,37 @@ pub fn run() -> Result<CommandReport> {
     report.detail(format!("qmd_db={}", paths.qmd_db.display()));
 
     if !paths.archives_dir.exists() {
-        report.issue("missing archives dir (~/.lilac_metaflora/archives)");
+        report.issue(format!(
+            "missing archives dir ({})",
+            paths.archives_dir.display()
+        ));
     }
     if !paths.memory_dir.exists() {
-        report.issue("missing daily memory dir (~/.lilac_metaflora/memory)");
+        report.issue(format!(
+            "missing daily memory dir ({})",
+            paths.memory_dir.display()
+        ));
     }
     if !paths.logs_dir.exists() {
-        report.issue("missing moon log dir (~/.lilac_metaflora/skills/moon-system/logs)");
+        report.issue(format!(
+            "missing moon log dir ({})",
+            paths.logs_dir.display()
+        ));
     }
     if !paths.memory_file.exists() {
-        report.issue("missing long-term memory file (~/.lilac_metaflora/MEMORY.md)");
+        report.issue(format!(
+            "missing long-term memory file ({})",
+            paths.memory_file.display()
+        ));
     }
     if !paths.openclaw_sessions_dir.exists() {
-        report.issue("missing OpenClaw sessions dir (~/.openclaw/agents/main/sessions)");
+        report.issue(format!(
+            "missing OpenClaw sessions dir ({})",
+            paths.openclaw_sessions_dir.display()
+        ));
     }
     if !paths.qmd_bin.exists() {
-        report.issue("missing qmd binary (~/.bun/bin/qmd or QMD_BIN)");
+        report.issue(format!("missing qmd binary ({})", paths.qmd_bin.display()));
     }
 
     Ok(report)

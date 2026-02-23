@@ -1,4 +1,4 @@
-# Moon System Skill
+# M.O.O.N. Skill
 
 Use this skill for Moon System operations:
 1. Plugin lifecycle (`install`, `verify`, `repair`, `post-upgrade`).

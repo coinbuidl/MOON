@@ -1,4 +1,4 @@
-# Moon System Runbook
+# M.O.O.N. Runbook
 
 ## Start One Cycle
 
@@ -10,6 +10,7 @@ Bootstrap sequence (minimal setup):
 
 ```bash
 cp .env.example .env
+cp moon.toml.example moon.toml
 MOON verify --strict
 MOON moon-status
 MOON moon-watch --once
@@ -23,7 +24,7 @@ Distill trigger behavior:
 4. Auto-distill reads archive projection markdown (`archives/mlib/*.md`) as its source.
 5. Selection order is oldest pending archive day first, then up to `max_per_cycle`.
 6. Start with `max_per_cycle=1` in test stage, then increase after stable runs.
-7. When `MOON_TOPIC_DISCOVERY=true`, daily memory files maintain a top `Entity Anchors` block with discovered topic tags.
+7. When `distill.topic_discovery = true`, daily memory files maintain a top `Entity Anchors` block with discovered topic tags.
 
 Retention windows:
 
@@ -39,7 +40,7 @@ MOON moon-watch --daemon
 ## Manual Distill
 
 ```bash
-MOON moon-distill --archive ~/.lilac_metaflora/archives/raw/<file>.jsonl --session-id <id>
+MOON moon-distill --archive $MOON_ARCHIVES_DIR/raw/<file>.jsonl --session-id <id>
 ```
 
 Manual layer-2 queue trigger (same selection logic as watcher):
@@ -62,13 +63,13 @@ MOON moon-index --name history
 
 ## Key Paths
 
-1. State file: `~/.lilac_metaflora/state/moon_state.json`
-2. Archives: `~/.lilac_metaflora/archives/`
-3. Raw session snapshots: `~/.lilac_metaflora/archives/raw/*.jsonl`
-4. Archive projections for retrieval: `~/.lilac_metaflora/archives/mlib/*.md`
-5. Archive ledger: `~/.lilac_metaflora/archives/ledger.jsonl`
-6. Daily memory: `~/.lilac_metaflora/memory/YYYY-MM-DD.md`
-7. Audit log: `~/.lilac_metaflora/skills/moon-system/logs/audit.log`
+1. State file: `$MOON_HOME/state/moon_state.json`
+2. Archives root: `$MOON_ARCHIVES_DIR` (default: `$MOON_HOME/archives`)
+3. Raw session snapshots: `$MOON_ARCHIVES_DIR/raw/*.jsonl`
+4. Archive projections for retrieval: `$MOON_ARCHIVES_DIR/mlib/*.md`
+5. Archive ledger: `$MOON_ARCHIVES_DIR/ledger.jsonl`
+6. Daily memory: `$MOON_MEMORY_DIR/YYYY-MM-DD.md` (default: `$MOON_HOME/memory/YYYY-MM-DD.md`)
+7. Audit log: `$MOON_LOGS_DIR/audit.log` (default: `$MOON_HOME/MOON/logs/audit.log`)
 
 ## Troubleshooting
 

@@ -25,11 +25,19 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
     if opts.daemon {
         if let Ok(exe) = std::env::current_exe() {
             let exe_str = exe.display().to_string();
-            if exe_str.contains("target/debug") || exe_str.contains("target/release") || exe_str.contains("target\\debug") || exe_str.contains("target\\release") {
+            if exe_str.contains("target/debug")
+                || exe_str.contains("target/release")
+                || exe_str.contains("target\\debug")
+                || exe_str.contains("target\\release")
+            {
                 report.issue("CRITICAL: Running the background daemon via `cargo run` is disabled for stability.");
                 report.issue("Cargo run holds file locks and causes severe CPU/IO spikes when the daemon restarts.");
-                report.issue("Please install the binary to your path first: `cargo install --path .`");
-                report.issue("Then start the daemon using the compiled binary: `MOON moon-watch --daemon`");
+                report.issue(
+                    "Please install the binary to your path first: `cargo install --path .`",
+                );
+                report.issue(
+                    "Then start the daemon using the compiled binary: `MOON moon-watch --daemon`",
+                );
                 return Ok(report);
             }
         }

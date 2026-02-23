@@ -1547,6 +1547,9 @@ fn distill_summary(input: &DistillInput) -> Result<(String, String)> {
 }
 
 fn topic_discovery_enabled() -> bool {
+    if let Ok(cfg) = crate::moon::config::load_config() {
+        return cfg.distill.topic_discovery;
+    }
     match env::var("MOON_TOPIC_DISCOVERY") {
         Ok(raw) => matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on"),
         Err(_) => false,

@@ -58,6 +58,8 @@ pub struct MoonDistillConfig {
     pub max_per_cycle: u64,
     #[serde(default = "default_residential_timezone")]
     pub residential_timezone: String,
+    #[serde(default)]
+    pub topic_discovery: bool,
 }
 
 fn default_residential_timezone() -> String {
@@ -71,6 +73,7 @@ impl Default for MoonDistillConfig {
             idle_secs: 360,
             max_per_cycle: 1,
             residential_timezone: "UTC".to_string(),
+            topic_discovery: false,
         }
     }
 }
@@ -230,8 +233,15 @@ fn resolve_config_path() -> Option<PathBuf> {
         }
     }
 
+    if let Ok(home_override) = env::var("MOON_HOME") {
+        let trimmed = home_override.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("MOON").join("moon.toml"));
+        }
+    }
+
     let home = dirs::home_dir()?;
-    Some(home.join(".lilac_metaflora").join("moon.toml"))
+    Some(home.join("MOON").join("MOON").join("moon.toml"))
 }
 
 fn merge_file_config(base: &mut MoonConfig) -> Result<()> {
@@ -299,6 +309,7 @@ pub fn load_config() -> Result<MoonConfig> {
         "MOON_RESIDENTIAL_TIMEZONE",
         &cfg.distill.residential_timezone,
     );
+    cfg.distill.topic_discovery = env_or_bool("MOON_TOPIC_DISCOVERY", cfg.distill.topic_discovery);
     cfg.retention.active_days = env_or_u64("MOON_RETENTION_ACTIVE_DAYS", cfg.retention.active_days);
     cfg.retention.warm_days = env_or_u64("MOON_RETENTION_WARM_DAYS", cfg.retention.warm_days);
     cfg.retention.cold_days = env_or_u64("MOON_RETENTION_COLD_DAYS", cfg.retention.cold_days);

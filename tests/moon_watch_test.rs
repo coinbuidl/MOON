@@ -101,7 +101,7 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -142,7 +142,7 @@ fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
     let event_log = tmp.path().join("events.log");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::create_dir_all(&inbound_dir).expect("mkdir inbound");
     fs::write(
@@ -194,7 +194,7 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
     let compact_log = tmp.path().join("compact.log");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -257,7 +257,7 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
     assert!(compact_calls.contains("agent:main:discord:channel:over"));
     assert!(compact_calls.contains("agent:main:whatsapp:+61400000000"));
     assert!(compact_calls.contains("MOON_ARCHIVE_INDEX"));
-    assert!(compact_calls.contains("moon-system-index-note"));
+    assert!(compact_calls.contains("MOON-index-note"));
     assert!(!compact_calls.contains("agent:main:discord:channel:small"));
     assert!(!compact_calls.contains("agent:main:main"));
 
@@ -290,7 +290,7 @@ fn moon_watch_once_distills_oldest_pending_archive_day_first() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -359,7 +359,7 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
@@ -450,7 +450,7 @@ fn moon_watch_once_distill_now_runs_in_manual_mode() {
     fs::create_dir_all(moon_home.join("archives/raw")).expect("mkdir archives raw");
     fs::create_dir_all(moon_home.join("archives/mlib")).expect("mkdir archives mlib");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -507,7 +507,7 @@ fn moon_watch_daily_mode_waits_for_idle_window_before_attempt() {
     fs::create_dir_all(moon_home.join("archives/raw")).expect("mkdir archives raw");
     fs::create_dir_all(moon_home.join("archives/mlib")).expect("mkdir archives mlib");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -572,7 +572,7 @@ fn moon_watch_once_emits_ai_warning_when_ledger_is_invalid() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -613,7 +613,7 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
     let qmd_log = tmp.path().join("qmd.log");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::create_dir_all(moon_home.join("continuity")).expect("mkdir continuity");
     fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
@@ -695,7 +695,7 @@ fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(

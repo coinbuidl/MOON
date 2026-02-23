@@ -25,7 +25,7 @@ fn moon_recall_returns_matches() {
     let moon_home = tmp.path().join("moon");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(
@@ -51,7 +51,7 @@ fn moon_recall_maps_qmd_file_uri_to_archive_path() {
     let archives = moon_home.join("archives");
     fs::create_dir_all(archives.join("raw")).expect("mkdir archives/raw");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(
@@ -82,7 +82,7 @@ fn moon_recall_prefers_exact_channel_archive_match() {
     let continuity = moon_home.join("continuity");
     fs::create_dir_all(&archives).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("skills/moon-system/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
     fs::create_dir_all(&continuity).expect("mkdir continuity");
 
     let deterministic_archive = archives.join("exact-session.jsonl");

@@ -32,7 +32,7 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
     * Side-effect priority classification for tool entries
 3.  **Tiered Distillation Pipeline**:
     *   **Phase 1 (Raw Distillation)**: Automatically distills archive projection markdown (`archives/mlib/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
-    *   **Librarian Optimizations**: semantic de-duplication keeps final-state conclusions, and optional topic discovery (`MOON_TOPIC_DISCOVERY=true`) maintains a top-of-file entity anchor block in each daily memory file.
+    *   **Librarian Optimizations**: semantic de-duplication keeps final-state conclusions, and optional topic discovery (`distill.topic_discovery=true` in `moon.toml`) maintains a top-of-file entity anchor block in each daily memory file.
     *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
 
 ## Recommended Agent Integration
@@ -51,8 +51,8 @@ Add this block to your workspace `AGENTS.md` (adjust the repo path if different)
 ```md
 ### MOON Archive Recall Policy (Required)
 
-1. History search backend is QMD collection `history`, rooted at `~/.lilac_metaflora/archives`, mask `mlib/**/*.md` (archive projections in `~/.lilac_metaflora/archives/mlib/*.md`).
-2. Default history retrieval command is `MOON moon-recall --name history --query "<user-intent-query>"`. (If running from source instead of a compiled binary, use `cargo run --manifest-path /Users/lilac/.lilac_metaflora/skills/moon-system/Cargo.toml -- moon-recall ...`).
+1. History search backend is QMD collection `history`, rooted at `$MOON_ARCHIVES_DIR`, mask `mlib/**/*.md` (archive projections in `$MOON_ARCHIVES_DIR/mlib/*.md`).
+2. Default history retrieval command is `MOON moon-recall --name history --query "<user-intent-query>"`. (If running from source instead of a compiled binary, use `cargo run --manifest-path /path/to/MOON/Cargo.toml -- moon-recall --name history --query "<user-intent-query>"`).
 3. Run history retrieval before answering when any condition is true: user references past sessions, pre-compaction context, prior decisions, or current-session context is insufficient.
 4. Retrieval procedure is strict: run one primary query, run one fallback query if no hits, and use top 3 hits only; include `archive_path` in reasoning when available.
 5. If finer detail is required, read the projection frontmatter field `archive_jsonl_path` and fetch only the minimal raw JSONL segment needed.
@@ -81,19 +81,24 @@ Query semantics:
 
 ```bash
 cp .env.example .env
+cp moon.toml.example moon.toml
+$EDITOR .env
 cargo install --path .
+MOON verify --strict
+MOON moon-status
 ```
 
-Set `.env` before first run.
+`.env.example` and `moon.toml.example` are templates. Keep them generic; put
+machine-specific values in `.env` and local `moon.toml` only.
 
-Must-have variable:
+Required `.env` value:
 
 ```bash
 # Required: OpenClaw binary path (no default)
 OPENCLAW_BIN=/absolute/path/to/openclaw
 ```
 
-Recommended explicit path setup (these are the runtime defaults, written explicitly for clarity):
+Default path profile (already set in `.env.example`):
 
 ```bash
 # Binaries
@@ -102,17 +107,46 @@ QMD_BIN=$HOME/.bun/bin/qmd
 QMD_DB=$HOME/.cache/qmd/index.sqlite
 
 # Moon runtime paths
-MOON_HOME=$HOME/.lilac_metaflora
+MOON_HOME=$HOME/MOON
 MOON_ARCHIVES_DIR=$MOON_HOME/archives
 MOON_MEMORY_DIR=$MOON_HOME/memory
 MOON_MEMORY_FILE=$MOON_HOME/MEMORY.md
-MOON_LOGS_DIR=$MOON_HOME/skills/moon-system/logs
-MOON_CONFIG_PATH=$MOON_HOME/moon.toml
+MOON_LOGS_DIR=$MOON_HOME/MOON/logs
+MOON_CONFIG_PATH=$MOON_HOME/MOON/moon.toml
 
 # OpenClaw session source
 OPENCLAW_STATE_DIR=$HOME/.openclaw
 OPENCLAW_CONFIG_PATH=$OPENCLAW_STATE_DIR/openclaw.json
 OPENCLAW_SESSIONS_DIR=$HOME/.openclaw/agents/main/sessions
+```
+
+Workspace-root path profile (optional):
+
+Use this if you want MOON runtime data under an existing workspace root instead of `$HOME/MOON`.
+
+```bash
+MOON_HOME=/path/to/workspace
+MOON_ARCHIVES_DIR=$MOON_HOME/archives
+MOON_MEMORY_DIR=$MOON_HOME/memory
+MOON_MEMORY_FILE=$MOON_HOME/MEMORY.md
+MOON_LOGS_DIR=$MOON_HOME/skills/MOON/logs
+MOON_CONFIG_PATH=$MOON_HOME/skills/MOON/moon.toml
+```
+
+`moon.toml` is optional. If `MOON_CONFIG_PATH` points to a missing file, MOON
+continues with built-in defaults plus `.env` overrides.
+
+Recommended split:
+
+1. `.env`: paths, binaries, provider/model/API keys, and env-only runtime knobs.
+2. `moon.toml`: tuning in `[thresholds]`, `[watcher]`, `[distill]`, `[retention]`, `[inbound_watch]`.
+
+If the same tuning key appears in both places, `.env` wins.
+
+Create a local config file:
+
+```bash
+cp moon.toml.example moon.toml
 ```
 
 Cheaper distill profile (recommended for the agent):
@@ -127,23 +161,30 @@ GEMINI_API_KEY=...
 
 Distill safety guardrails (recommended):
 
-```bash
-# Distill trigger behavior:
-# - mode=idle: run distill after no new archives for idle_secs.
-# - mode=daily: run layer-2 distill once per residential day after idle_secs (timezone below).
-# - mode=manual: disable auto layer-2 distill; trigger with `moon-watch --once --distill-now`.
-# - recommended idle window for active OpenClaw usage: 360 seconds (6 minutes).
-MOON_DISTILL_MODE=idle
-MOON_DISTILL_IDLE_SECS=360
-# During validation start with 1 and raise after stable runs.
-MOON_DISTILL_MAX_PER_CYCLE=1
-MOON_RESIDENTIAL_TIMEZONE=UTC
-MOON_TOPIC_DISCOVERY=true
+```toml
+[thresholds]
+trigger_ratio = 0.5
 
-# Retention windows (days)
-MOON_RETENTION_ACTIVE_DAYS=7
-MOON_RETENTION_WARM_DAYS=30
-MOON_RETENTION_COLD_DAYS=31
+[watcher]
+poll_interval_secs = 30
+cooldown_secs = 60
+
+[distill]
+mode = "idle"
+idle_secs = 360
+max_per_cycle = 3
+residential_timezone = "UTC"
+topic_discovery = true
+
+[retention]
+active_days = 7
+warm_days = 30
+cold_days = 31
+```
+
+Env-only guardrails (keep these in `.env`):
+
+```bash
 
 # Archives larger than this threshold are chunk-distilled automatically.
 # Use `auto` to infer a safe chunk size from model context limits
@@ -233,6 +274,14 @@ After OpenClaw upgrade:
 MOON post-upgrade
 ```
 
+If you upgraded from older builds, clean legacy macOS LaunchAgents to avoid
+duplicate daemons or stale `/tmp/moon*system*.log` logs:
+
+```bash
+launchctl list | rg -i "moon.*system" || true
+ls "$HOME/Library/LaunchAgents" | rg -i "moon.*system" || true
+```
+
 Archive and index latest session:
 
 ```bash
@@ -256,14 +305,14 @@ MOON moon-watch --once
 
 Idle distill selection order:
 
-1. Distill waits until the latest archive has been idle for `MOON_DISTILL_IDLE_SECS`.
+1. Distill waits until the latest archive has been idle for `distill.idle_secs`.
 2. It then selects the oldest pending archive day first.
 3. It distills projection markdown sidecars (`*.md`) for those archives, not raw `*.jsonl`.
 4. It processes up to `max_per_cycle` archives from that day.
 
 Daily distill selection order:
 
-1. In `MOON_DISTILL_MODE=daily`, distill attempts once per residential day (`MOON_RESIDENTIAL_TIMEZONE`) after the latest archive is idle for `MOON_DISTILL_IDLE_SECS`.
+1. In `distill.mode = "daily"`, distill attempts once per residential day (`distill.residential_timezone`) after the latest archive is idle for `distill.idle_secs`.
 2. It selects the oldest pending archive day first.
 3. It distills projection markdown sidecars (`*.md`) for those archives.
 4. Use `MOON moon-watch --once --distill-now` for manual immediate layer-2 runs.
@@ -289,26 +338,30 @@ Start from:
 1. `.env.example`
 2. `moon.toml.example`
 
-Most-used variables:
+Most-used `.env` variables:
 
 1. `OPENCLAW_BIN`
 2. `QMD_BIN`
 3. `MOON_HOME`
-4. `OPENCLAW_SESSIONS_DIR`
-5. `MOON_DISTILL_PROVIDER`
-6. `MOON_DISTILL_MODEL`
-7. `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `AI_API_KEY` (distill only)
-8. `MOON_DISTILL_CHUNK_BYTES` (default `auto`; use numeric bytes to force a fixed threshold)
-9. `MOON_DISTILL_MAX_CHUNKS` (default `128`)
-10. `MOON_DISTILL_MODEL_CONTEXT_TOKENS` (optional context hint used by `MOON_DISTILL_CHUNK_BYTES=auto`)
-11. `MOON_HIGH_TOKEN_ALERT_THRESHOLD` (default `1000000`; set `0` to disable)
-12. `MOON_TRIGGER_RATIO`
-13. `MOON_POLL_INTERVAL_SECS`
-14. `MOON_COOLDOWN_SECS`
-15. `MOON_RESIDENTIAL_TIMEZONE`
-16. `MOON_TOPIC_DISCOVERY`
-17. `MOON_INBOUND_WATCH_PATHS`
-18. `MOON_RETENTION_ACTIVE_DAYS` / `MOON_RETENTION_WARM_DAYS` / `MOON_RETENTION_COLD_DAYS`
+4. `MOON_CONFIG_PATH`
+5. `OPENCLAW_SESSIONS_DIR`
+6. `MOON_DISTILL_PROVIDER`
+7. `MOON_DISTILL_MODEL`
+8. `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `AI_API_KEY` (distill only)
+9. `MOON_DISTILL_CHUNK_BYTES` (default `auto`; use numeric bytes to force a fixed threshold)
+10. `MOON_DISTILL_MAX_CHUNKS` (default `128`)
+11. `MOON_DISTILL_MODEL_CONTEXT_TOKENS` (optional context hint used by `MOON_DISTILL_CHUNK_BYTES=auto`)
+12. `MOON_HIGH_TOKEN_ALERT_THRESHOLD` (default `1000000`; set `0` to disable)
+13. `MOON_ENABLE_COMPACTION_WRITE`
+14. `MOON_ENABLE_SESSION_ROLLOVER`
+
+Primary tuning belongs in `moon.toml`:
+
+1. `[thresholds] trigger_ratio`
+2. `[watcher] poll_interval_secs`, `cooldown_secs`
+3. `[distill] mode`, `idle_secs`, `max_per_cycle`, `residential_timezone`, `topic_discovery`
+4. `[retention] active_days`, `warm_days`, `cold_days`
+5. `[inbound_watch] enabled`, `recursive`, `watch_paths`, `event_mode`
 
 Legacy compatibility: `MOON_THRESHOLD_COMPACTION_RATIO`,
 `MOON_THRESHOLD_ARCHIVE_RATIO`, and `MOON_THRESHOLD_PRUNE_RATIO` are still read
@@ -338,33 +391,30 @@ as fallback inputs for `MOON_TRIGGER_RATIO`.
 If you need full cleanup, stop services and remove plugin/runtime data:
 
 ```bash
-# Stop known service names (current + legacy)
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.lilac.moon-system.plist 2>/dev/null || true
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.lilac.moon.plist 2>/dev/null || true
-systemctl --user stop moon-system 2>/dev/null || true
-systemctl --user disable moon-system 2>/dev/null || true
-systemctl --user stop moon 2>/dev/null || true
-systemctl --user disable moon 2>/dev/null || true
+# Stop known MOON service names
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.MOON.agent.plist 2>/dev/null || true
+systemctl --user stop MOON 2>/dev/null || true
+systemctl --user disable MOON 2>/dev/null || true
 
-rm -f ~/Library/LaunchAgents/com.lilac.moon-system.plist
-rm -f ~/Library/LaunchAgents/com.lilac.moon.plist
-rm -f ~/.config/systemd/user/moon-system.service
-rm -f ~/.config/systemd/user/moon.service
+rm -f ~/Library/LaunchAgents/com.MOON.agent.plist
+rm -f ~/.config/systemd/user/MOON.service
 systemctl --user daemon-reload 2>/dev/null || true
 
-openclaw plugins uninstall oc-token-optim 2>/dev/null || true
-rm -rf ~/.openclaw/extensions/oc-token-optim
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-$OPENCLAW_STATE_DIR/openclaw.json}"
+openclaw plugins uninstall MOON 2>/dev/null || true
+rm -rf "$OPENCLAW_STATE_DIR/extensions/MOON"
 
-MOON_HOME="${MOON_HOME:-$HOME/.lilac_metaflora}"
+MOON_HOME="${MOON_HOME:-$HOME/MOON}"
 rm -rf "$MOON_HOME/archives" "$MOON_HOME/continuity" "$MOON_HOME/state" "$MOON_HOME/memory"
-rm -rf "$MOON_HOME/skills/moon-system/logs"
+rm -rf "$MOON_HOME/MOON/logs"
 rm -f "$MOON_HOME/MEMORY.md"
 
 # Optional: remove persisted Moon config if you created one
-rm -f "$MOON_HOME/moon.toml"
+rm -f "$MOON_HOME/MOON/moon.toml"
 ```
 
 Note: uninstalling the plugin does not automatically restore custom OpenClaw
-config values previously written under `plugins.entries.oc-token-optim` or
+config values previously written under `plugins.entries.MOON` or
 `agents.defaults.*`. Remove or revert those keys manually in
-`~/.openclaw/openclaw.json` if you want a full config rollback.
+`$OPENCLAW_CONFIG_PATH` (default: `$OPENCLAW_STATE_DIR/openclaw.json`) if you want a full config rollback.

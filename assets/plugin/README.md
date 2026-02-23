@@ -12,7 +12,7 @@
 
 ## Plugin config
 
-Under `plugins.entries.oc-token-optim.config`:
+Under `plugins.entries.MOON.config`:
 
 1. `maxTokens` (default `12000`)
 2. `maxChars` (default `60000`)

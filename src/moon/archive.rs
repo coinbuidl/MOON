@@ -379,7 +379,7 @@ fn render_projection_markdown_v2(
 
         let preview = truncate_preview(&entry.content, 60);
 
-        // NL injection every 15 entries for Lilac §4
+        // Natural-language timeline marker every 15 entries
         if i > 0 && i % 15 == 0 {
             let nl_time = ts_local.format("%A %p").to_string();
             out.push_str(&format!("| - | **[{}]** | - | - | - |\n", nl_time));
@@ -418,7 +418,7 @@ fn render_projection_markdown_v2(
                 .as_deref()
                 .map(|r| truncate_preview(r, 60))
                 .unwrap_or_default();
-            // Contextual stitching (Lilac §3)
+            // Contextual stitching between tool call target and result preview
             list.push(format!(
                 "- [{}] `{}` → {}\n",
                 time_str_utc, target, result_preview
