@@ -63,7 +63,7 @@ MOON moon-index --name history
 
 ## Key Paths
 
-1. State file: `$MOON_STATE_FILE` (default: `$MOON_HOME/state/moon_state.json`; `MOON_STATE_DIR` is supported as directory override)
+1. State file: `$MOON_STATE_FILE` (default: `$MOON_HOME/MOON/state/moon_state.json`; `MOON_STATE_DIR` is supported as directory override)
 2. Archives root: `$MOON_ARCHIVES_DIR` (default: `$MOON_HOME/archives`)
 3. Raw session snapshots: `$MOON_ARCHIVES_DIR/raw/*.jsonl`
 4. Archive projections for retrieval: `$MOON_ARCHIVES_DIR/mlib/*.md`

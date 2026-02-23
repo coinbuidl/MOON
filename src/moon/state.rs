@@ -52,7 +52,11 @@ pub fn state_file_path(paths: &MoonPaths) -> PathBuf {
             return PathBuf::from(trimmed).join("moon_state.json");
         }
     }
-    paths.moon_home.join("state").join("moon_state.json")
+    paths
+        .moon_home
+        .join("MOON")
+        .join("state")
+        .join("moon_state.json")
 }
 
 pub fn load(paths: &MoonPaths) -> Result<MoonState> {

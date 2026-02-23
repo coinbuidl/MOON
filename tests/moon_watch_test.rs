@@ -128,7 +128,10 @@ fn moon_watch_once_uses_moon_state_file_override() {
         .arg("--json")
         .assert()
         .success()
-        .stdout(contains(format!("state_file={}", custom_state_file.display())));
+        .stdout(contains(format!(
+            "state_file={}",
+            custom_state_file.display()
+        )));
 
     assert!(
         custom_state_file.exists(),
@@ -136,7 +139,7 @@ fn moon_watch_once_uses_moon_state_file_override() {
         custom_state_file.display()
     );
     assert!(
-        !moon_home.join("state/moon_state.json").exists(),
+        !moon_home.join("MOON/state/moon_state.json").exists(),
         "default state path should not be created when MOON_STATE_FILE is set"
     );
 }
@@ -174,7 +177,7 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
         .assert()
         .success();
 
-    let state_file = moon_home.join("state/moon_state.json");
+    let state_file = moon_home.join("MOON/state/moon_state.json");
     assert!(state_file.exists());
     let ledger = moon_home.join("archives/ledger.jsonl");
     assert!(ledger.exists());
@@ -228,7 +231,7 @@ fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
     assert!(events.contains("Moon System inbound file detected"));
     assert!(events.contains("task.md"));
 
-    let state_file = moon_home.join("state/moon_state.json");
+    let state_file = moon_home.join("MOON/state/moon_state.json");
     let state_raw = fs::read_to_string(state_file).expect("read state");
     assert!(state_raw.contains("inbound_seen_files"));
 }
@@ -393,7 +396,7 @@ fn moon_watch_once_distills_oldest_pending_archive_day_first() {
         .assert()
         .success();
 
-    let distilled = read_distilled_archive_paths(&moon_home.join("state/moon_state.json"));
+    let distilled = read_distilled_archive_paths(&moon_home.join("MOON/state/moon_state.json"));
     assert_eq!(distilled.len(), 1);
     assert!(distilled.contains(&old_archive.to_string_lossy().to_string()));
     assert!(!distilled.contains(&new_archive.to_string_lossy().to_string()));
@@ -457,7 +460,8 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
         "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
         already.display()
     );
-    fs::write(moon_home.join("state/moon_state.json"), state).expect("write state");
+    fs::create_dir_all(moon_home.join("MOON/state")).expect("mkdir state");
+    fs::write(moon_home.join("MOON/state/moon_state.json"), state).expect("write state");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(&qmd);
@@ -481,7 +485,7 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
         .assert()
         .success();
 
-    let distilled = read_distilled_archive_paths(&moon_home.join("state/moon_state.json"));
+    let distilled = read_distilled_archive_paths(&moon_home.join("MOON/state/moon_state.json"));
     assert_eq!(distilled.len(), 2);
     assert!(distilled.contains(&eligible.to_string_lossy().to_string()));
     assert!(distilled.contains(&already.to_string_lossy().to_string()));
@@ -541,7 +545,7 @@ fn moon_watch_once_distill_now_runs_in_manual_mode() {
         .assert()
         .success();
 
-    let distilled = read_distilled_archive_paths(&moon_home.join("state/moon_state.json"));
+    let distilled = read_distilled_archive_paths(&moon_home.join("MOON/state/moon_state.json"));
     assert_eq!(distilled.len(), 1);
     assert!(distilled.contains(&archive_path.to_string_lossy().to_string()));
 }
@@ -606,7 +610,7 @@ fn moon_watch_daily_mode_waits_for_idle_window_before_attempt() {
         .assert()
         .success();
 
-    let state_file = moon_home.join("state/moon_state.json");
+    let state_file = moon_home.join("MOON/state/moon_state.json");
     let distilled = read_distilled_archive_paths(&state_file);
     assert!(distilled.is_empty());
     assert!(read_last_distill_trigger_epoch(&state_file).is_none());
@@ -695,7 +699,8 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
         "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
         archive_path_str
     );
-    fs::write(moon_home.join("state/moon_state.json"), state).expect("write state");
+    fs::create_dir_all(moon_home.join("MOON/state")).expect("mkdir state");
+    fs::write(moon_home.join("MOON/state/moon_state.json"), state).expect("write state");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(&qmd);
@@ -728,7 +733,8 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
         .expect("read map");
     assert!(!map.contains(&archive_path_str));
 
-    let state_raw = fs::read_to_string(moon_home.join("state/moon_state.json")).expect("state");
+    let state_raw =
+        fs::read_to_string(moon_home.join("MOON/state/moon_state.json")).expect("state");
     assert!(!state_raw.contains(&archive_path_str));
 
     let qmd_calls = fs::read_to_string(&qmd_log).expect("qmd calls");
@@ -769,7 +775,8 @@ fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
         "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
         archive_path_str
     );
-    fs::write(moon_home.join("state/moon_state.json"), state).expect("write state");
+    fs::create_dir_all(moon_home.join("MOON/state")).expect("mkdir state");
+    fs::write(moon_home.join("MOON/state/moon_state.json"), state).expect("write state");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(&qmd);
@@ -792,6 +799,7 @@ fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
         .success();
 
     assert!(archive_path.exists());
-    let state_raw = fs::read_to_string(moon_home.join("state/moon_state.json")).expect("state");
+    let state_raw =
+        fs::read_to_string(moon_home.join("MOON/state/moon_state.json")).expect("state");
     assert!(state_raw.contains(&archive_path_str));
 }

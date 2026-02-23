@@ -113,7 +113,7 @@ MOON_MEMORY_DIR=$MOON_HOME/memory
 MOON_MEMORY_FILE=$MOON_HOME/MEMORY.md
 MOON_LOGS_DIR=$MOON_HOME/MOON/logs
 MOON_CONFIG_PATH=$MOON_HOME/MOON/moon.toml
-MOON_STATE_FILE=$MOON_HOME/state/moon_state.json
+MOON_STATE_FILE=$MOON_HOME/MOON/state/moon_state.json
 
 # OpenClaw session source
 OPENCLAW_STATE_DIR=$HOME/.openclaw
@@ -142,7 +142,7 @@ State path override precedence:
 
 1. `MOON_STATE_FILE` (exact file path)
 2. `MOON_STATE_DIR` (directory; file becomes `moon_state.json`)
-3. fallback: `$MOON_HOME/state/moon_state.json`
+3. fallback: `$MOON_HOME/MOON/state/moon_state.json`
 
 Recommended split:
 
@@ -415,7 +415,9 @@ openclaw plugins uninstall MOON 2>/dev/null || true
 rm -rf "$OPENCLAW_STATE_DIR/extensions/MOON"
 
 MOON_HOME="${MOON_HOME:-$HOME/MOON}"
-rm -rf "$MOON_HOME/archives" "$MOON_HOME/continuity" "$MOON_HOME/state" "$MOON_HOME/memory"
+rm -rf "$MOON_HOME/archives" "$MOON_HOME/continuity" "$MOON_HOME/MOON/state" "$MOON_HOME/memory"
+# Optional legacy cleanup from older builds:
+rm -rf "$MOON_HOME/state"
 rm -rf "$MOON_HOME/MOON/logs"
 rm -f "$MOON_HOME/MEMORY.md"
 [ -n "${MOON_STATE_FILE:-}" ] && rm -f "$MOON_STATE_FILE"
