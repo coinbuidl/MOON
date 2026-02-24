@@ -36,7 +36,7 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
                     "Please install the binary to your path first: `cargo install --path .`",
                 );
                 report.issue(
-                    "Then start the daemon using the compiled binary: `MOON moon-watch --daemon`",
+                    "Then start the daemon using the compiled binary: `moon moon-watch --daemon`",
                 );
                 return Ok(report);
             }

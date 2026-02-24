@@ -164,16 +164,16 @@ pub fn run() -> Result<CommandReport> {
         report.issue("missing agents.defaults.contextPruning.softTrim.maxChars");
     }
     if !snapshot.plugin_max_tokens {
-        report.issue("missing plugins.entries.MOON.config.maxTokens");
+        report.issue("missing plugins.entries.moon.config.maxTokens");
     }
     if !snapshot.plugin_max_chars {
-        report.issue("missing plugins.entries.MOON.config.maxChars");
+        report.issue("missing plugins.entries.moon.config.maxChars");
     }
     if !snapshot.plugin_max_retained_bytes {
-        report.issue("missing plugins.entries.MOON.config.maxRetainedBytes");
+        report.issue("missing plugins.entries.moon.config.maxRetainedBytes");
     }
     if !snapshot.plugin_read_profile_tokens {
-        report.issue("missing plugins.entries.MOON.config.tools.read.maxTokens");
+        report.issue("missing plugins.entries.moon.config.tools.read.maxTokens");
     }
     let context_tokens = path_u64(&cfg, &["agents", "defaults", "contextTokens"]);
     if context_tokens.is_none() {

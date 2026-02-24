@@ -25,7 +25,7 @@ fn moon_recall_returns_matches() {
     let moon_home = tmp.path().join("moon");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(
@@ -33,7 +33,7 @@ fn moon_recall_returns_matches() {
         r#"[{"path":"/tmp/a.json","snippet":"rule captured","score":0.8}]"#,
     );
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("QMD_BIN", &qmd)
@@ -51,7 +51,7 @@ fn moon_recall_maps_qmd_file_uri_to_archive_path() {
     let archives = moon_home.join("archives");
     fs::create_dir_all(archives.join("raw")).expect("mkdir archives/raw");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(
@@ -60,7 +60,7 @@ fn moon_recall_maps_qmd_file_uri_to_archive_path() {
     );
 
     let expected = archives.join("raw/test-session-1771470000.jsonl");
-    let assert = assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    let assert = assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("QMD_BIN", &qmd)
@@ -82,7 +82,7 @@ fn moon_recall_prefers_exact_channel_archive_match() {
     let continuity = moon_home.join("continuity");
     fs::create_dir_all(&archives).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&continuity).expect("mkdir continuity");
 
     let deterministic_archive = archives.join("exact-session.jsonl");
@@ -104,7 +104,7 @@ fn moon_recall_prefers_exact_channel_archive_match() {
         r#"[{"path":"/tmp/semantic.json","snippet":"semantic recall","score":0.8}]"#,
     );
 
-    let assert = assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    let assert = assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("QMD_BIN", &qmd)

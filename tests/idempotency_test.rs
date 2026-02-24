@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 fn write_fake_openclaw(bin_path: &Path, log_path: &Path) {
     let script = format!(
-        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '{{\"plugins\":[{{\"id\":\"MOON\"}}]}}'\nfi\nexit 0\n",
+        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '{{\"plugins\":[{{\"id\":\"moon\"}}]}}'\nfi\nexit 0\n",
         log_path.display()
     );
     fs::write(bin_path, script).expect("write fake openclaw");
@@ -30,7 +30,7 @@ fn second_install_is_noop_for_plugin_sync() {
     let log_path = tmp.path().join("openclaw.log");
     write_fake_openclaw(&fake_openclaw, &log_path);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("OPENCLAW_STATE_DIR", &state_dir)
         .env("OPENCLAW_CONFIG_PATH", &config_path)
@@ -39,7 +39,7 @@ fn second_install_is_noop_for_plugin_sync() {
         .assert()
         .success();
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("OPENCLAW_STATE_DIR", &state_dir)
         .env("OPENCLAW_CONFIG_PATH", &config_path)

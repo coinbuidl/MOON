@@ -1,4 +1,4 @@
-# Moon System Failure Policy
+# moon System Failure Policy
 
 ## Principles
 

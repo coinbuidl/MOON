@@ -127,7 +127,7 @@ fn run_chat_send(session_key: &str, message: &str, label: &str) -> Result<String
         .duration_since(UNIX_EPOCH)
         .context("system clock is before UNIX_EPOCH")?
         .as_millis();
-    let idempotency_key = format!("MOON-{label}-{}-{now_ms}", std::process::id());
+    let idempotency_key = format!("moon-{label}-{}-{now_ms}", std::process::id());
     let params = serde_json::json!({
         "sessionKey": normalized_key,
         "message": message,

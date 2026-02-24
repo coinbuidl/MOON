@@ -3,7 +3,7 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub const PLUGIN_ID: &str = "MOON";
+pub const PLUGIN_ID: &str = "moon";
 
 #[derive(Debug, Clone)]
 pub struct OpenClawPaths {

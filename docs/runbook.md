@@ -3,7 +3,7 @@
 ## Start One Cycle
 
 ```bash
-MOON moon-watch --once
+moon moon-watch --once
 ```
 
 Bootstrap sequence (minimal setup):
@@ -11,9 +11,9 @@ Bootstrap sequence (minimal setup):
 ```bash
 cp .env.example .env
 cp moon.toml.example moon.toml
-MOON verify --strict
-MOON moon-status
-MOON moon-watch --once
+moon verify --strict
+moon moon-status
+moon moon-watch --once
 ```
 
 Distill trigger behavior:
@@ -34,42 +34,42 @@ Retention windows:
 ## Start Daemon
 
 ```bash
-MOON moon-watch --daemon
+moon moon-watch --daemon
 ```
 
 ## Manual Distill
 
 ```bash
-MOON moon-distill --archive $MOON_ARCHIVES_DIR/raw/<file>.jsonl --session-id <id>
+moon moon-distill --archive $MOON_ARCHIVES_DIR/raw/<file>.jsonl --session-id <id>
 ```
 
 Manual layer-2 queue trigger (same selection logic as watcher):
 
 ```bash
-MOON moon-watch --once --distill-now
+moon moon-watch --once --distill-now
 ```
 
 ## Recall
 
 ```bash
-MOON moon-recall --query "keyword" --name history
+moon moon-recall --query "keyword" --name history
 ```
 
 Rebuild history index + normalize archive layout:
 
 ```bash
-MOON moon-index --name history
+moon moon-index --name history
 ```
 
 ## Key Paths
 
-1. State file: `$MOON_STATE_FILE` (default: `$MOON_HOME/MOON/state/moon_state.json`; `MOON_STATE_DIR` is supported as directory override)
+1. State file: `$MOON_STATE_FILE` (default: `$MOON_HOME/moon/state/moon_state.json`; `MOON_STATE_DIR` is supported as directory override)
 2. Archives root: `$MOON_ARCHIVES_DIR` (default: `$MOON_HOME/archives`)
 3. Raw session snapshots: `$MOON_ARCHIVES_DIR/raw/*.jsonl`
 4. Archive projections for retrieval: `$MOON_ARCHIVES_DIR/mlib/*.md`
 5. Archive ledger: `$MOON_ARCHIVES_DIR/ledger.jsonl`
 6. Daily memory: `$MOON_MEMORY_DIR/YYYY-MM-DD.md` (default: `$MOON_HOME/memory/YYYY-MM-DD.md`)
-7. Audit log: `$MOON_LOGS_DIR/audit.log` (default: `$MOON_HOME/MOON/logs/audit.log`)
+7. Audit log: `$MOON_LOGS_DIR/audit.log` (default: `$MOON_HOME/moon/logs/audit.log`)
 
 ## Troubleshooting
 

@@ -236,12 +236,12 @@ fn resolve_config_path() -> Option<PathBuf> {
     if let Ok(home_override) = env::var("MOON_HOME") {
         let trimmed = home_override.trim();
         if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed).join("MOON").join("moon.toml"));
+            return Some(PathBuf::from(trimmed).join("moon").join("moon.toml"));
         }
     }
 
     let home = dirs::home_dir()?;
-    Some(home.join("MOON").join("MOON").join("moon.toml"))
+    Some(home.join("moon").join("moon").join("moon.toml"))
 }
 
 fn merge_file_config(base: &mut MoonConfig) -> Result<()> {

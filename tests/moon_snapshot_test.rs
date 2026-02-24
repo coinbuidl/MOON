@@ -11,7 +11,7 @@ fn moon_snapshot_copies_latest_session_file_to_archives() {
     let source = sessions_dir.join("main-session.json");
     fs::write(&source, "{\"hello\":\"moon\"}\n").expect("write source");
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
         .env("MOON_ARCHIVES_DIR", &archives_dir)

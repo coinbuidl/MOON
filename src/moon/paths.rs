@@ -30,12 +30,12 @@ fn env_or_default_path(var: &str, fallback: PathBuf) -> PathBuf {
 
 pub fn resolve_paths() -> Result<MoonPaths> {
     let home = required_home_dir()?;
-    let moon_home = env_or_default_path("MOON_HOME", home.join("MOON"));
+    let moon_home = env_or_default_path("MOON_HOME", home.join("moon"));
 
     let archives_dir = env_or_default_path("MOON_ARCHIVES_DIR", moon_home.join("archives"));
     let memory_dir = env_or_default_path("MOON_MEMORY_DIR", moon_home.join("memory"));
     let memory_file = env_or_default_path("MOON_MEMORY_FILE", moon_home.join("MEMORY.md"));
-    let logs_dir = env_or_default_path("MOON_LOGS_DIR", moon_home.join("MOON/logs"));
+    let logs_dir = env_or_default_path("MOON_LOGS_DIR", moon_home.join("moon/logs"));
     let openclaw_sessions_dir = env_or_default_path(
         "OPENCLAW_SESSIONS_DIR",
         home.join(".openclaw/agents/main/sessions"),

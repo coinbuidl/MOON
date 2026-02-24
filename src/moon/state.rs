@@ -54,7 +54,7 @@ pub fn state_file_path(paths: &MoonPaths) -> PathBuf {
     }
     paths
         .moon_home
-        .join("MOON")
+        .join("moon")
         .join("state")
         .join("moon_state.json")
 }

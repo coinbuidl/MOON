@@ -2588,7 +2588,7 @@ mod tests {
 
     #[test]
     fn discover_topic_tags_filters_timestamp_noise() {
-        let summary = "Decision: Keep MOON trigger ratio at 1.0. archive_jsonl_path /tmp/x. 2026-02-21T10:00:00Z. QMD indexing stable.";
+        let summary = "Decision: Keep moon trigger ratio at 1.0. archive_jsonl_path /tmp/x. 2026-02-21T10:00:00Z. QMD indexing stable.";
         let tags = super::discover_topic_tags(summary);
         assert!(tags.iter().any(|t| t == "#moon"));
         assert!(tags.iter().any(|t| t == "#qmd"));

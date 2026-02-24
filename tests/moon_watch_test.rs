@@ -101,7 +101,7 @@ fn moon_watch_once_uses_moon_state_file_override() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -116,7 +116,7 @@ fn moon_watch_once_uses_moon_state_file_override() {
 
     let custom_state_file = tmp.path().join("custom-state").join("moon_state.json");
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("MOON_STATE_FILE", &custom_state_file)
@@ -139,7 +139,7 @@ fn moon_watch_once_uses_moon_state_file_override() {
         custom_state_file.display()
     );
     assert!(
-        !moon_home.join("MOON/state/moon_state.json").exists(),
+        !moon_home.join("moon/state/moon_state.json").exists(),
         "default state path should not be created when MOON_STATE_FILE is set"
     );
 }
@@ -152,7 +152,7 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -165,7 +165,7 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -177,7 +177,7 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
         .assert()
         .success();
 
-    let state_file = moon_home.join("MOON/state/moon_state.json");
+    let state_file = moon_home.join("moon/state/moon_state.json");
     assert!(state_file.exists());
     let ledger = moon_home.join("archives/ledger.jsonl");
     assert!(ledger.exists());
@@ -193,7 +193,7 @@ fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
     let event_log = tmp.path().join("events.log");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::create_dir_all(&inbound_dir).expect("mkdir inbound");
     fs::write(
@@ -208,7 +208,7 @@ fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -231,7 +231,7 @@ fn moon_watch_once_triggers_inbound_system_event_for_new_file() {
     assert!(events.contains("Moon System inbound file detected"));
     assert!(events.contains("task.md"));
 
-    let state_file = moon_home.join("MOON/state/moon_state.json");
+    let state_file = moon_home.join("moon/state/moon_state.json");
     let state_raw = fs::read_to_string(state_file).expect("read state");
     assert!(state_raw.contains("inbound_seen_files"));
 }
@@ -245,7 +245,7 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
     let compact_log = tmp.path().join("compact.log");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -285,7 +285,7 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
         {"key":"agent:main:main","totalTokens":90000,"contextTokens":100000}
     ]}"#;
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -308,7 +308,7 @@ fn moon_watch_once_compacts_all_oversized_discord_and_whatsapp_sessions() {
     assert!(compact_calls.contains("agent:main:discord:channel:over"));
     assert!(compact_calls.contains("agent:main:whatsapp:+61400000000"));
     assert!(compact_calls.contains("MOON_ARCHIVE_INDEX"));
-    assert!(compact_calls.contains("MOON-index-note"));
+    assert!(compact_calls.contains("moon-index-note"));
     assert!(!compact_calls.contains("agent:main:discord:channel:small"));
     assert!(!compact_calls.contains("agent:main:main"));
 
@@ -341,7 +341,7 @@ fn moon_watch_once_distills_oldest_pending_archive_day_first() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -379,7 +379,7 @@ fn moon_watch_once_distills_oldest_pending_archive_day_first() {
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -396,7 +396,7 @@ fn moon_watch_once_distills_oldest_pending_archive_day_first() {
         .assert()
         .success();
 
-    let distilled = read_distilled_archive_paths(&moon_home.join("MOON/state/moon_state.json"));
+    let distilled = read_distilled_archive_paths(&moon_home.join("moon/state/moon_state.json"));
     assert_eq!(distilled.len(), 1);
     assert!(distilled.contains(&old_archive.to_string_lossy().to_string()));
     assert!(!distilled.contains(&new_archive.to_string_lossy().to_string()));
@@ -410,7 +410,7 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
@@ -460,15 +460,15 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
         "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
         already.display()
     );
-    fs::create_dir_all(moon_home.join("MOON/state")).expect("mkdir state");
-    fs::write(moon_home.join("MOON/state/moon_state.json"), state).expect("write state");
+    fs::create_dir_all(moon_home.join("moon/state")).expect("mkdir state");
+    fs::write(moon_home.join("moon/state/moon_state.json"), state).expect("write state");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(&qmd);
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -485,7 +485,7 @@ fn moon_watch_once_distill_selection_skips_unindexed_missing_and_already_distill
         .assert()
         .success();
 
-    let distilled = read_distilled_archive_paths(&moon_home.join("MOON/state/moon_state.json"));
+    let distilled = read_distilled_archive_paths(&moon_home.join("moon/state/moon_state.json"));
     assert_eq!(distilled.len(), 2);
     assert!(distilled.contains(&eligible.to_string_lossy().to_string()));
     assert!(distilled.contains(&already.to_string_lossy().to_string()));
@@ -502,7 +502,7 @@ fn moon_watch_once_distill_now_runs_in_manual_mode() {
     fs::create_dir_all(moon_home.join("archives/raw")).expect("mkdir archives raw");
     fs::create_dir_all(moon_home.join("archives/mlib")).expect("mkdir archives mlib");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -530,7 +530,7 @@ fn moon_watch_once_distill_now_runs_in_manual_mode() {
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -545,7 +545,7 @@ fn moon_watch_once_distill_now_runs_in_manual_mode() {
         .assert()
         .success();
 
-    let distilled = read_distilled_archive_paths(&moon_home.join("MOON/state/moon_state.json"));
+    let distilled = read_distilled_archive_paths(&moon_home.join("moon/state/moon_state.json"));
     assert_eq!(distilled.len(), 1);
     assert!(distilled.contains(&archive_path.to_string_lossy().to_string()));
 }
@@ -559,7 +559,7 @@ fn moon_watch_daily_mode_waits_for_idle_window_before_attempt() {
     fs::create_dir_all(moon_home.join("archives/raw")).expect("mkdir archives raw");
     fs::create_dir_all(moon_home.join("archives/mlib")).expect("mkdir archives mlib");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -592,7 +592,7 @@ fn moon_watch_daily_mode_waits_for_idle_window_before_attempt() {
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -610,7 +610,7 @@ fn moon_watch_daily_mode_waits_for_idle_window_before_attempt() {
         .assert()
         .success();
 
-    let state_file = moon_home.join("MOON/state/moon_state.json");
+    let state_file = moon_home.join("moon/state/moon_state.json");
     let distilled = read_distilled_archive_paths(&state_file);
     assert!(distilled.is_empty());
     assert!(read_last_distill_trigger_epoch(&state_file).is_none());
@@ -624,7 +624,7 @@ fn moon_watch_once_emits_ai_warning_when_ledger_is_invalid() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("s1.json"),
@@ -638,7 +638,7 @@ fn moon_watch_once_emits_ai_warning_when_ledger_is_invalid() {
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -665,7 +665,7 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
     let qmd_log = tmp.path().join("qmd.log");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::create_dir_all(moon_home.join("continuity")).expect("mkdir continuity");
     fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
@@ -699,15 +699,15 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
         "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
         archive_path_str
     );
-    fs::create_dir_all(moon_home.join("MOON/state")).expect("mkdir state");
-    fs::write(moon_home.join("MOON/state/moon_state.json"), state).expect("write state");
+    fs::create_dir_all(moon_home.join("moon/state")).expect("mkdir state");
+    fs::write(moon_home.join("moon/state/moon_state.json"), state).expect("write state");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(&qmd);
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -734,7 +734,7 @@ fn moon_watch_once_cleans_up_expired_distilled_archives_after_grace_period() {
     assert!(!map.contains(&archive_path_str));
 
     let state_raw =
-        fs::read_to_string(moon_home.join("MOON/state/moon_state.json")).expect("state");
+        fs::read_to_string(moon_home.join("moon/state/moon_state.json")).expect("state");
     assert!(!state_raw.contains(&archive_path_str));
 
     let qmd_calls = fs::read_to_string(&qmd_log).expect("qmd calls");
@@ -749,7 +749,7 @@ fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
     let sessions_dir = tmp.path().join("sessions");
     fs::create_dir_all(moon_home.join("archives")).expect("mkdir archives");
     fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
-    fs::create_dir_all(moon_home.join("MOON/logs")).expect("mkdir logs");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
     fs::create_dir_all(moon_home.join("state")).expect("mkdir state");
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
@@ -775,15 +775,15 @@ fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
         "{{\n  \"schema_version\": 1,\n  \"last_heartbeat_epoch_secs\": 0,\n  \"last_archive_trigger_epoch_secs\": null,\n  \"last_compaction_trigger_epoch_secs\": null,\n  \"last_distill_trigger_epoch_secs\": null,\n  \"last_session_id\": null,\n  \"last_usage_ratio\": null,\n  \"last_provider\": null,\n  \"distilled_archives\": {{\n    \"{}\": 1\n  }},\n  \"inbound_seen_files\": {{}}\n}}\n",
         archive_path_str
     );
-    fs::create_dir_all(moon_home.join("MOON/state")).expect("mkdir state");
-    fs::write(moon_home.join("MOON/state/moon_state.json"), state).expect("write state");
+    fs::create_dir_all(moon_home.join("moon/state")).expect("mkdir state");
+    fs::write(moon_home.join("moon/state/moon_state.json"), state).expect("write state");
 
     let qmd = tmp.path().join("qmd");
     write_fake_qmd(&qmd);
     let openclaw = tmp.path().join("openclaw");
     write_fake_openclaw(&openclaw);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("MOON_HOME", &moon_home)
         .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
@@ -800,6 +800,6 @@ fn moon_watch_once_retention_keeps_recent_cold_window_archives() {
 
     assert!(archive_path.exists());
     let state_raw =
-        fs::read_to_string(moon_home.join("MOON/state/moon_state.json")).expect("state");
+        fs::read_to_string(moon_home.join("moon/state/moon_state.json")).expect("state");
     assert!(state_raw.contains(&archive_path_str));
 }

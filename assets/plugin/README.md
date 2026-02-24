@@ -1,6 +1,6 @@
-# MOON plugin
+# moon plugin
 
-`MOON` compacts large `toolResult` text blocks at persist time using the `tool_result_persist` hook.
+`moon` compacts large `toolResult` text blocks at persist time using the `tool_result_persist` hook.
 
 ## Stage 2 behavior
 
@@ -12,7 +12,7 @@
 
 ## Plugin config
 
-Under `plugins.entries.MOON.config`:
+Under `plugins.entries.moon.config`:
 
 1. `maxTokens` (default `12000`)
 2. `maxChars` (default `60000`)

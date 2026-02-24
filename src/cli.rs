@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use crate::commands;
 
 #[derive(Debug, Parser)]
-#[command(name = "MOON")]
+#[command(name = "moon")]
 #[command(about = "OpenClaw context optimization installer/repair CLI")]
 pub struct Cli {
     #[arg(long, global = true)]

@@ -1,5 +1,5 @@
 {
-  "id": "MOON",
+  "id": "moon",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

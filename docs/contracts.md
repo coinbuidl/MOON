@@ -1,8 +1,8 @@
-# Moon System Contracts
+# moon System Contracts
 
 ## Scope
 
-This document defines Phase 0 contract shapes for the Moon watcher pipeline.
+This document defines Phase 0 contract shapes for the moon watcher pipeline.
 
 ## SessionUsageSnapshot
 

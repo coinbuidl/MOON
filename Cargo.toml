@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust CLI for OpenClaw session lifecycle automation: archive, index, recall, and low-cost distillation."
 license = "MIT"
-repository = "https://github.com/coinbuidl/MOON"
-homepage = "https://github.com/coinbuidl/MOON"
+repository = "https://github.com/coinbuidl/moon"
+homepage = "https://github.com/coinbuidl/moon"
 readme = "README.md"
 keywords = ["openclaw", "llm", "cli", "memory", "context"]
 categories = ["command-line-utilities"]
-default-run = "MOON"
+default-run = "moon"
 
 [[bin]]
-name = "MOON"
+name = "moon"
 path = "src/main.rs"
 
 [dependencies]

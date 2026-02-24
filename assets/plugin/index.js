@@ -55,7 +55,7 @@ function compactByBudget(text, limits) {
 
   const omittedTokens = Math.max(0, estimatedTokensBefore - limits.maxTokens);
   const marker =
-    `\n\n[MOON truncated ~${omittedTokens} tokens; ` +
+    `\n\n[moon truncated ~${omittedTokens} tokens; ` +
     `full payload may be available in details]\n\n`;
 
   const sliceBudget = Math.max(220, effectiveCharBudget - marker.length);
@@ -214,7 +214,7 @@ function compactToolResultMessage(message, toolName, pluginConfig) {
     ) {
       const projected = projectJsonSummary(originalText);
       if (projected) {
-        workingText = `[MOON projected JSON summary]\n${projected}`;
+        workingText = `[moon projected JSON summary]\n${projected}`;
         strategies.add("json_projection");
       }
     }
@@ -273,7 +273,7 @@ function compactToolResultMessage(message, toolName, pluginConfig) {
 }
 
 export default {
-  id: "MOON",
+  id: "moon",
   register(api) {
     api.on("tool_result_persist", (event, ctx) => {
       const pluginCfg = isObject(api && api.pluginConfig) ? api.pluginConfig : {};

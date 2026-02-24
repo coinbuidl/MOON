@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 fn write_fake_openclaw(bin_path: &Path, log_path: &Path) {
     let script = format!(
-        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"id\":\"MOON\"}}]'\nfi\nexit 0\n",
+        "#!/usr/bin/env bash\necho \"$@\" >> \"{}\"\nif [ \"$1\" = \"plugins\" ] && [ \"$2\" = \"list\" ]; then\n  echo '[{{\"id\":\"moon\"}}]'\nfi\nexit 0\n",
         log_path.display()
     );
     fs::write(bin_path, script).expect("write fake openclaw");
@@ -30,7 +30,7 @@ fn install_creates_plugin_and_stage2_config_entries() {
     let log_path = tmp.path().join("openclaw.log");
     write_fake_openclaw(&fake_openclaw, &log_path);
 
-    assert_cmd::cargo::cargo_bin_cmd!("MOON")
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
         .current_dir(tmp.path())
         .env("OPENCLAW_STATE_DIR", &state_dir)
         .env("OPENCLAW_CONFIG_PATH", &config_path)
@@ -39,7 +39,7 @@ fn install_creates_plugin_and_stage2_config_entries() {
         .assert()
         .success();
 
-    let plugin_dir = state_dir.join("extensions").join("MOON");
+    let plugin_dir = state_dir.join("extensions").join("moon");
     assert!(plugin_dir.join("index.js").exists());
     assert!(plugin_dir.join("openclaw.plugin.json").exists());
     assert!(plugin_dir.join("package.json").exists());
@@ -49,7 +49,7 @@ fn install_creates_plugin_and_stage2_config_entries() {
     assert_eq!(
         cfg.get("plugins")
             .and_then(|v| v.get("entries"))
-            .and_then(|v| v.get("MOON"))
+            .and_then(|v| v.get("moon"))
             .and_then(|v| v.get("enabled"))
             .and_then(Value::as_bool),
         Some(true)
@@ -58,7 +58,7 @@ fn install_creates_plugin_and_stage2_config_entries() {
     assert_eq!(
         cfg.get("plugins")
             .and_then(|v| v.get("entries"))
-            .and_then(|v| v.get("MOON"))
+            .and_then(|v| v.get("moon"))
             .and_then(|v| v.get("config"))
             .and_then(|v| v.get("maxTokens"))
             .and_then(Value::as_i64),
@@ -68,7 +68,7 @@ fn install_creates_plugin_and_stage2_config_entries() {
     assert_eq!(
         cfg.get("plugins")
             .and_then(|v| v.get("entries"))
-            .and_then(|v| v.get("MOON"))
+            .and_then(|v| v.get("moon"))
             .and_then(|v| v.get("config"))
             .and_then(|v| v.get("tools"))
             .and_then(|v| v.get("read"))
