@@ -289,8 +289,9 @@ Commands:
 8. `moon-index [--name <collection>] [--dry-run] [--reproject]`
    - `--reproject`: regenerate all projection markdown files using the v2 structured format
 9. `moon-watch [--once|--daemon] [--distill-now]`
-10. `moon-recall --query <text> [--name <collection>]`
-11. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
+10. `moon-stop`
+11. `moon-recall --query <text> [--name <collection>]`
+12. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
     - default: archives larger than `MOON_DISTILL_CHUNK_BYTES` are auto-distilled in chunks
     - `--allow-large-archive`: force single-pass distill above the chunk threshold
 
@@ -354,6 +355,12 @@ Run one watcher cycle:
 
 ```bash
 moon moon-watch --once
+```
+
+Stop the watcher daemon:
+
+```bash
+moon moon-stop
 ```
 
 Idle distill selection order:

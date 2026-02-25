@@ -23,6 +23,7 @@ pub enum Command {
     PostUpgrade,
     Status,
     MoonStatus,
+    MoonStop,
     MoonSnapshot(MoonSnapshotArgs),
     MoonIndex(MoonIndexArgs),
     MoonWatch(MoonWatchArgs),
@@ -141,6 +142,7 @@ pub fn run() -> Result<()> {
         Command::PostUpgrade => commands::post_upgrade::run()?,
         Command::Status => commands::status::run()?,
         Command::MoonStatus => commands::moon_status::run()?,
+        Command::MoonStop => commands::moon_stop::run()?,
         Command::MoonSnapshot(args) => {
             commands::moon_snapshot::run(&commands::moon_snapshot::MoonSnapshotOptions {
                 source: args.source.clone(),

@@ -2,7 +2,7 @@
 
 Use this skill for moon System operations:
 1. Plugin lifecycle (`install`, `verify`, `repair`, `post-upgrade`).
-2. moon workflows (`moon-watch`, `moon-snapshot`, `moon-index`, `moon-recall`, `moon-distill`).
+2. moon workflows (`moon-watch`, `moon-stop`, `moon-snapshot`, `moon-index`, `moon-recall`, `moon-distill`).
 
 ## Operating Rule
 

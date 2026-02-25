@@ -4,6 +4,7 @@ pub mod moon_index;
 pub mod moon_recall;
 pub mod moon_snapshot;
 pub mod moon_status;
+pub mod moon_stop;
 pub mod moon_watch;
 pub mod post_upgrade;
 pub mod repair;
