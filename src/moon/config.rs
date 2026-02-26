@@ -85,6 +85,29 @@ pub struct MoonRetentionConfig {
     pub cold_days: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoonEmbedConfig {
+    pub mode: String,
+    pub idle_secs: u64,
+    pub cooldown_secs: u64,
+    pub max_docs_per_cycle: u64,
+    pub min_pending_docs: u64,
+    pub max_cycle_secs: u64,
+}
+
+impl Default for MoonEmbedConfig {
+    fn default() -> Self {
+        Self {
+            mode: "manual".to_string(),
+            idle_secs: 600,
+            cooldown_secs: 300,
+            max_docs_per_cycle: 25,
+            min_pending_docs: 1,
+            max_cycle_secs: 90,
+        }
+    }
+}
+
 impl Default for MoonRetentionConfig {
     fn default() -> Self {
         Self {
@@ -152,6 +175,7 @@ pub struct MoonConfig {
     pub inbound_watch: MoonInboundWatchConfig,
     pub distill: MoonDistillConfig,
     pub retention: MoonRetentionConfig,
+    pub embed: MoonEmbedConfig,
     pub context: Option<MoonContextConfig>,
 }
 
@@ -162,6 +186,7 @@ struct PartialMoonConfig {
     inbound_watch: Option<MoonInboundWatchConfig>,
     distill: Option<MoonDistillConfig>,
     retention: Option<MoonRetentionConfig>,
+    embed: Option<MoonEmbedConfig>,
     context: Option<MoonContextConfig>,
 }
 
@@ -274,6 +299,24 @@ fn validate(cfg: &MoonConfig) -> Result<()> {
             "invalid retention windows: require warm_days < cold_days"
         ));
     }
+    if cfg.embed.mode != "manual" && cfg.embed.mode != "idle" {
+        return Err(anyhow!("invalid embed mode: use `manual` or `idle`"));
+    }
+    if cfg.embed.idle_secs == 0 {
+        return Err(anyhow!("invalid embed idle secs: must be >= 1"));
+    }
+    if cfg.embed.cooldown_secs == 0 {
+        return Err(anyhow!("invalid embed cooldown secs: must be >= 1"));
+    }
+    if cfg.embed.max_docs_per_cycle == 0 {
+        return Err(anyhow!("invalid embed max docs per cycle: must be >= 1"));
+    }
+    if cfg.embed.min_pending_docs == 0 {
+        return Err(anyhow!("invalid embed min pending docs: must be >= 1"));
+    }
+    if cfg.embed.max_cycle_secs == 0 {
+        return Err(anyhow!("invalid embed max cycle secs: must be >= 1"));
+    }
     if let Some(context) = &cfg.context {
         if matches!(context.window_mode, MoonContextWindowMode::Fixed) {
             let Some(window_tokens) = context.window_tokens else {
@@ -367,6 +410,9 @@ fn merge_file_config(base: &mut MoonConfig) -> Result<()> {
     if let Some(retention) = parsed.retention {
         base.retention = retention;
     }
+    if let Some(embed) = parsed.embed {
+        base.embed = embed;
+    }
     if let Some(context) = parsed.context {
         base.context = Some(context);
     }
@@ -408,6 +454,16 @@ pub fn load_config() -> Result<MoonConfig> {
     cfg.retention.active_days = env_or_u64("MOON_RETENTION_ACTIVE_DAYS", cfg.retention.active_days);
     cfg.retention.warm_days = env_or_u64("MOON_RETENTION_WARM_DAYS", cfg.retention.warm_days);
     cfg.retention.cold_days = env_or_u64("MOON_RETENTION_COLD_DAYS", cfg.retention.cold_days);
+    cfg.embed.mode = env_or_string("MOON_EMBED_MODE", &cfg.embed.mode);
+    cfg.embed.idle_secs = env_or_u64("MOON_EMBED_IDLE_SECS", cfg.embed.idle_secs);
+    cfg.embed.cooldown_secs = env_or_u64("MOON_EMBED_COOLDOWN_SECS", cfg.embed.cooldown_secs);
+    cfg.embed.max_docs_per_cycle = env_or_u64(
+        "MOON_EMBED_MAX_DOCS_PER_CYCLE",
+        cfg.embed.max_docs_per_cycle,
+    );
+    cfg.embed.min_pending_docs =
+        env_or_u64("MOON_EMBED_MIN_PENDING_DOCS", cfg.embed.min_pending_docs);
+    cfg.embed.max_cycle_secs = env_or_u64("MOON_EMBED_MAX_CYCLE_SECS", cfg.embed.max_cycle_secs);
 
     validate(&cfg)?;
     Ok(cfg)

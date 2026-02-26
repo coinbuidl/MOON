@@ -2,7 +2,7 @@
 
 Use this skill for moon System operations:
 1. Plugin lifecycle (`install`, `verify`, `repair`, `post-upgrade`).
-2. moon workflows (`moon-watch`, `moon-stop`, `moon-snapshot`, `moon-index`, `moon-recall`, `moon-distill`).
+2. moon workflows (`moon-watch`, `moon-stop`, `moon-snapshot`, `moon-index`, `moon-embed`, `moon-recall`, `moon-distill`).
 
 ## Operating Rule
 
@@ -17,3 +17,5 @@ Use this skill for moon System operations:
 9. If `[context].compaction_authority = "moon"` is configured in `moon.toml`, enforce OpenClaw `agents.defaults.compaction.mode = "default"` (valid mode) and let moon drive earlier compaction via `[context]` ratios.
 10. On current OpenClaw versions, auto-compaction cannot be hard-disabled via config mode; treat moon as primary compaction orchestrator with OpenClaw fallback.
 11. If `moon status` reports `context policy drift`, fix with `moon install` (or `moon repair`) and re-check before continuing.
+12. Use `moon moon-embed` for manual embedding refresh (`--max-docs` for bounded sprint runs). Prefer `moon --json moon-embed ...` for automation/report parsing.
+13. For watcher-managed embed, configure `[embed].mode = "idle"` in `moon.toml`; watcher embed failures are degraded by design and should not block compaction/distill.

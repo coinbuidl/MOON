@@ -12,6 +12,7 @@ use crate::moon::distill::{
     DistillInput, DistillOutput, archive_file_size, distill_chunk_bytes, load_archive_excerpt,
     run_chunked_archive_distillation, run_distillation,
 };
+use crate::moon::embed::{self, EmbedCaller, EmbedRunError, EmbedRunOptions};
 use crate::moon::inbound_watch::{self, InboundWatchOutcome};
 use crate::moon::paths::resolve_paths;
 use crate::moon::qmd;
@@ -35,7 +36,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD: u64 = 1_000_000;
 const MAX_HIGH_TOKEN_ALERT_SESSIONS: usize = 5;
@@ -77,6 +78,9 @@ pub struct WatchCycleOutcome {
     pub distill_mode: String,
     pub distill_idle_secs: u64,
     pub distill_max_per_cycle: u64,
+    pub embed_mode: String,
+    pub embed_idle_secs: u64,
+    pub embed_max_docs_per_cycle: u64,
     pub retention_active_days: u64,
     pub retention_warm_days: u64,
     pub retention_cold_days: u64,
@@ -86,6 +90,7 @@ pub struct WatchCycleOutcome {
     pub archive: Option<ArchivePipelineOutcome>,
     pub compaction_result: Option<String>,
     pub distill: Option<DistillOutput>,
+    pub embed_result: Option<String>,
     pub continuity: Option<ContinuityOutcome>,
     pub archive_retention_result: Option<String>,
 }
@@ -769,8 +774,10 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     let mut archive_out = None;
     let mut compaction_result = None;
     let mut distill_out = None;
+    let mut embed_result: Option<String>;
     let mut continuity_out = None;
     let mut archive_retention_result = None;
+    let mut archive_index_succeeded_this_cycle = false;
     let compaction_cooldown_ready = is_cooldown_ready(
         unified_layer1_last_trigger_epoch(&state),
         usage.captured_at_epoch_secs,
@@ -915,58 +922,13 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         }
     }
 
-    if !triggers.is_empty() {
-        audit::append_event(
-            &paths,
-            "watcher",
-            "triggered",
-            &format!(
-                "usage_ratio={:.4}, triggers={:?}",
-                usage.usage_ratio, trigger_names
-            ),
-        )?;
-    }
-
-    if inbound_watch.detected_files > 0 || inbound_watch.failed_events > 0 {
-        audit::append_event(
-            &paths,
-            "inbound_watch",
-            if inbound_watch.failed_events == 0 {
-                "ok"
-            } else {
-                "degraded"
-            },
-            &format!(
-                "detected={} triggered={} failed={} watched_paths={}",
-                inbound_watch.detected_files,
-                inbound_watch.triggered_events,
-                inbound_watch.failed_events,
-                inbound_watch.watched_paths.join(",")
-            ),
-        )?;
-    }
-
     if let Some(archive) =
         run_archive_if_needed(&paths, &triggers, compaction_has_archivable_targets)?
     {
+        if archive.record.indexed {
+            archive_index_succeeded_this_cycle = true;
+        }
         state.last_archive_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-        let filtered_noise_count = archive.record.projection_filtered_noise_count.unwrap_or(0);
-        audit::append_event(
-            &paths,
-            "archive",
-            if archive.record.indexed {
-                "ok"
-            } else {
-                "degraded"
-            },
-            &format!(
-                "archive={} indexed={} deduped={} filtered_noise_count={}",
-                archive.record.archive_path,
-                archive.record.indexed,
-                archive.deduped,
-                filtered_noise_count
-            ),
-        )?;
         archive_out = Some(archive);
     }
 
@@ -979,7 +941,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
             compaction_targets.len(),
             cfg.watcher.cooldown_secs
         );
-        audit::append_event(&paths, "compaction", "skipped", &skip_note)?;
         compaction_result = Some(skip_note);
     } else if !compaction_targets.is_empty() {
         state.last_compaction_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
@@ -1014,25 +975,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                 }
             };
 
-            audit::append_event(
-                &paths,
-                "archive",
-                if archived.record.indexed {
-                    "ok"
-                } else {
-                    "degraded"
-                },
-                &format!(
-                    "scope=pre-compaction key={} source={} archive={} indexed={} deduped={} filtered_noise_count={}",
-                    target.session_id,
-                    archived.record.source_path,
-                    archived.record.archive_path,
-                    archived.record.indexed,
-                    archived.deduped,
-                    archived.record.projection_filtered_noise_count.unwrap_or(0)
-                ),
-            )?;
-
             if !archived.record.indexed {
                 failed += 1;
                 outcomes.push(format!(
@@ -1045,6 +987,7 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                 ));
                 continue;
             }
+            archive_index_succeeded_this_cycle = true;
 
             let mapped = match channel_archive_map::upsert(
                 &paths,
@@ -1094,15 +1037,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                             format!("index_note_failed error={err:#}")
                         }
                     };
-                    audit::append_event(
-                        &paths,
-                        "compaction",
-                        "ok",
-                        &format!(
-                            "key={} archived={} result={} index_note={}",
-                            target.session_id, mapped.archive_path, summary, index_note
-                        ),
-                    )?;
                     format!(
                         "ok key={} ratio={:.4} used={} max={} archived={} {} {}",
                         target.session_id,
@@ -1116,15 +1050,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                 }
                 Err(err) => {
                     failed += 1;
-                    audit::append_event(
-                        &paths,
-                        "compaction",
-                        "degraded",
-                        &format!(
-                            "key={} archived={} error={err:#}",
-                            target.session_id, mapped.archive_path
-                        ),
-                    )?;
                     format!(
                         "failed key={} ratio={:.4} used={} max={} archived={} error={err:#}",
                         target.session_id,
@@ -1151,12 +1076,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         audit::append_event(&paths, "compaction", status, &compact_result)?;
         compaction_result = Some(compact_result);
     } else if compaction_result.is_none() && !compaction_notes.is_empty() {
-        audit::append_event(
-            &paths,
-            "compaction",
-            "degraded",
-            &format!("skipped reason=no-targets {}", compaction_notes.join(" | ")),
-        )?;
         compaction_result = Some(format!(
             "skipped reason=no-targets {}",
             compaction_notes.join(" | ")
@@ -1428,25 +1347,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                 };
                 match run_chunked_archive_distillation(&paths, &chunked_input) {
                     Ok(chunked) => {
-                        let status = if chunked.truncated { "degraded" } else { "ok" };
-                        audit::append_event(
-                            &paths,
-                            "distill",
-                            status,
-                            &format!(
-                                "mode=idle-chunked archive={} distill_source={} source={} session={} bytes={} chunk_trigger_bytes={} chunk_count={} chunk_target_bytes={} truncated={}",
-                                record.archive_path,
-                                distill_source_path,
-                                record.source_path,
-                                record.session_id,
-                                archive_size,
-                                distill_chunk_trigger_bytes,
-                                chunked.chunk_count,
-                                chunked.chunk_target_bytes,
-                                chunked.truncated
-                            ),
-                        )?;
-
                         let distill = DistillOutput {
                             provider: chunked.provider,
                             summary: chunked.summary,
@@ -1468,23 +1368,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                             extract_key_decisions(&distill.summary),
                         ) {
                             Ok(outcome) => {
-                                audit::append_event(
-                                    &paths,
-                                    "continuity",
-                                    if outcome.rollover_ok {
-                                        "ok"
-                                    } else {
-                                        "degraded"
-                                    },
-                                    &format!(
-                                        "archive={} session={} map={} target={} rollover_ok={}",
-                                        record.archive_path,
-                                        record.session_id,
-                                        outcome.map_path,
-                                        outcome.target_session_id,
-                                        outcome.rollover_ok
-                                    ),
-                                )?;
                                 continuity_out = Some(outcome);
                             }
                             Err(err) => {
@@ -1499,15 +1382,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                                     reason: "continuity-build-failed",
                                     err: &format!("{err:#}"),
                                 });
-                                audit::append_event(
-                                    &paths,
-                                    "continuity",
-                                    "degraded",
-                                    &format!(
-                                        "archive={} session={} error={err:#}",
-                                        record.archive_path, record.session_id
-                                    ),
-                                )?;
                             }
                         }
                         distill_out = Some(distill);
@@ -1575,19 +1449,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                     state
                         .distilled_archives
                         .insert(archive_path.clone(), usage.captured_at_epoch_secs);
-                    audit::append_event(
-                        &paths,
-                        "distill",
-                        "ok",
-                        &format!(
-                            "mode=idle archive={} distill_source={} source={} session={} bytes={}",
-                            record.archive_path,
-                            distill_source_path,
-                            record.source_path,
-                            record.session_id,
-                            archive_size
-                        ),
-                    )?;
 
                     match build_continuity(
                         &paths,
@@ -1597,23 +1458,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                         extract_key_decisions(&distill.summary),
                     ) {
                         Ok(outcome) => {
-                            audit::append_event(
-                                &paths,
-                                "continuity",
-                                if outcome.rollover_ok {
-                                    "ok"
-                                } else {
-                                    "degraded"
-                                },
-                                &format!(
-                                    "archive={} session={} map={} target={} rollover_ok={}",
-                                    record.archive_path,
-                                    record.session_id,
-                                    outcome.map_path,
-                                    outcome.target_session_id,
-                                    outcome.rollover_ok
-                                ),
-                            )?;
                             continuity_out = Some(outcome);
                         }
                         Err(err) => {
@@ -1628,15 +1472,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                                 reason: "continuity-build-failed",
                                 err: &format!("{err:#}"),
                             });
-                            audit::append_event(
-                                &paths,
-                                "continuity",
-                                "degraded",
-                                &format!(
-                                    "archive={} session={} error={err:#}",
-                                    record.archive_path, record.session_id
-                                ),
-                            )?;
                         }
                     }
                     distill_out = Some(distill);
@@ -1669,8 +1504,120 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                 }
             }
         }
-    } else if !distill_notes.is_empty() {
-        audit::append_event(&paths, "distill", "skipped", &distill_notes.join(" | "))?;
+    }
+
+    if cfg.embed.mode.eq_ignore_ascii_case("idle") {
+        if !archive_index_succeeded_this_cycle {
+            embed_result = Some("skipped reason=no-archive-index-success".to_string());
+        } else {
+            let started = Instant::now();
+            let run_opts = EmbedRunOptions {
+                collection_name: "history".to_string(),
+                max_docs: cfg.embed.max_docs_per_cycle as usize,
+                dry_run: false,
+                allow_unbounded: false,
+                caller: EmbedCaller::Watcher,
+                max_cycle_secs: Some(cfg.embed.max_cycle_secs),
+            };
+            match embed::run(&paths, &mut state, &cfg.embed, &run_opts) {
+                Ok(summary) => {
+                    let line = format!(
+                        "mode={} capability={} selected={} embedded={} pending_before={} pending_after={} degraded={} skip_reason={}",
+                        summary.mode,
+                        summary.capability,
+                        summary.selected_docs,
+                        summary.embedded_docs,
+                        summary.pending_before,
+                        summary.pending_after,
+                        summary.degraded,
+                        summary.skip_reason
+                    );
+                    let status = if summary.degraded { "degraded" } else { "ok" };
+                    let _ = audit::append_event(&paths, "embed", status, &line);
+
+                    if summary.skip_reason == "locked" {
+                        warn::emit(WarnEvent {
+                            code: "EMBED_LOCKED",
+                            stage: "embed",
+                            action: "acquire-lock",
+                            session: &usage.session_id,
+                            archive: "na",
+                            source: "na",
+                            retry: "retry-next-cycle",
+                            reason: "embed-lock-active",
+                            err: "embed-lock-active",
+                        });
+                    } else if summary.skip_reason == "capability-missing" {
+                        warn::emit(WarnEvent {
+                            code: "EMBED_CAPABILITY_MISSING",
+                            stage: "embed",
+                            action: "check-capability",
+                            session: &usage.session_id,
+                            archive: "na",
+                            source: "na",
+                            retry: "retry-next-cycle",
+                            reason: "embed-capability-missing",
+                            err: "qmd-embed-capability-missing",
+                        });
+                    }
+
+                    embed_result = Some(line);
+                }
+                Err(err) => {
+                    let (code, action, reason) = match &err {
+                        EmbedRunError::CapabilityMissing(_) => (
+                            "EMBED_CAPABILITY_MISSING",
+                            "check-capability",
+                            "capability-missing",
+                        ),
+                        EmbedRunError::Locked(_) => {
+                            ("EMBED_LOCKED", "acquire-lock", "embed-lock-active")
+                        }
+                        EmbedRunError::StatusFailed(_) => {
+                            ("EMBED_STATUS_FAILED", "run-embed", "embed-status-failed")
+                        }
+                        EmbedRunError::Failed(_) => ("EMBED_FAILED", "run-embed", "embed-failed"),
+                    };
+                    warn::emit(WarnEvent {
+                        code,
+                        stage: "embed",
+                        action,
+                        session: &usage.session_id,
+                        archive: "na",
+                        source: "na",
+                        retry: "retry-next-cycle",
+                        reason,
+                        err: &format!("{err}"),
+                    });
+                    let line = format!("failed error={err}");
+                    let _ = audit::append_event(&paths, "embed", "degraded", &line);
+                    embed_result = Some(line);
+                }
+            }
+
+            if started.elapsed().as_secs() > cfg.embed.max_cycle_secs {
+                warn::emit(WarnEvent {
+                    code: "EMBED_FAILED",
+                    stage: "embed",
+                    action: "run-embed",
+                    session: &usage.session_id,
+                    archive: "na",
+                    source: "na",
+                    retry: "retry-next-cycle",
+                    reason: "timeout",
+                    err: "embed-run-exceeded-max-cycle-secs",
+                });
+                let timeout_note = format!("timeout max_cycle_secs={}", cfg.embed.max_cycle_secs);
+                let _ = audit::append_event(&paths, "embed", "degraded", &timeout_note);
+                if let Some(current) = embed_result.take() {
+                    embed_result = Some(format!("{current} {timeout_note}"));
+                } else {
+                    embed_result = Some(timeout_note);
+                }
+            }
+        }
+    } else {
+        embed_result = Some("skipped reason=manual-mode".to_string());
     }
 
     if let Some(summary) = cleanup_expired_distilled_archives(
@@ -1701,6 +1648,9 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         distill_mode: cfg.distill.mode.clone(),
         distill_idle_secs: cfg.distill.idle_secs,
         distill_max_per_cycle: cfg.distill.max_per_cycle,
+        embed_mode: cfg.embed.mode.clone(),
+        embed_idle_secs: cfg.embed.idle_secs,
+        embed_max_docs_per_cycle: cfg.embed.max_docs_per_cycle,
         retention_active_days: cfg.retention.active_days,
         retention_warm_days: cfg.retention.warm_days,
         retention_cold_days: cfg.retention.cold_days,
@@ -1710,6 +1660,7 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         archive: archive_out,
         compaction_result,
         distill: distill_out,
+        embed_result,
         continuity: continuity_out,
         archive_retention_result,
     })

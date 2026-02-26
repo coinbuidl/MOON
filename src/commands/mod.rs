@@ -1,5 +1,6 @@
 pub mod install;
 pub mod moon_distill;
+pub mod moon_embed;
 pub mod moon_index;
 pub mod moon_recall;
 pub mod moon_snapshot;

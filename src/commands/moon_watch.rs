@@ -22,24 +22,26 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
         return Ok(report);
     }
 
-    if opts.daemon {
-        if let Ok(exe) = std::env::current_exe() {
-            let exe_str = exe.display().to_string();
-            if exe_str.contains("target/debug")
-                || exe_str.contains("target/release")
-                || exe_str.contains("target\\debug")
-                || exe_str.contains("target\\release")
-            {
-                report.issue("CRITICAL: Running the background daemon via `cargo run` is disabled for stability.");
-                report.issue("Cargo run holds file locks and causes severe CPU/IO spikes when the daemon restarts.");
-                report.issue(
-                    "Please install the binary to your path first: `cargo install --path .`",
-                );
-                report.issue(
-                    "Then start the daemon using the compiled binary: `moon moon-watch --daemon`",
-                );
-                return Ok(report);
-            }
+    if opts.daemon
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let exe_str = exe.display().to_string();
+        if exe_str.contains("target/debug")
+            || exe_str.contains("target/release")
+            || exe_str.contains("target\\debug")
+            || exe_str.contains("target\\release")
+        {
+            report.issue(
+                "CRITICAL: Running the background daemon via `cargo run` is disabled for stability.",
+            );
+            report.issue(
+                "Cargo run holds file locks and causes severe CPU/IO spikes when the daemon restarts.",
+            );
+            report.issue("Please install the binary to your path first: `cargo install --path .`");
+            report.issue(
+                "Then start the daemon using the compiled binary: `moon moon-watch --daemon`",
+            );
+            return Ok(report);
         }
     }
 
@@ -79,6 +81,12 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
     report.detail(format!(
         "distill.max_per_cycle={}",
         cycle.distill_max_per_cycle
+    ));
+    report.detail(format!("embed.mode={}", cycle.embed_mode));
+    report.detail(format!("embed.idle_secs={}", cycle.embed_idle_secs));
+    report.detail(format!(
+        "embed.max_docs_per_cycle={}",
+        cycle.embed_max_docs_per_cycle
     ));
     report.detail(format!(
         "retention.active_days={}",
@@ -142,6 +150,9 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
     if let Some(distill) = cycle.distill {
         report.detail(format!("distill.provider={}", distill.provider));
         report.detail(format!("distill.summary_path={}", distill.summary_path));
+    }
+    if let Some(result) = cycle.embed_result {
+        report.detail(format!("embed.result={result}"));
     }
     if let Some(result) = cycle.archive_retention_result {
         report.detail(format!("archive_retention.result={result}"));

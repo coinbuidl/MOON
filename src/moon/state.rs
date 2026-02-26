@@ -15,10 +15,12 @@ pub struct MoonState {
     #[serde(alias = "last_prune_trigger_epoch_secs")]
     pub last_compaction_trigger_epoch_secs: Option<u64>,
     pub last_distill_trigger_epoch_secs: Option<u64>,
+    pub last_embed_trigger_epoch_secs: Option<u64>,
     pub last_session_id: Option<String>,
     pub last_usage_ratio: Option<f64>,
     pub last_provider: Option<String>,
     pub distilled_archives: BTreeMap<String, u64>,
+    pub embedded_projections: BTreeMap<String, u64>,
     pub compaction_hysteresis_active: BTreeMap<String, u64>,
     pub inbound_seen_files: BTreeMap<String, u64>,
 }
@@ -26,15 +28,17 @@ pub struct MoonState {
 impl Default for MoonState {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             last_heartbeat_epoch_secs: 0,
             last_archive_trigger_epoch_secs: None,
             last_compaction_trigger_epoch_secs: None,
             last_distill_trigger_epoch_secs: None,
+            last_embed_trigger_epoch_secs: None,
             last_session_id: None,
             last_usage_ratio: None,
             last_provider: None,
             distilled_archives: BTreeMap::new(),
+            embedded_projections: BTreeMap::new(),
             compaction_hysteresis_active: BTreeMap::new(),
             inbound_seen_files: BTreeMap::new(),
         }
@@ -69,8 +73,11 @@ pub fn load(paths: &MoonPaths) -> Result<MoonState> {
 
     let raw =
         fs::read_to_string(&file).with_context(|| format!("failed to read {}", file.display()))?;
-    let parsed: MoonState = serde_json::from_str(&raw)
+    let mut parsed: MoonState = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", file.display()))?;
+    if parsed.schema_version < 2 {
+        parsed.schema_version = 2;
+    }
     Ok(parsed)
 }
 
@@ -125,4 +132,22 @@ pub fn rewrite_distilled_archive_paths(
     }
 
     Ok(rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MoonState;
+
+    #[test]
+    fn deserializes_v1_state_with_embed_defaults() {
+        let raw = r#"{
+  "schema_version": 1,
+  "last_heartbeat_epoch_secs": 10,
+  "distilled_archives": {}
+}"#;
+        let parsed: MoonState = serde_json::from_str(raw).expect("parse state");
+        assert_eq!(parsed.schema_version, 1);
+        assert!(parsed.last_embed_trigger_epoch_secs.is_none());
+        assert!(parsed.embedded_projections.is_empty());
+    }
 }

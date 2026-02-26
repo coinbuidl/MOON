@@ -27,6 +27,7 @@ pub enum Command {
     MoonSnapshot(MoonSnapshotArgs),
     MoonIndex(MoonIndexArgs),
     MoonWatch(MoonWatchArgs),
+    MoonEmbed(MoonEmbedArgs),
     MoonRecall(MoonRecallArgs),
     MoonDistill(MoonDistillArgs),
 }
@@ -89,6 +90,20 @@ pub struct MoonRecallArgs {
     pub name: String,
     #[arg(long)]
     pub channel_key: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct MoonEmbedArgs {
+    #[arg(long, default_value = "history")]
+    pub name: String,
+    #[arg(long, default_value_t = 25)]
+    pub max_docs: usize,
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long)]
+    pub allow_unbounded: bool,
+    #[arg(long)]
+    pub watcher_trigger: bool,
 }
 
 #[derive(Debug, Args)]
@@ -161,6 +176,15 @@ pub fn run() -> Result<()> {
                 once: args.once,
                 daemon: args.daemon,
                 distill_now: args.distill_now,
+            })?
+        }
+        Command::MoonEmbed(args) => {
+            commands::moon_embed::run(&commands::moon_embed::MoonEmbedOptions {
+                collection_name: args.name.clone(),
+                max_docs: args.max_docs,
+                dry_run: args.dry_run,
+                allow_unbounded: args.allow_unbounded,
+                watcher_trigger: args.watcher_trigger,
             })?
         }
         Command::MoonRecall(args) => {

@@ -24,6 +24,14 @@ active_days = 7
 warm_days = 30
 cold_days = 31
 
+[embed]
+mode = "manual"
+idle_secs = 600
+cooldown_secs = 300
+max_docs_per_cycle = 25
+min_pending_docs = 1
+max_cycle_secs = 90
+
 [inbound_watch]
 enabled = false
 recursive = true

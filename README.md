@@ -1,15 +1,10 @@
 # Ã°Å¸Å’â„¢ M.O.O.N.
 > **Strategic Memory Augmentation & Context Distillation System**
 
-```text
-[SYSTEM BOOT... PHASE 1: NEURAL LINK ESTABLISHED]
-[LOADING EXTERNAL MEMORY MODULE: M.O.O.N.]
-```
-
 ### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">M</font>emory</span>
 ### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">O</font>ptimisation</span>
-### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">O</font>perational</span>
-### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">N</font>ormaliser</span>
+### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">O</font>rganisation</span>
+### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">N</font>ode</span>
 
 ---
 
@@ -34,6 +29,11 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
     *   **Phase 1 (Raw Distillation)**: Automatically distills archive projection markdown (`archives/mlib/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
     *   **Librarian Optimizations**: semantic de-duplication keeps final-state conclusions, and optional topic discovery (`distill.topic_discovery=true` in `moon.toml`) maintains a top-of-file entity anchor block in each daily memory file.
     *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
+4.  **Embed Lifecycle Management**:
+    * Manual command: `moon moon-embed --name history --max-docs 25`
+    * Capability negotiation against installed QMD (`bounded`, `unbounded-only`, or `missing`)
+    * Single-flight lock (`$MOON_LOGS_DIR/moon-embed.lock`) to avoid overlapping embed workers
+    * Optional watcher auto-embed (`[embed].mode = "idle"`) without blocking compaction/distill
 
 ## Recommended Agent Integration
 
@@ -156,7 +156,7 @@ State path override precedence:
 Recommended split:
 
 1. `.env`: paths, binaries, provider/model/API keys, and env-only runtime knobs.
-2. `moon.toml`: tuning in `[context]`, `[watcher]`, `[distill]`, `[retention]`, `[inbound_watch]` (and optional legacy `[thresholds]`).
+2. `moon.toml`: tuning in `[context]`, `[watcher]`, `[distill]`, `[retention]`, `[embed]`, `[inbound_watch]` (and optional legacy `[thresholds]`).
 
 If the same tuning key appears in both places, `.env` wins.
 
@@ -290,8 +290,9 @@ Commands:
    - `--reproject`: regenerate all projection markdown files using the v2 structured format
 9. `moon-watch [--once|--daemon] [--distill-now]`
 10. `moon-stop`
-11. `moon-recall --query <text> [--name <collection>]`
-12. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
+11. `moon-embed [--name <collection>] [--max-docs <N>] [--dry-run] [--allow-unbounded] [--watcher-trigger]`
+12. `moon-recall --query <text> [--name <collection>]`
+13. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
     - default: archives larger than `MOON_DISTILL_CHUNK_BYTES` are auto-distilled in chunks
     - `--allow-large-archive`: force single-pass distill above the chunk threshold
 
@@ -345,6 +346,12 @@ moon moon-index --name history
 
 `moon-index` also normalizes older archive layout into `archives/raw/` and backfills missing projection markdown files before running QMD sync.
 
+Run manual embed sprint:
+
+```bash
+moon moon-embed --name history --max-docs 25
+```
+
 Recall prior context:
 
 ```bash
@@ -383,6 +390,12 @@ Retention lifecycle windows:
 2. Warm (`active_days < age <= warm_days`): retained and indexed.
 3. Cold candidate (`>= cold_days`): deleted only when a distill marker exists.
 
+Embed lifecycle windows:
+
+1. `embed.mode = "manual"`: watcher does not auto-run embed.
+2. `embed.mode = "idle"`: watcher attempts embed after archive/index success and embed idle/cooldown gates.
+3. If QMD lacks bounded embed capability, watcher skips embed in degraded mode and continues the cycle.
+
 Archive layout:
 
 1. `archives/ledger.jsonl`: archive ledger metadata.
@@ -415,6 +428,12 @@ Most-used `.env` variables:
 13. `MOON_HIGH_TOKEN_ALERT_THRESHOLD` (default `1000000`; set `0` to disable)
 14. `MOON_ENABLE_COMPACTION_WRITE`
 15. `MOON_ENABLE_SESSION_ROLLOVER`
+16. `MOON_EMBED_MODE` (`manual` or `idle`)
+17. `MOON_EMBED_IDLE_SECS`
+18. `MOON_EMBED_COOLDOWN_SECS`
+19. `MOON_EMBED_MAX_DOCS_PER_CYCLE`
+20. `MOON_EMBED_MIN_PENDING_DOCS`
+21. `MOON_EMBED_MAX_CYCLE_SECS`
 
 Primary tuning belongs in `moon.toml`:
 
@@ -422,8 +441,9 @@ Primary tuning belongs in `moon.toml`:
 2. `[watcher] poll_interval_secs`, `cooldown_secs`
 3. `[distill] mode`, `idle_secs`, `max_per_cycle`, `residential_timezone`, `topic_discovery`
 4. `[retention] active_days`, `warm_days`, `cold_days`
-5. `[inbound_watch] enabled`, `recursive`, `watch_paths`, `event_mode`
-6. `[thresholds] trigger_ratio` (legacy/fallback path when context policy is not active)
+5. `[embed] mode`, `idle_secs`, `cooldown_secs`, `max_docs_per_cycle`, `min_pending_docs`, `max_cycle_secs`
+6. `[inbound_watch] enabled`, `recursive`, `watch_paths`, `event_mode`
+7. `[thresholds] trigger_ratio` (legacy/fallback path when context policy is not active)
 
 Legacy compatibility: `MOON_THRESHOLD_COMPACTION_RATIO`,
 `MOON_THRESHOLD_ARCHIVE_RATIO`, and `MOON_THRESHOLD_PRUNE_RATIO` are still read

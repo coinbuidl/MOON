@@ -19,6 +19,10 @@
 7. `INDEX_NOTE_FAILED`
 8. `PROJECTION_WRITE_FAILED`
 9. `DISTILL_SOURCE_MISSING`
+10. `EMBED_FAILED`
+11. `EMBED_LOCKED`
+12. `EMBED_CAPABILITY_MISSING`
+13. `EMBED_STATUS_FAILED`
 
 ## Warning Triage
 
@@ -30,6 +34,10 @@
 6. `INDEX_NOTE_FAILED`: verify gateway `chat.send` permissions and session key validity.
 7. `PROJECTION_WRITE_FAILED`: verify archive read permissions and projection markdown write permissions.
 8. `DISTILL_SOURCE_MISSING`: verify archive projection markdown exists (`archives/mlib/*.md`) and rerun `moon-index --name history` to backfill.
+9. `EMBED_FAILED`: verify `QMD_BIN`, `qmd embed` execution, and file permissions for lock/state paths.
+10. `EMBED_LOCKED`: another embed worker is active; retry next cycle or after current run ends.
+11. `EMBED_CAPABILITY_MISSING`: installed QMD build lacks required embed capability surface; upgrade QMD or allow degraded unbounded mode manually.
+12. `EMBED_STATUS_FAILED`: QMD embed returned failed status payload; inspect command output and QMD logs.
 
 ## Stage Policies
 
@@ -111,3 +119,15 @@ Failure:
 Policy:
 1. Return structured empty result.
 2. Never fail hard on no-match conditions.
+
+## Embed Stage
+
+Failure:
+1. QMD embed capability missing.
+2. Active embed lock.
+3. QMD embed command failed or reported failed status.
+
+Policy:
+1. Watcher mode: warn and continue cycle in degraded mode.
+2. Manual mode: return `ok=false` unless explicitly degraded by flags.
+3. Always append embed audit detail.
