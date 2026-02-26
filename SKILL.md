@@ -20,3 +20,4 @@ Use this skill for moon System operations:
 12. Use `moon moon-embed` for manual embedding refresh (`--max-docs` for bounded sprint runs). Prefer `moon --json moon-embed ...` for automation/report parsing.
 13. For watcher-managed embed, configure `[embed].mode = "idle"` in `moon.toml`; watcher embed failures are degraded by design and should not block compaction/distill.
 14. Treat `--allow-unbounded` as degraded fallback only: MOON will run embed but does not mark selected docs as confirmed embedded unless bounded/verifiable completion is available.
+15. For automatic layer-2 distillation, prefer `[distill].mode = "daily"` for once-per-residential-day runs; use `mode = "idle"` only when you want repeated idle-window distill cycles.

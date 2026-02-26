@@ -226,7 +226,7 @@ poll_interval_secs = 30
 cooldown_secs = 60
 
 [distill]
-mode = "idle"
+mode = "daily"
 idle_secs = 360
 max_per_cycle = 3
 residential_timezone = "UTC"
