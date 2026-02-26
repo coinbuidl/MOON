@@ -1,13 +1,14 @@
 mod assets;
 mod cli;
 mod commands;
+mod env_loader;
 mod error;
 mod logging;
 mod moon;
 mod openclaw;
 
 fn main() {
-    let _ = dotenvy::dotenv();
+    env_loader::load_dotenv();
 
     if let Err(err) = cli::run() {
         eprintln!("error: {err:#}");

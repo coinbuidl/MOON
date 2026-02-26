@@ -95,11 +95,24 @@ moon moon-status
 `.env.example` and `moon.toml.example` are templates. Keep them generic; put
 machine-specific values in `.env` and local `moon.toml` only.
 
-Important: `.env` autoload is based on the process working directory. If you run
-`moon` outside this repo (for example from `~`), this repo's `.env` is not
-loaded and runtime paths fall back to defaults (for example `$HOME/moon`).
-Run commands from the repo root, or export/source the same env vars in your
-shell before running `moon` from elsewhere.
+Workspace model (agent-facing):
+
+1. `MOON_HOME` is the workspace root for moon runtime data.
+2. Recommended default: `MOON_HOME=$HOME` (so home is the workspace root).
+3. Repo path should be `MOON_HOME/moon`.
+4. Daily memory path is `MOON_HOME/memory/YYYY-MM-DD.md`.
+
+`.env` autoload precedence:
+
+1. Standard dotenv search from current working directory upward.
+2. Deterministic moon repo fallback:
+   - `MOON_HOME/moon/.env`
+   - if `MOON_HOME` is unset: `$HOME/moon/.env`
+
+This makes daemon runs resilient when started outside the moon repo working
+directory.
+
+Agent check: ensure `.env` exists in the moon repo folder (`moon/.env`).
 
 Required `.env` value:
 
@@ -117,7 +130,7 @@ QMD_BIN=$HOME/.bun/bin/qmd
 QMD_DB=$HOME/.cache/qmd/index.sqlite
 
 # moon runtime paths
-MOON_HOME=$HOME/moon
+MOON_HOME=$HOME
 MOON_ARCHIVES_DIR=$MOON_HOME/archives
 MOON_MEMORY_DIR=$MOON_HOME/memory
 MOON_MEMORY_FILE=$MOON_HOME/MEMORY.md
@@ -133,16 +146,16 @@ OPENCLAW_SESSIONS_DIR=$HOME/.openclaw/agents/main/sessions
 
 Workspace-root path profile (optional):
 
-Use this if you want moon runtime data under an existing workspace root instead of `$HOME/moon`.
+Use this if your workspace root is not `$HOME`.
 
 ```bash
 MOON_HOME=/path/to/workspace
 MOON_ARCHIVES_DIR=$MOON_HOME/archives
 MOON_MEMORY_DIR=$MOON_HOME/memory
 MOON_MEMORY_FILE=$MOON_HOME/MEMORY.md
-MOON_LOGS_DIR=$MOON_HOME/skills/moon/logs
-MOON_CONFIG_PATH=$MOON_HOME/skills/moon/moon.toml
-MOON_STATE_FILE=$MOON_HOME/skills/moon/state/moon_state.json
+MOON_LOGS_DIR=$MOON_HOME/moon/logs
+MOON_CONFIG_PATH=$MOON_HOME/moon/moon.toml
+MOON_STATE_FILE=$MOON_HOME/moon/state/moon_state.json
 ```
 
 `moon.toml` is optional. If `MOON_CONFIG_PATH` points to a missing file, moon
@@ -177,15 +190,16 @@ prune_mode = "disabled"            # "disabled" or "guarded"
 compaction_authority = "moon"      # "moon" or "openclaw"
 compaction_start_ratio = 0.78
 compaction_emergency_ratio = 0.90
-compaction_recover_ratio = 0.65
 ```
 
 When `compaction_authority = "moon"`:
 
 1. `moon install` / `moon repair` enforce OpenClaw compaction mode to `default` (valid on current OpenClaw builds).
 2. moon watcher is the primary trigger for `/compact` based on `[context]` ratios.
-3. OpenClaw may still auto-compact as a fallback on overflow/threshold paths.
-4. `moon status` reports a policy violation (`ok=false`) if OpenClaw config drifts from the expected mode for the selected authority.
+3. Simplified compaction loop: if usage is still `>= compaction_start_ratio` after cooldown, moon can compact again on the next eligible cycle.
+4. Emergency ratio can bypass cooldown (`usage >= compaction_emergency_ratio`).
+5. OpenClaw may still auto-compact as a fallback on overflow/threshold paths.
+6. `moon status` reports a policy violation (`ok=false`) if OpenClaw config drifts from the expected mode for the selected authority.
 
 Cheaper distill profile (recommended for the agent):
 
@@ -206,7 +220,6 @@ prune_mode = "disabled"
 compaction_authority = "moon"
 compaction_start_ratio = 0.78
 compaction_emergency_ratio = 0.90
-compaction_recover_ratio = 0.65
 
 [watcher]
 poll_interval_secs = 30
@@ -446,7 +459,7 @@ Most-used `.env` variables:
 
 Primary tuning belongs in `moon.toml`:
 
-1. `[context] window_mode`, `window_tokens`, `prune_mode`, `compaction_authority`, `compaction_start_ratio`, `compaction_emergency_ratio`, `compaction_recover_ratio`
+1. `[context] window_mode`, `window_tokens`, `prune_mode`, `compaction_authority`, `compaction_start_ratio`, `compaction_emergency_ratio`
 2. `[watcher] poll_interval_secs`, `cooldown_secs`
 3. `[distill] mode`, `idle_secs`, `max_per_cycle`, `residential_timezone`, `topic_discovery`
 4. `[retention] active_days`, `warm_days`, `cold_days`
@@ -516,7 +529,7 @@ OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-$OPENCLAW_STATE_DIR/openclaw.json}
 openclaw plugins uninstall moon 2>/dev/null || true
 trash_path "$OPENCLAW_STATE_DIR/extensions/moon"
 
-MOON_HOME="${MOON_HOME:-$HOME/moon}"
+MOON_HOME="${MOON_HOME:-$HOME}"
 # Remove moon-owned runtime artifacts only (keep archives/memory/MEMORY.md)
 trash_path "$MOON_HOME/continuity"
 trash_path "$MOON_HOME/moon/state"

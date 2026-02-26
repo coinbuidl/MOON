@@ -11,8 +11,6 @@ pub enum TriggerKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextCompactionDecision {
     pub should_compact: bool,
-    pub activate_hysteresis: bool,
-    pub clear_hysteresis: bool,
     pub bypassed_cooldown: bool,
 }
 
@@ -20,32 +18,11 @@ pub fn evaluate_context_compaction_candidate(
     usage_ratio: f64,
     start_ratio: f64,
     emergency_ratio: f64,
-    recover_ratio: f64,
     cooldown_ready: bool,
-    hysteresis_active: bool,
 ) -> ContextCompactionDecision {
-    if hysteresis_active {
-        if usage_ratio <= recover_ratio {
-            return ContextCompactionDecision {
-                should_compact: false,
-                activate_hysteresis: false,
-                clear_hysteresis: true,
-                bypassed_cooldown: false,
-            };
-        }
-        return ContextCompactionDecision {
-            should_compact: false,
-            activate_hysteresis: false,
-            clear_hysteresis: false,
-            bypassed_cooldown: false,
-        };
-    }
-
     if usage_ratio < start_ratio {
         return ContextCompactionDecision {
             should_compact: false,
-            activate_hysteresis: false,
-            clear_hysteresis: false,
             bypassed_cooldown: false,
         };
     }
@@ -54,16 +31,12 @@ pub fn evaluate_context_compaction_candidate(
     if cooldown_ready || bypassed_cooldown {
         return ContextCompactionDecision {
             should_compact: true,
-            activate_hysteresis: true,
-            clear_hysteresis: false,
             bypassed_cooldown,
         };
     }
 
     ContextCompactionDecision {
         should_compact: false,
-        activate_hysteresis: false,
-        clear_hysteresis: false,
         bypassed_cooldown: false,
     }
 }
@@ -163,34 +136,23 @@ mod tests {
     fn context_compaction_bypasses_cooldown_only_on_emergency() {
         let start = 0.78;
         let emergency = 0.90;
-        let recover = 0.65;
 
-        let regular =
-            evaluate_context_compaction_candidate(0.85, start, emergency, recover, false, false);
+        let regular = evaluate_context_compaction_candidate(0.85, start, emergency, false);
         assert!(!regular.should_compact);
         assert!(!regular.bypassed_cooldown);
 
-        let emergency_hit =
-            evaluate_context_compaction_candidate(0.95, start, emergency, recover, false, false);
+        let emergency_hit = evaluate_context_compaction_candidate(0.95, start, emergency, false);
         assert!(emergency_hit.should_compact);
-        assert!(emergency_hit.activate_hysteresis);
         assert!(emergency_hit.bypassed_cooldown);
     }
 
     #[test]
-    fn context_compaction_hysteresis_blocks_until_recover() {
+    fn context_compaction_retriggers_after_cooldown_when_still_above_start() {
         let start = 0.78;
         let emergency = 0.90;
-        let recover = 0.65;
 
-        let blocked =
-            evaluate_context_compaction_candidate(0.82, start, emergency, recover, true, true);
-        assert!(!blocked.should_compact);
-        assert!(!blocked.clear_hysteresis);
-
-        let clear =
-            evaluate_context_compaction_candidate(0.60, start, emergency, recover, true, true);
-        assert!(!clear.should_compact);
-        assert!(clear.clear_hysteresis);
+        let ready = evaluate_context_compaction_candidate(0.82, start, emergency, true);
+        assert!(ready.should_compact);
+        assert!(!ready.bypassed_cooldown);
     }
 }

@@ -679,6 +679,9 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     let paths = resolve_paths()?;
     let cfg = load_config()?;
     let mut state = load(&paths)?;
+    // Legacy field retained for backward-compatible state parsing; no longer used
+    // for compaction trigger decisions.
+    state.compaction_hysteresis_active.clear();
     let inbound_watch = inbound_watch::process(&paths, &cfg, &mut state)?;
 
     let mut usage_batch_note = None;
@@ -810,13 +813,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                         .filter(|s| is_compaction_channel_session(&s.session_id))
                         .cloned()
                         .collect();
-                    let observed = candidate_sessions
-                        .iter()
-                        .map(|s| s.session_id.clone())
-                        .collect::<BTreeSet<_>>();
-                    state
-                        .compaction_hysteresis_active
-                        .retain(|session_key, _| observed.contains(session_key));
                 } else if is_compaction_channel_session(&usage.session_id) {
                     candidate_sessions.push(usage.clone());
                 }
@@ -824,62 +820,32 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                 candidate_sessions.push(usage.clone());
             }
 
-            let mut blocked_hysteresis = 0usize;
             let mut blocked_cooldown = 0usize;
-            let mut cleared_hysteresis = 0usize;
             let mut bypassed_cooldown = 0usize;
             for candidate in candidate_sessions {
-                let hysteresis_active = state
-                    .compaction_hysteresis_active
-                    .contains_key(&candidate.session_id);
                 let decision = evaluate_context_compaction_candidate(
                     candidate.usage_ratio,
                     policy.compaction_start_ratio,
                     policy.compaction_emergency_ratio,
-                    policy.compaction_recover_ratio,
                     compaction_cooldown_ready,
-                    hysteresis_active,
                 );
-                if decision.clear_hysteresis {
-                    cleared_hysteresis += 1;
-                    state
-                        .compaction_hysteresis_active
-                        .remove(&candidate.session_id);
-                    continue;
-                }
                 if decision.should_compact {
-                    if decision.activate_hysteresis {
-                        state
-                            .compaction_hysteresis_active
-                            .entry(candidate.session_id.clone())
-                            .or_insert(usage.captured_at_epoch_secs);
-                    }
                     if decision.bypassed_cooldown {
                         bypassed_cooldown += 1;
                     }
                     compaction_targets.push(candidate);
                     continue;
                 }
-                if hysteresis_active {
-                    blocked_hysteresis += 1;
-                } else if candidate.usage_ratio >= policy.compaction_start_ratio
+                if candidate.usage_ratio >= policy.compaction_start_ratio
                     && !compaction_cooldown_ready
                 {
                     blocked_cooldown += 1;
                 }
             }
             compaction_notes.push(format!(
-                "policy=start_ratio={:.4} emergency_ratio={:.4} recover_ratio={:.4}",
-                policy.compaction_start_ratio,
-                policy.compaction_emergency_ratio,
-                policy.compaction_recover_ratio
+                "policy=start_ratio={:.4} emergency_ratio={:.4}",
+                policy.compaction_start_ratio, policy.compaction_emergency_ratio,
             ));
-            if cleared_hysteresis > 0 {
-                compaction_notes.push(format!("hysteresis_cleared={cleared_hysteresis}"));
-            }
-            if blocked_hysteresis > 0 {
-                compaction_notes.push(format!("hysteresis_blocked={blocked_hysteresis}"));
-            }
             if blocked_cooldown > 0 {
                 compaction_notes.push(format!("cooldown_blocked={blocked_cooldown}"));
             }

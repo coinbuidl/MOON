@@ -6,7 +6,6 @@ prune_mode = "disabled"
 compaction_authority = "moon"
 compaction_start_ratio = 0.5
 compaction_emergency_ratio = 0.90
-compaction_recover_ratio = 0.35
 
 [watcher]
 poll_interval_secs = 30

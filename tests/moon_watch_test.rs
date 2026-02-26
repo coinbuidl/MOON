@@ -890,7 +890,7 @@ fn moon_watch_context_policy_bypasses_cooldown_on_emergency_ratio() {
 
 #[test]
 #[cfg(not(windows))]
-fn moon_watch_context_policy_hysteresis_blocks_until_recover_ratio() {
+fn moon_watch_context_policy_retriggers_after_cooldown_when_above_trigger_ratio() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
     let sessions_dir = tmp.path().join("sessions");
@@ -902,7 +902,7 @@ fn moon_watch_context_policy_hysteresis_blocks_until_recover_ratio() {
     fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
     fs::write(
         sessions_dir.join("sess-over.jsonl"),
-        "{\"messages\":[\"discord hysteresis\"]}\n",
+        "{\"messages\":[\"discord retrigger\"]}\n",
     )
     .expect("write session file");
     fs::write(
@@ -940,7 +940,7 @@ fn moon_watch_context_policy_hysteresis_blocks_until_recover_ratio() {
     };
 
     let over_start = r#"{"path":"x","count":1,"sessions":[{"key":"agent:main:discord:channel:over","totalTokens":82,"contextTokens":100}]}"#;
-    let below_recover = r#"{"path":"x","count":1,"sessions":[{"key":"agent:main:discord:channel:over","totalTokens":60,"contextTokens":100}]}"#;
+    let below_trigger = r#"{"path":"x","count":1,"sessions":[{"key":"agent:main:discord:channel:over","totalTokens":40,"contextTokens":100}]}"#;
 
     run_watch(over_start);
     let first_count = compact_calls();
@@ -948,13 +948,13 @@ fn moon_watch_context_policy_hysteresis_blocks_until_recover_ratio() {
 
     run_watch(over_start);
     let second_count = compact_calls();
-    assert_eq!(second_count, 1);
+    assert_eq!(second_count, 2);
 
-    run_watch(below_recover);
+    run_watch(below_trigger);
     let third_count = compact_calls();
-    assert_eq!(third_count, 1);
+    assert_eq!(third_count, 2);
 
     run_watch(over_start);
     let fourth_count = compact_calls();
-    assert_eq!(fourth_count, 2);
+    assert_eq!(fourth_count, 3);
 }

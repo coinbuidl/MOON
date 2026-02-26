@@ -161,9 +161,11 @@ impl Default for MoonContextConfig {
             window_tokens: None,
             prune_mode: MoonContextPruneMode::Disabled,
             compaction_authority: MoonContextCompactionAuthority::Moon,
-            compaction_start_ratio: 0.78,
+            compaction_start_ratio: 0.50,
             compaction_emergency_ratio: 0.90,
-            compaction_recover_ratio: 0.65,
+            // Legacy field retained for backward compatibility; compaction
+            // trigger logic no longer depends on recover ratio.
+            compaction_recover_ratio: 0.0,
         }
     }
 }
@@ -344,11 +346,6 @@ fn validate(cfg: &MoonConfig) -> Result<()> {
         if !(context.compaction_recover_ratio >= 0.0 && context.compaction_recover_ratio < 1.0) {
             return Err(anyhow!(
                 "invalid context config: require 0 <= compaction_recover_ratio < 1.0"
-            ));
-        }
-        if context.compaction_recover_ratio >= context.compaction_start_ratio {
-            return Err(anyhow!(
-                "invalid context config: require compaction_recover_ratio < compaction_start_ratio"
             ));
         }
         if context.compaction_start_ratio > context.compaction_emergency_ratio {
