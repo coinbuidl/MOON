@@ -255,6 +255,41 @@ fn acquire_lock(
     }
 }
 
+fn is_embed_timeout(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("command timed out after")
+}
+
+fn run_bounded_embed_with_backoff(
+    paths: &MoonPaths,
+    opts: &EmbedRunOptions,
+    initial_max_docs: usize,
+) -> std::result::Result<(usize, qmd::EmbedExecResult), EmbedRunError> {
+    let mut max_docs = initial_max_docs.max(1);
+    loop {
+        match qmd::embed_bounded(
+            &paths.qmd_bin,
+            &opts.collection_name,
+            max_docs,
+            opts.max_cycle_secs,
+        ) {
+            Ok(exec) => return Ok((max_docs, exec)),
+            Err(err) => {
+                if opts.caller == EmbedCaller::Watcher && is_embed_timeout(&err) && max_docs > 1 {
+                    max_docs = (max_docs / 2).max(1);
+                    continue;
+                }
+                let timeout_text = opts
+                    .max_cycle_secs
+                    .map(|secs| secs.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                return Err(EmbedRunError::Failed(format!(
+                    "bounded-embed-failed max_docs={max_docs} timeout_secs={timeout_text} error={err:#}"
+                )));
+            }
+        }
+    }
+}
+
 pub fn run(
     paths: &MoonPaths,
     state: &mut MoonState,
@@ -420,13 +455,7 @@ pub fn run(
         }
     };
 
-    let exec = qmd::embed_bounded(
-        &paths.qmd_bin,
-        &opts.collection_name,
-        selected_docs,
-        opts.max_cycle_secs,
-    )
-    .map_err(|err| EmbedRunError::Failed(format!("bounded-embed-failed error={err:#}")))?;
+    let (embedded_docs, exec) = run_bounded_embed_with_backoff(paths, opts, selected_docs)?;
 
     if qmd::output_indicates_embed_status_failed(&exec.stdout, &exec.stderr) {
         return Err(EmbedRunError::StatusFailed(
@@ -434,13 +463,12 @@ pub fn run(
         ));
     }
 
-    for doc in &selected {
+    for doc in selected.iter().take(embedded_docs) {
         state.embedded_projections.insert(
             doc.path.display().to_string(),
             now_epoch.max(doc.mtime_epoch_secs),
         );
     }
-    let embedded_docs = selected_docs;
 
     let existing_projection_paths = docs
         .iter()

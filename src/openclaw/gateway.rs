@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
@@ -17,23 +17,35 @@ fn ensure_executable_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_openclaw_bin() -> Result<String> {
-    let custom =
-        env::var("OPENCLAW_BIN").context("OPENCLAW_BIN is required and must point to openclaw")?;
-    let trimmed = custom.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("OPENCLAW_BIN is required and cannot be empty");
+pub(crate) fn resolve_openclaw_bin_path() -> Result<PathBuf> {
+    match env::var("OPENCLAW_BIN") {
+        Ok(custom) => {
+            let trimmed = custom.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("OPENCLAW_BIN is set but empty");
+            }
+            let path = PathBuf::from(trimmed);
+            ensure_executable_path(&path)?;
+            return Ok(path);
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("OPENCLAW_BIN contains invalid unicode");
+        }
+        Err(env::VarError::NotPresent) => {}
     }
-    ensure_executable_path(Path::new(trimmed))?;
-    Ok(trimmed.to_string())
+
+    let resolved = which::which("openclaw")
+        .context("openclaw binary not found; set OPENCLAW_BIN or add openclaw to PATH")?;
+    ensure_executable_path(&resolved)?;
+    Ok(resolved)
 }
 
 fn run_openclaw(args: &[&str]) -> Result<Output> {
-    let bin = resolve_openclaw_bin()?;
+    let bin = resolve_openclaw_bin_path()?;
     let out = Command::new(&bin)
         .args(args)
         .output()
-        .with_context(|| format!("failed to run `{bin} {}`", args.join(" ")))?;
+        .with_context(|| format!("failed to run `{}` {}", bin.display(), args.join(" ")))?;
     Ok(out)
 }
 
@@ -228,5 +240,5 @@ pub fn run_sessions_index_note(
 }
 
 pub fn openclaw_available() -> bool {
-    resolve_openclaw_bin().is_ok()
+    resolve_openclaw_bin_path().is_ok()
 }

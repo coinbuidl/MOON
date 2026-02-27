@@ -57,7 +57,7 @@ Failure:
 1. OpenClaw metrics unavailable.
 
 Policy:
-1. Fail the cycle and surface a clear error (`OPENCLAW_BIN` required and executable).
+1. Fail the cycle and surface a clear error when `openclaw` is unavailable (not on `PATH` and no valid `OPENCLAW_BIN` override).
 2. Retry next cycle in daemon mode after normal poll interval.
 
 ## Archive Stage

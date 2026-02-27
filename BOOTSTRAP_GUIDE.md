@@ -9,8 +9,15 @@ Before installation, you MUST define your workspace boundaries. Export these in 
 # The absolute path to your OpenClaw workspace
 export MOON_HOME="/Users/lilac/.lilac_metaflora"
 
-# The absolute path to the OpenClaw binary (required for compaction triggers)
+# Optional override for OpenClaw binary path.
+# If unset, moon resolves `openclaw` from PATH.
 export OPENCLAW_BIN="/Users/lilac/.nvm/versions/node/v24.13.0/bin/openclaw"
+```
+
+Validation:
+
+```bash
+command -v openclaw
 ```
 
 ## 2. Provenance Handshake

@@ -26,6 +26,48 @@ exit 0
     }
 }
 
+fn write_fake_qmd_embed_timeout_backoff(bin_path: &Path) {
+    let script = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${MOON_TEST_QMD_LOG:-}" ]]; then
+  printf "%s\n" "$*" >> "${MOON_TEST_QMD_LOG}"
+fi
+
+if [[ "${1:-}" == "embed" && "${2:-}" == "--help" ]]; then
+  echo "Usage: qmd embed <collection> --max-docs <n>"
+  exit 0
+fi
+
+if [[ "${1:-}" == "embed" ]]; then
+  max_docs=0
+  for ((i=1; i<=$#; i++)); do
+    arg="${!i}"
+    if [[ "${arg}" == "--max-docs" ]]; then
+      next=$((i + 1))
+      max_docs="${!next:-0}"
+      break
+    fi
+  done
+
+  if [[ "${max_docs}" =~ ^[0-9]+$ ]] && (( max_docs > 1 )); then
+    sleep 2
+  fi
+  exit 0
+fi
+
+exit 0
+"#;
+    fs::write(bin_path, script).expect("write fake qmd");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(bin_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(bin_path, perms).expect("chmod");
+    }
+}
+
 fn write_fake_openclaw(bin_path: &Path) {
     let script = r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -202,6 +244,61 @@ fn moon_watch_once_triggers_pipeline_with_low_thresholds() {
     assert!(state_file.exists());
     let ledger = moon_home.join("archives/ledger.jsonl");
     assert!(ledger.exists());
+}
+
+#[test]
+#[cfg(not(windows))]
+fn moon_watch_once_retries_embed_with_smaller_batch_after_timeout() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let sessions_dir = tmp.path().join("sessions");
+    let mlib_dir = moon_home.join("archives/mlib");
+    let qmd_log = tmp.path().join("qmd.log");
+
+    fs::create_dir_all(&mlib_dir).expect("mkdir mlib");
+    fs::create_dir_all(moon_home.join("archives/raw")).expect("mkdir raw");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
+    fs::create_dir_all(&sessions_dir).expect("mkdir sessions");
+    fs::write(
+        sessions_dir.join("s1.json"),
+        "{\"decision\":\"embed timeout backoff\"}\n",
+    )
+    .expect("write session");
+
+    for name in ["a.md", "b.md", "c.md", "d.md"] {
+        fs::write(mlib_dir.join(name), format!("- [user] {name}\n")).expect("write projection");
+    }
+
+    let qmd = tmp.path().join("qmd");
+    write_fake_qmd_embed_timeout_backoff(&qmd);
+    let openclaw = tmp.path().join("openclaw");
+    write_fake_openclaw(&openclaw);
+
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("OPENCLAW_SESSIONS_DIR", &sessions_dir)
+        .env("QMD_BIN", &qmd)
+        .env("OPENCLAW_BIN", &openclaw)
+        .env("MOON_TEST_QMD_LOG", &qmd_log)
+        .env("MOON_EMBED_MAX_DOCS_PER_CYCLE", "4")
+        .env("MOON_EMBED_MAX_CYCLE_SECS", "1")
+        .env("MOON_DISTILL_MODE", "manual")
+        .arg("moon-watch")
+        .arg("--once")
+        .assert()
+        .success();
+
+    let qmd_calls = fs::read_to_string(&qmd_log).expect("read qmd log");
+    assert!(qmd_calls.contains("embed --help"));
+    assert!(qmd_calls.contains("embed history --max-docs 4"));
+    assert!(qmd_calls.contains("embed history --max-docs 2"));
+    assert!(qmd_calls.contains("embed history --max-docs 1"));
+
+    let audit = fs::read_to_string(moon_home.join("moon/logs/audit.log")).expect("read audit");
+    assert!(audit.contains("\"phase\":\"embed\",\"status\":\"ok\""));
+    assert!(audit.contains("mode=watcher capability=bounded selected=4 embedded=1"));
 }
 
 #[test]

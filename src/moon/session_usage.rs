@@ -1,9 +1,9 @@
 use crate::moon::paths::MoonPaths;
+use crate::openclaw::gateway::resolve_openclaw_bin_path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -105,26 +105,6 @@ fn find_u64(root: &Value, paths: &[&[&str]]) -> Option<u64> {
         }
     }
     None
-}
-
-fn resolve_openclaw_bin() -> Result<PathBuf> {
-    let custom =
-        env::var("OPENCLAW_BIN").context("OPENCLAW_BIN is required and must point to openclaw")?;
-    let trimmed = custom.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("OPENCLAW_BIN is required and cannot be empty");
-    }
-    let path = PathBuf::from(trimmed);
-    if !path.exists() {
-        anyhow::bail!(
-            "OPENCLAW_BIN is set but path does not exist: {}",
-            path.display()
-        );
-    }
-    if !path.is_file() {
-        anyhow::bail!("OPENCLAW_BIN is set but is not a file: {}", path.display());
-    }
-    Ok(path)
 }
 
 fn openclaw_usage_args() -> Vec<String> {
@@ -246,7 +226,7 @@ impl SessionUsageProvider for OpenClawUsageProvider {
     }
 
     fn collect(&self, _paths: &MoonPaths) -> Result<SessionUsageSnapshot> {
-        let bin = resolve_openclaw_bin()?;
+        let bin = resolve_openclaw_bin_path()?;
         let args = openclaw_usage_args();
         let output = Command::new(&bin)
             .args(&args)
@@ -272,7 +252,7 @@ pub fn collect_usage(paths: &MoonPaths) -> Result<SessionUsageSnapshot> {
 }
 
 pub fn collect_openclaw_usage_batch() -> Result<OpenClawUsageBatch> {
-    let bin = resolve_openclaw_bin()?;
+    let bin = resolve_openclaw_bin_path()?;
     let args = openclaw_sessions_args();
     let output = Command::new(&bin)
         .args(&args)

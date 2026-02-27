@@ -74,7 +74,8 @@ moon moon-index --name history
 ## Troubleshooting
 
 1. No usage data:
-- verify `OPENCLAW_BIN` is set to a valid `openclaw` binary path
+- verify `openclaw` is available on `PATH` (`command -v openclaw`)
+- optionally set `OPENCLAW_BIN` to a specific `openclaw` binary path
 2. QMD indexing/search fails:
 - set `QMD_BIN`
 - verify `qmd collection add` and `qmd search` work manually

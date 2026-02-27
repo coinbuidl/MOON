@@ -103,7 +103,7 @@ impl Default for MoonEmbedConfig {
             cooldown_secs: 60,
             max_docs_per_cycle: 25,
             min_pending_docs: 1,
-            max_cycle_secs: 90,
+            max_cycle_secs: 300,
         }
     }
 }

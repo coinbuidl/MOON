@@ -93,7 +93,7 @@ Query semantics:
 
 ## Agent bootstrap checklist
 
-1. Set `.env` (at minimum: `OPENCLAW_BIN`; recommended: explicit path block below).
+1. Set `.env` (at minimum: ensure `openclaw` is on `PATH`; optional: set `OPENCLAW_BIN`; recommended: explicit path block below).
 2. Apply plugin install + provenance self-heal:
    `moon install` (or `cargo run -- install`)
 3. Validate environment and plugin wiring:
@@ -139,10 +139,11 @@ directory.
 
 Agent check: ensure `.env` exists in the moon repo folder (`moon/.env`).
 
-Required `.env` value:
+OpenClaw binary resolution:
 
 ```bash
-# Required: OpenClaw binary path (no default)
+# Preferred: ensure `openclaw` is available on PATH.
+# Optional override: pin an explicit binary path.
 OPENCLAW_BIN=/absolute/path/to/openclaw
 ```
 
@@ -457,7 +458,7 @@ Start from:
 
 Most-used `.env` variables:
 
-1. `OPENCLAW_BIN`
+1. `OPENCLAW_BIN` (optional override; `openclaw` is auto-resolved from `PATH` when unset)
 2. `QMD_BIN`
 3. `MOON_HOME`
 4. `MOON_CONFIG_PATH`
