@@ -36,7 +36,7 @@
 8. `DISTILL_SOURCE_MISSING`: verify archive projection markdown exists (`archives/mlib/*.md`) and rerun `moon-index --name history` to backfill.
 9. `EMBED_FAILED`: verify `QMD_BIN`, `qmd embed` execution, and file permissions for lock/state paths.
 10. `EMBED_LOCKED`: another embed worker is active; retry next cycle or after current run ends.
-11. `EMBED_CAPABILITY_MISSING`: installed QMD build lacks required embed capability surface; upgrade QMD or allow degraded unbounded mode manually.
+11. `EMBED_CAPABILITY_MISSING`: installed QMD build lacks bounded embed capability (`--max-docs`); upgrade QMD.
 12. `EMBED_STATUS_FAILED`: QMD embed returned failed status payload; inspect command output and QMD logs.
 
 ## Stage Policies
@@ -129,5 +129,5 @@ Failure:
 
 Policy:
 1. Watcher mode: warn and continue cycle in degraded mode.
-2. Manual mode: return `ok=false` unless explicitly degraded by flags.
+2. Manual mode: return `ok=false` on lock/capability/command failures (no degraded unbounded fallback flags).
 3. Always append embed audit detail.

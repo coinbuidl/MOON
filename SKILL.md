@@ -1,6 +1,9 @@
-# M.O.O.N. Skill
+# M.O.O.N. Admin Skill
 
-Use this skill for moon System operations:
+Use this skill for moon system admin/operator operations.
+For least-privilege sub-agents, use `SKILL_SUBAGENT.md` instead.
+
+This skill covers:
 1. Plugin lifecycle (`install`, `verify`, `repair`, `post-upgrade`).
 2. moon workflows (`moon-watch`, `moon-stop`, `moon-snapshot`, `moon-index`, `moon-embed`, `moon-recall`, `moon-distill`).
 
@@ -17,7 +20,9 @@ Use this skill for moon System operations:
 9. If `[context].compaction_authority = "moon"` is configured in `moon.toml`, enforce OpenClaw `agents.defaults.compaction.mode = "default"` (valid mode) and let moon drive earlier compaction via `[context]` ratios.
 10. On current OpenClaw versions, auto-compaction cannot be hard-disabled via config mode; treat moon as primary compaction orchestrator with OpenClaw fallback.
 11. If `moon status` reports `context policy drift`, fix with `moon install` (or `moon repair`) and re-check before continuing.
-12. Use `moon moon-embed` for manual embedding refresh (`--max-docs` for bounded sprint runs). Prefer `moon --json moon-embed ...` for automation/report parsing.
-13. For watcher-managed embed, configure `[embed].mode = "idle"` in `moon.toml`; watcher embed failures are degraded by design and should not block compaction/distill.
-14. Treat `--allow-unbounded` as degraded fallback only: MOON will run embed but does not mark selected docs as confirmed embedded unless bounded/verifiable completion is available.
-15. For automatic layer-2 distillation, prefer `[distill].mode = "daily"` for once-per-residential-day runs; use `mode = "idle"` only when you want repeated idle-window distill cycles.
+12. Use `moon moon-embed` for manual embedding refresh (`--max-docs` bounded sprint runs). Manual runs trigger immediately and bypass watcher cooldown gates.
+13. Watcher embed is always auto and runs near the end of each cycle (after compaction/distill stages), then on cooldown-driven cycles. Gating is `[embed].cooldown_secs` + `[embed].min_pending_docs`; `[embed].idle_secs` is legacy compatibility only.
+14. Manual embed must not alter watcher cooldown timing; watcher cooldown continues from watcher-trigger timestamps only.
+15. Keep embed bounded-only. If QMD lacks `--max-docs`, watcher degrades and manual embed returns capability-missing (no unbounded fallback).
+16. Embed lock is non-blocking: watcher reports degraded/locked and retries next cycle; manual command returns lock error immediately (no queue/wait behavior).
+17. For automatic layer-2 distillation, prefer `[distill].mode = "daily"` for once-per-residential-day runs; use `mode = "idle"` only when you want repeated idle-window distill cycles.

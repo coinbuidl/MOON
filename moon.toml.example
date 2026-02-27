@@ -24,10 +24,11 @@ warm_days = 30
 cold_days = 31
 
 [embed]
-mode = "manual"
-idle_secs = 600
-cooldown_secs = 300
-max_docs_per_cycle = 25
+mode = "auto"
+# Legacy compatibility knob; watcher auto embed is cooldown-based now.
+idle_secs = 0
+cooldown_secs = 60
+max_docs_per_cycle = 10
 min_pending_docs = 1
 max_cycle_secs = 90
 

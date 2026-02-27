@@ -31,10 +31,10 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
     *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
 4.  **Embed Lifecycle Management**:
     * Manual command: `moon moon-embed --name history --max-docs 25`
-    * Capability negotiation against installed QMD (`bounded`, `unbounded-only`, or `missing`)
+    * Capability negotiation against installed QMD (`bounded` required; otherwise treated as missing/degraded)
     * Single-flight lock (`$MOON_LOGS_DIR/moon-embed.lock`) to avoid overlapping embed workers
-    * Optional watcher auto-embed (`[embed].mode = "idle"`) without blocking compaction/distill
-    * In `--allow-unbounded` fallback mode, MOON does not mark selected docs as confirmed embedded unless verifiable
+    * Watcher embed runs automatically near the end of each cycle (after compaction/distill stages), then continues on cooldown-driven cycles
+    * Bounded-only execution (`--max-docs`): no unbounded fallback path
 
 ## Recommended Agent Integration
 
@@ -44,6 +44,30 @@ To ensure reliable long-term memory and optimal token hygiene, it is recommended
 *   **Agent (Strategic Distillation)**: Responsible for high-level cognitive reviewÃ¢â‚¬â€auditing daily logs and migrating key strategic insights into the long-term `MEMORY.md`.
 
 This modular architecture prevents the Agent from being overwhelmed by raw session data while ensuring that distilled knowledge is persisted with high signal-to-noise ratios.
+
+### Skill Placement (Admin vs Sub-agent)
+
+Keep both skill source files in this repo root:
+
+1. `SKILL.md` for admin/operator tasks (`install`, `verify`, `repair`, watcher lifecycle).
+2. `SKILL_SUBAGENT.md` for least-privilege sub-agent tasks (`moon-recall`, `moon-distill`, bounded `moon-embed`).
+
+If your runtime expects installed skills at `$CODEX_HOME/skills/<name>/SKILL.md`,
+copy them as:
+
+```bash
+MOON_REPO="/absolute/path/to/moon"
+SKILLS_HOME="${CODEX_HOME:-$HOME/.codex}/skills"
+
+mkdir -p "$SKILLS_HOME/moon-admin" "$SKILLS_HOME/moon-subagent"
+cp "$MOON_REPO/SKILL.md" "$SKILLS_HOME/moon-admin/SKILL.md"
+cp "$MOON_REPO/SKILL_SUBAGENT.md" "$SKILLS_HOME/moon-subagent/SKILL.md"
+```
+
+Recommended role split:
+
+1. Primary/operator agent: `moon-admin`.
+2. Sub-agents: `moon-subagent` only.
 
 ### AGENTS.md Recall Policy Template
 
@@ -79,6 +103,7 @@ Query semantics:
 5. Run one watcher cycle:
    `moon moon-watch --once` (or `cargo run -- moon-watch --once`)
 6. Enable daemon mode only after one-shot run is clean.
+7. Install role-scoped skills (`moon-admin`, `moon-subagent`) if your runtime uses `$CODEX_HOME/skills`.
 
 ## Quick start
 
@@ -304,8 +329,7 @@ Commands:
    - `--reproject`: regenerate all projection markdown files using the v2 structured format
 9. `moon-watch [--once|--daemon] [--distill-now]`
 10. `moon-stop`
-11. `moon-embed [--name <collection>] [--max-docs <N>] [--dry-run] [--allow-unbounded] [--watcher-trigger]`
-    - `--allow-unbounded`: run degraded fallback when QMD lacks bounded embed capability; selected docs are not marked confirmed embedded in MOON state
+11. `moon-embed [--name <collection>] [--max-docs <N>] [--dry-run] [--watcher-trigger]`
 12. `moon-recall --query <text> [--name <collection>]`
 13. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive]`
     - default: archives larger than `MOON_DISTILL_CHUNK_BYTES` are auto-distilled in chunks
@@ -367,12 +391,6 @@ Run manual embed sprint:
 moon moon-embed --name history --max-docs 25
 ```
 
-Fallback for older QMD without bounded embed:
-
-```bash
-moon moon-embed --name history --max-docs 25 --allow-unbounded
-```
-
 Recall prior context:
 
 ```bash
@@ -413,10 +431,14 @@ Retention lifecycle windows:
 
 Embed lifecycle windows:
 
-1. `embed.mode = "manual"`: watcher does not auto-run embed.
-2. `embed.mode = "idle"`: watcher attempts embed after archive/index success and embed idle/cooldown gates.
-3. If QMD lacks bounded embed capability, watcher skips embed in degraded mode and continues the cycle.
-4. Manual `--allow-unbounded` is degraded fallback; MOON does not treat selected docs as confirmed embedded without bounded/verifiable completion.
+1. Watcher embed is always auto (legacy `embed.mode` values normalize to `auto`).
+2. Watcher attempts embed near the end of each cycle (after compaction/distill stages), then on subsequent cycles.
+3. Watcher execution is gated by `embed.cooldown_secs` and `embed.min_pending_docs`.
+4. Manual `moon-embed` runs immediately and bypasses watcher cooldown gating.
+5. Manual `moon-embed` does not reset the watcher cooldown clock.
+6. QMD must support bounded embed (`--max-docs`); otherwise watcher degrades and manual embed returns capability-missing.
+7. `embed.idle_secs` is retained only for compatibility and does not gate watcher embed execution.
+8. Lock behavior is non-blocking: watcher embed skips current cycle when lock is busy; manual embed returns lock error (no wait queue).
 
 Archive layout:
 
@@ -450,8 +472,8 @@ Most-used `.env` variables:
 13. `MOON_HIGH_TOKEN_ALERT_THRESHOLD` (default `1000000`; set `0` to disable)
 14. `MOON_ENABLE_COMPACTION_WRITE`
 15. `MOON_ENABLE_SESSION_ROLLOVER`
-16. `MOON_EMBED_MODE` (`manual` or `idle`)
-17. `MOON_EMBED_IDLE_SECS`
+16. `MOON_EMBED_MODE` (`auto`; legacy aliases `idle` and `manual` normalize to `auto`)
+17. `MOON_EMBED_IDLE_SECS` (legacy compatibility knob; no watcher gate effect)
 18. `MOON_EMBED_COOLDOWN_SECS`
 19. `MOON_EMBED_MAX_DOCS_PER_CYCLE`
 20. `MOON_EMBED_MIN_PENDING_DOCS`
@@ -463,7 +485,7 @@ Primary tuning belongs in `moon.toml`:
 2. `[watcher] poll_interval_secs`, `cooldown_secs`
 3. `[distill] mode`, `idle_secs`, `max_per_cycle`, `residential_timezone`, `topic_discovery`
 4. `[retention] active_days`, `warm_days`, `cold_days`
-5. `[embed] mode`, `idle_secs`, `cooldown_secs`, `max_docs_per_cycle`, `min_pending_docs`, `max_cycle_secs`
+5. `[embed] mode` (fixed `auto`; legacy aliases normalize), `idle_secs` (legacy compatibility), `cooldown_secs`, `max_docs_per_cycle`, `min_pending_docs`, `max_cycle_secs`
 6. `[inbound_watch] enabled`, `recursive`, `watch_paths`, `event_mode`
 7. `[thresholds] trigger_ratio` (legacy/fallback path when context policy is not active)
 

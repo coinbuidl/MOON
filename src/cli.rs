@@ -101,8 +101,6 @@ pub struct MoonEmbedArgs {
     #[arg(long)]
     pub dry_run: bool,
     #[arg(long)]
-    pub allow_unbounded: bool,
-    #[arg(long)]
     pub watcher_trigger: bool,
 }
 
@@ -183,7 +181,6 @@ pub fn run() -> Result<()> {
                 collection_name: args.name.clone(),
                 max_docs: args.max_docs,
                 dry_run: args.dry_run,
-                allow_unbounded: args.allow_unbounded,
                 watcher_trigger: args.watcher_trigger,
             })?
         }

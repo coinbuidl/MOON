@@ -34,12 +34,44 @@ The Watcher is the "brain" of the system. It handles archival, compaction, and d
 
 ## 5. Embedding Strategy (Large Backlogs)
 If you have a massive existing session history (e.g., >10,000 chunks):
-- **Do not force a full sync**: Extremely large unbounded runs may cause process stalls.
-- **Idle Mode**: Set `[embed].mode = "idle"` in `moon.toml`. The Watcher will drip-feed embeddings during inactivity.
+- **Bounded only**: MOON requires bounded embed (`qmd embed --max-docs`) for verifiable progress.
+- **Auto watcher embed**: Keep `[embed].mode = "auto"` (legacy aliases normalize to `auto`). Watcher runs embed near cycle end with cooldown + pending-doc gates.
 - **Manual Sprints**: Use `moon moon-embed --max-docs 20` for controlled, verifiable progress.
 
-## 6. Sub-agent Memory Access
-To allow sub-agents to use the library, provide them with the `SKILL_SUBAGENT.md` protocol. This enables `moon-recall` search capabilities without granting them administrative permissions (like `stop` or `repair`).
+## 6. Skill File Placement (Required)
+MOON ships two role-scoped skill guides in this repo root:
+
+- `SKILL.md`: admin/operator scope (install, verify, repair, watcher lifecycle).
+- `SKILL_SUBAGENT.md`: least-privilege sub-agent scope (recall, distill, bounded embed).
+
+Keep these files in the repo root as source-of-truth:
+
+- `<moon-repo>/SKILL.md`
+- `<moon-repo>/SKILL_SUBAGENT.md`
+
+If your agent runtime loads skills from `$CODEX_HOME/skills/<skill-name>/SKILL.md`,
+install both files to explicit skill directories:
+
+```bash
+MOON_REPO="/absolute/path/to/moon"
+SKILLS_HOME="${CODEX_HOME:-$HOME/.codex}/skills"
+
+mkdir -p "$SKILLS_HOME/moon-admin" "$SKILLS_HOME/moon-subagent"
+cp "$MOON_REPO/SKILL.md" "$SKILLS_HOME/moon-admin/SKILL.md"
+cp "$MOON_REPO/SKILL_SUBAGENT.md" "$SKILLS_HOME/moon-subagent/SKILL.md"
+```
+
+## 7. Sub-agent Memory Access
+When delegating memory tasks, give sub-agents only the sub-agent skill
+(`moon-subagent`). Do not grant admin/operator skill (`moon-admin`) to
+sub-agents.
+
+Example workspace rule (`AGENTS.md`):
+
+```md
+- Primary operator agent may use `moon-admin`.
+- Sub-agents must use `moon-subagent` only.
+```
 
 ---
 *Follow these steps to achieve a self-healing, memory-aware workspace. - Lilac* ✨💕

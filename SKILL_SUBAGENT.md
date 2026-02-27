@@ -1,21 +1,31 @@
-# Moon Memory Skill
+# MOON Sub-agent Skill (Memory Operations Only)
 
-Use this skill to retrieve high-signal information from the long-term session library (`mlib/`).
+Use this skill when a sub-agent needs memory search/distill/embed functions only.
 
-## Core Tool: `moon-recall`
+## Allowed Commands (Only These)
 
-Before starting a task that requires context from past sessions, search the library:
+1. Search history:
 `moon moon-recall --name history --query "<keywords>"`
+2. Distill one archive:
+`moon moon-distill --archive <path-to-archive-jsonl>`
+3. Embed bounded batches:
+`moon moon-embed --name history --max-docs <N>`
 
-### Guidelines
+## Operating Rules
 
-1. **Search First**: If the user refers to prior decisions, technical fixes, or specific conversations not in your current context, run a recall query immediately.
-2. **Keyword Optimization**: Use 3-5 specific keywords related to the topic (e.g., "watcher binary path fix" or "venus system margins").
-3. **Execution**: Always run via the `moon` binary. Do NOT attempt to rebuild, restart, or modify the MOON system.
-4. **Output Usage**: Use the retrieved Markdown projections to inform your reasoning and responses. Do not hallucinate past facts if the recall returns no matches.
+1. **Search first**: If the task depends on prior context, run `moon-recall` before answering.
+2. **Use bounded embed only**: `moon-embed` must include `--max-docs <N>` to avoid unbounded runs.
+3. **Minimal side effects**: Do not run loops/daemons; execute single-shot commands only.
+4. **No hallucinated history**: If recall has no relevant results, explicitly report no hit.
+5. **Run via installed binary**: Use `moon ...` commands only.
 
-## Constraints
+## Prohibited Commands
 
-- **Read-Only**: You are authorized for **retrieval only**.
-- **Prohibited**: Do NOT use `moon-stop`, `moon-stop`, `install`, `repair`, or any `cargo` commands.
-- **Scope**: Focus on the `history` collection to find session projections.
+- Any build/runtime admin command: `cargo *`, `moon install`, `moon verify`, `moon repair`.
+- Any lifecycle/process control command: `moon moon-watch`, `moon-stop`.
+- Any command not listed under "Allowed Commands (Only These)".
+
+## Scope
+
+- Target collection for recall/embed: `history`.
+- This skill is for sub-agents and least-privilege memory operations only.

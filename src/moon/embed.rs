@@ -36,7 +36,6 @@ pub struct EmbedRunOptions {
     pub collection_name: String,
     pub max_docs: usize,
     pub dry_run: bool,
-    pub allow_unbounded: bool,
     pub caller: EmbedCaller,
     pub max_cycle_secs: Option<u64>,
 }
@@ -62,7 +61,6 @@ enum SkipReason {
     Locked,
     CapabilityMissing,
     Cooldown,
-    IdleNotMet,
 }
 
 impl SkipReason {
@@ -72,7 +70,6 @@ impl SkipReason {
             Self::Locked => "locked",
             Self::CapabilityMissing => "capability-missing",
             Self::Cooldown => "cooldown",
-            Self::IdleNotMet => "idle-not-met",
         }
     }
 }
@@ -187,10 +184,6 @@ fn pending_docs<'a>(state: &MoonState, docs: &'a [ProjectionDoc]) -> Vec<&'a Pro
         .collect()
 }
 
-fn latest_projection_epoch(docs: &[ProjectionDoc]) -> Option<u64> {
-    docs.iter().map(|doc| doc.mtime_epoch_secs).max()
-}
-
 fn pid_alive(pid: u32) -> bool {
     let Ok(status) = Command::new("kill").arg("-0").arg(pid.to_string()).status() else {
         return false;
@@ -275,7 +268,7 @@ pub fn run(
     let pending = pending_docs(state, &docs);
     let pending_before = pending.len();
 
-    if opts.caller == EmbedCaller::Watcher && cfg.mode.eq_ignore_ascii_case("idle") {
+    if opts.caller == EmbedCaller::Watcher {
         if !is_cooldown_ready(
             state.last_embed_trigger_epoch_secs,
             now_epoch,
@@ -294,25 +287,6 @@ pub fn run(
                 degraded: false,
                 skip_reason: SkipReason::Cooldown.as_str().to_string(),
             });
-        }
-
-        if let Some(latest_epoch) = latest_projection_epoch(&docs) {
-            let idle_for = now_epoch.saturating_sub(latest_epoch);
-            if idle_for < cfg.idle_secs {
-                return Ok(EmbedRunSummary {
-                    collection: opts.collection_name.clone(),
-                    mode: opts.caller.as_str().to_string(),
-                    capability: "missing".to_string(),
-                    requested_max_docs: opts.max_docs,
-                    selected_docs: 0,
-                    embedded_docs: 0,
-                    pending_before,
-                    pending_after: pending_before,
-                    elapsed_ms: started.elapsed().as_millis(),
-                    degraded: false,
-                    skip_reason: SkipReason::IdleNotMet.as_str().to_string(),
-                });
-            }
         }
 
         if pending_before < cfg.min_pending_docs as usize {
@@ -369,19 +343,17 @@ pub fn run(
         });
     }
 
-    state.last_embed_trigger_epoch_secs = Some(now_epoch);
+    if opts.caller == EmbedCaller::Watcher {
+        state.last_embed_trigger_epoch_secs = Some(now_epoch);
+    }
 
     let probe = qmd::probe_embed_capability(&paths.qmd_bin);
-    let mut degraded = false;
     let mut skip_reason = SkipReason::None;
 
-    let run_bounded = match probe.capability {
-        qmd::EmbedCapability::Bounded => true,
+    match probe.capability {
+        qmd::EmbedCapability::Bounded => {}
         qmd::EmbedCapability::UnboundedOnly => {
-            if opts.allow_unbounded {
-                degraded = true;
-                false
-            } else if opts.caller == EmbedCaller::Watcher {
+            if opts.caller == EmbedCaller::Watcher {
                 return Ok(EmbedRunSummary {
                     collection: opts.collection_name.clone(),
                     mode: opts.caller.as_str().to_string(),
@@ -395,9 +367,8 @@ pub fn run(
                     degraded: true,
                     skip_reason: SkipReason::CapabilityMissing.as_str().to_string(),
                 });
-            } else {
-                return Err(EmbedRunError::CapabilityMissing(probe.note));
             }
+            return Err(EmbedRunError::CapabilityMissing(probe.note));
         }
         qmd::EmbedCapability::Missing => {
             if opts.caller == EmbedCaller::Watcher {
@@ -417,7 +388,7 @@ pub fn run(
             }
             return Err(EmbedRunError::CapabilityMissing(probe.note));
         }
-    };
+    }
 
     let _lock = match acquire_lock(paths, opts.caller, &opts.collection_name, now_epoch) {
         Ok(Some(lock)) => lock,
@@ -449,18 +420,13 @@ pub fn run(
         }
     };
 
-    let exec = if run_bounded {
-        qmd::embed_bounded(
-            &paths.qmd_bin,
-            &opts.collection_name,
-            selected_docs,
-            opts.max_cycle_secs,
-        )
-        .map_err(|err| EmbedRunError::Failed(format!("bounded-embed-failed error={err:#}")))?
-    } else {
-        qmd::embed_unbounded(&paths.qmd_bin, &opts.collection_name, opts.max_cycle_secs)
-            .map_err(|err| EmbedRunError::Failed(format!("unbounded-embed-failed error={err:#}")))?
-    };
+    let exec = qmd::embed_bounded(
+        &paths.qmd_bin,
+        &opts.collection_name,
+        selected_docs,
+        opts.max_cycle_secs,
+    )
+    .map_err(|err| EmbedRunError::Failed(format!("bounded-embed-failed error={err:#}")))?;
 
     if qmd::output_indicates_embed_status_failed(&exec.stdout, &exec.stderr) {
         return Err(EmbedRunError::StatusFailed(
@@ -468,16 +434,13 @@ pub fn run(
         ));
     }
 
-    let mut embedded_docs = 0usize;
-    if run_bounded {
-        for doc in &selected {
-            state.embedded_projections.insert(
-                doc.path.display().to_string(),
-                now_epoch.max(doc.mtime_epoch_secs),
-            );
-        }
-        embedded_docs = selected_docs;
+    for doc in &selected {
+        state.embedded_projections.insert(
+            doc.path.display().to_string(),
+            now_epoch.max(doc.mtime_epoch_secs),
+        );
     }
+    let embedded_docs = selected_docs;
 
     let existing_projection_paths = docs
         .iter()
@@ -499,7 +462,7 @@ pub fn run(
         pending_before,
         pending_after,
         elapsed_ms: started.elapsed().as_millis(),
-        degraded,
+        degraded: false,
         skip_reason: skip_reason.as_str().to_string(),
     })
 }

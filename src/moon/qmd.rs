@@ -301,30 +301,6 @@ pub fn embed_bounded(
     );
 }
 
-pub fn embed_unbounded(
-    qmd_bin: &Path,
-    collection_name: &str,
-    timeout_secs: Option<u64>,
-) -> Result<EmbedExecResult> {
-    let bin = resolve_qmd_bin(qmd_bin)?;
-    let mut cmd = Command::new(&bin);
-    cmd.arg("embed").arg(collection_name);
-    let output = run_command_with_optional_timeout(&mut cmd, timeout_secs)
-        .with_context(|| format!("failed to run `{}`", bin.display()))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if output.status.success() {
-        return Ok(EmbedExecResult { stdout, stderr });
-    }
-
-    anyhow::bail!(
-        "qmd embed (unbounded) failed\nstdout: {}\nstderr: {}",
-        stdout,
-        stderr
-    );
-}
-
 pub fn output_indicates_embed_status_failed(stdout: &str, stderr: &str) -> bool {
     let combined = format!("{stdout}\n{stderr}");
     let lower = combined.to_ascii_lowercase();

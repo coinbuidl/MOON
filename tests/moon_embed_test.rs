@@ -166,7 +166,7 @@ fn moon_embed_watcher_trigger_degrades_on_missing_capability() {
 }
 
 #[test]
-fn moon_embed_unbounded_does_not_mark_docs_embedded() {
+fn moon_embed_manual_fails_when_only_unbounded_capability_exists() {
     let tmp = tempdir().expect("tempdir");
     let moon_home = tmp.path().join("moon");
     let mlib_dir = moon_home.join("archives/mlib");
@@ -185,19 +185,88 @@ fn moon_embed_unbounded_does_not_mark_docs_embedded() {
         .env("MOON_HOME", &moon_home)
         .env("QMD_BIN", &qmd)
         .arg("moon-embed")
-        .arg("--allow-unbounded")
-        .args(["--max-docs", "1"])
         .assert()
-        .success()
-        .stdout(contains("embed.capability=unbounded-only"))
-        .stdout(contains("embed.degraded=true"))
-        .stdout(contains("embed.selected_docs=1"))
-        .stdout(contains("embed.embedded_docs=0"))
-        .stdout(contains("embed.pending_before=2"))
-        .stdout(contains("embed.pending_after=2"));
+        .failure()
+        .stdout(contains("embed capability missing"));
 
     let log = fs::read_to_string(&qmd_log).expect("read qmd log");
     assert!(log.contains("embed --help"));
-    assert!(log.contains("embed history"));
+    assert!(!log.contains("embed history"));
     assert!(!log.contains("--max-docs"));
+}
+
+#[test]
+fn moon_embed_manual_ignores_watcher_cooldown_and_keeps_watcher_clock() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    let mlib_dir = moon_home.join("archives/mlib");
+    fs::create_dir_all(&mlib_dir).expect("mkdir mlib");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    fs::create_dir_all(moon_home.join("moon/logs")).expect("mkdir logs");
+
+    fs::write(mlib_dir.join("a.md"), "a").expect("write a");
+    fs::write(mlib_dir.join("b.md"), "b").expect("write b");
+
+    let qmd = tmp.path().join("qmd");
+    let qmd_log = tmp.path().join("qmd.log");
+    write_fake_qmd_bounded(&qmd, &qmd_log);
+
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("QMD_BIN", &qmd)
+        .env("MOON_EMBED_COOLDOWN_SECS", "3600")
+        .arg("--json")
+        .arg("moon-embed")
+        .args(["--name", "history"])
+        .args(["--max-docs", "1"])
+        .arg("--watcher-trigger")
+        .assert()
+        .success()
+        .stdout(contains("embed.selected_docs=1"))
+        .stdout(contains("embed.pending_before=2"))
+        .stdout(contains("embed.pending_after=1"));
+
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("QMD_BIN", &qmd)
+        .env("MOON_EMBED_COOLDOWN_SECS", "3600")
+        .arg("--json")
+        .arg("moon-embed")
+        .args(["--name", "history"])
+        .args(["--max-docs", "1"])
+        .arg("--watcher-trigger")
+        .assert()
+        .success()
+        .stdout(contains("embed.skip_reason=cooldown"));
+
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("QMD_BIN", &qmd)
+        .env("MOON_EMBED_COOLDOWN_SECS", "3600")
+        .arg("--json")
+        .arg("moon-embed")
+        .args(["--name", "history"])
+        .args(["--max-docs", "1"])
+        .assert()
+        .success()
+        .stdout(contains("embed.selected_docs=1"))
+        .stdout(contains("embed.pending_before=1"))
+        .stdout(contains("embed.pending_after=0"));
+
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .env("QMD_BIN", &qmd)
+        .env("MOON_EMBED_COOLDOWN_SECS", "3600")
+        .arg("--json")
+        .arg("moon-embed")
+        .args(["--name", "history"])
+        .args(["--max-docs", "1"])
+        .arg("--watcher-trigger")
+        .assert()
+        .success()
+        .stdout(contains("embed.skip_reason=cooldown"));
 }

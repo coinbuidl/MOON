@@ -12,7 +12,6 @@ pub struct MoonEmbedOptions {
     pub collection_name: String,
     pub max_docs: usize,
     pub dry_run: bool,
-    pub allow_unbounded: bool,
     pub watcher_trigger: bool,
 }
 
@@ -31,7 +30,6 @@ pub fn run(opts: &MoonEmbedOptions) -> Result<CommandReport> {
         collection_name: opts.collection_name.clone(),
         max_docs: opts.max_docs,
         dry_run: opts.dry_run,
-        allow_unbounded: opts.allow_unbounded,
         caller,
         max_cycle_secs: None,
     };

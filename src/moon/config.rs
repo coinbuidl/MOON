@@ -27,7 +27,7 @@ impl Default for MoonWatcherConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: 30,
-            cooldown_secs: 300,
+            cooldown_secs: 60,
         }
     }
 }
@@ -98,9 +98,9 @@ pub struct MoonEmbedConfig {
 impl Default for MoonEmbedConfig {
     fn default() -> Self {
         Self {
-            mode: "manual".to_string(),
-            idle_secs: 600,
-            cooldown_secs: 300,
+            mode: "auto".to_string(),
+            idle_secs: 0,
+            cooldown_secs: 60,
             max_docs_per_cycle: 25,
             min_pending_docs: 1,
             max_cycle_secs: 90,
@@ -264,6 +264,17 @@ fn env_or_csv_paths(var: &str, fallback: &[String]) -> Vec<String> {
     }
 }
 
+fn normalize_embed_mode(raw: &str) -> String {
+    if raw.eq_ignore_ascii_case("auto")
+        || raw.eq_ignore_ascii_case("idle")
+        || raw.eq_ignore_ascii_case("manual")
+    {
+        "auto".to_string()
+    } else {
+        raw.trim().to_string()
+    }
+}
+
 fn validate(cfg: &MoonConfig) -> Result<()> {
     let trigger = cfg.thresholds.trigger_ratio;
     if !(trigger > 0.0 && trigger <= 1.0) {
@@ -301,11 +312,10 @@ fn validate(cfg: &MoonConfig) -> Result<()> {
             "invalid retention windows: require warm_days < cold_days"
         ));
     }
-    if cfg.embed.mode != "manual" && cfg.embed.mode != "idle" {
-        return Err(anyhow!("invalid embed mode: use `manual` or `idle`"));
-    }
-    if cfg.embed.idle_secs == 0 {
-        return Err(anyhow!("invalid embed idle secs: must be >= 1"));
+    if cfg.embed.mode != "auto" {
+        return Err(anyhow!(
+            "invalid embed mode: use `auto` (legacy aliases: `idle`, `manual`)"
+        ));
     }
     if cfg.embed.cooldown_secs == 0 {
         return Err(anyhow!("invalid embed cooldown secs: must be >= 1"));
@@ -461,6 +471,7 @@ pub fn load_config() -> Result<MoonConfig> {
     cfg.embed.min_pending_docs =
         env_or_u64("MOON_EMBED_MIN_PENDING_DOCS", cfg.embed.min_pending_docs);
     cfg.embed.max_cycle_secs = env_or_u64("MOON_EMBED_MAX_CYCLE_SECS", cfg.embed.max_cycle_secs);
+    cfg.embed.mode = normalize_embed_mode(&cfg.embed.mode);
 
     validate(&cfg)?;
     Ok(cfg)

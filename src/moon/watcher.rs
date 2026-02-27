@@ -780,7 +780,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     let mut embed_result: Option<String>;
     let mut continuity_out = None;
     let mut archive_retention_result = None;
-    let mut archive_index_succeeded_this_cycle = false;
     let compaction_cooldown_ready = is_cooldown_ready(
         unified_layer1_last_trigger_epoch(&state),
         usage.captured_at_epoch_secs,
@@ -891,9 +890,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     if let Some(archive) =
         run_archive_if_needed(&paths, &triggers, compaction_has_archivable_targets)?
     {
-        if archive.record.indexed {
-            archive_index_succeeded_this_cycle = true;
-        }
         state.last_archive_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
         archive_out = Some(archive);
     }
@@ -953,8 +949,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                 ));
                 continue;
             }
-            archive_index_succeeded_this_cycle = true;
-
             let mapped = match channel_archive_map::upsert(
                 &paths,
                 &target.session_id,
@@ -1472,118 +1466,107 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         }
     }
 
-    if cfg.embed.mode.eq_ignore_ascii_case("idle") {
-        if !archive_index_succeeded_this_cycle {
-            embed_result = Some("skipped reason=no-archive-index-success".to_string());
-        } else {
-            let started = Instant::now();
-            let run_opts = EmbedRunOptions {
-                collection_name: "history".to_string(),
-                max_docs: cfg.embed.max_docs_per_cycle as usize,
-                dry_run: false,
-                allow_unbounded: false,
-                caller: EmbedCaller::Watcher,
-                max_cycle_secs: Some(cfg.embed.max_cycle_secs),
-            };
-            match embed::run(&paths, &mut state, &cfg.embed, &run_opts) {
-                Ok(summary) => {
-                    let line = format!(
-                        "mode={} capability={} selected={} embedded={} pending_before={} pending_after={} degraded={} skip_reason={}",
-                        summary.mode,
-                        summary.capability,
-                        summary.selected_docs,
-                        summary.embedded_docs,
-                        summary.pending_before,
-                        summary.pending_after,
-                        summary.degraded,
-                        summary.skip_reason
-                    );
-                    let status = if summary.degraded { "degraded" } else { "ok" };
-                    let _ = audit::append_event(&paths, "embed", status, &line);
+    let embed_started = Instant::now();
+    let embed_run_opts = EmbedRunOptions {
+        collection_name: "history".to_string(),
+        max_docs: cfg.embed.max_docs_per_cycle as usize,
+        dry_run: false,
+        caller: EmbedCaller::Watcher,
+        max_cycle_secs: Some(cfg.embed.max_cycle_secs),
+    };
+    match embed::run(&paths, &mut state, &cfg.embed, &embed_run_opts) {
+        Ok(summary) => {
+            let line = format!(
+                "mode={} capability={} selected={} embedded={} pending_before={} pending_after={} degraded={} skip_reason={}",
+                summary.mode,
+                summary.capability,
+                summary.selected_docs,
+                summary.embedded_docs,
+                summary.pending_before,
+                summary.pending_after,
+                summary.degraded,
+                summary.skip_reason
+            );
+            let status = if summary.degraded { "degraded" } else { "ok" };
+            let _ = audit::append_event(&paths, "embed", status, &line);
 
-                    if summary.skip_reason == "locked" {
-                        warn::emit(WarnEvent {
-                            code: "EMBED_LOCKED",
-                            stage: "embed",
-                            action: "acquire-lock",
-                            session: &usage.session_id,
-                            archive: "na",
-                            source: "na",
-                            retry: "retry-next-cycle",
-                            reason: "embed-lock-active",
-                            err: "embed-lock-active",
-                        });
-                    } else if summary.skip_reason == "capability-missing" {
-                        warn::emit(WarnEvent {
-                            code: "EMBED_CAPABILITY_MISSING",
-                            stage: "embed",
-                            action: "check-capability",
-                            session: &usage.session_id,
-                            archive: "na",
-                            source: "na",
-                            retry: "retry-next-cycle",
-                            reason: "embed-capability-missing",
-                            err: "qmd-embed-capability-missing",
-                        });
-                    }
-
-                    embed_result = Some(line);
-                }
-                Err(err) => {
-                    let (code, action, reason) = match &err {
-                        EmbedRunError::CapabilityMissing(_) => (
-                            "EMBED_CAPABILITY_MISSING",
-                            "check-capability",
-                            "capability-missing",
-                        ),
-                        EmbedRunError::Locked(_) => {
-                            ("EMBED_LOCKED", "acquire-lock", "embed-lock-active")
-                        }
-                        EmbedRunError::StatusFailed(_) => {
-                            ("EMBED_STATUS_FAILED", "run-embed", "embed-status-failed")
-                        }
-                        EmbedRunError::Failed(_) => ("EMBED_FAILED", "run-embed", "embed-failed"),
-                    };
-                    warn::emit(WarnEvent {
-                        code,
-                        stage: "embed",
-                        action,
-                        session: &usage.session_id,
-                        archive: "na",
-                        source: "na",
-                        retry: "retry-next-cycle",
-                        reason,
-                        err: &format!("{err}"),
-                    });
-                    let line = format!("failed error={err}");
-                    let _ = audit::append_event(&paths, "embed", "degraded", &line);
-                    embed_result = Some(line);
-                }
-            }
-
-            if started.elapsed().as_secs() > cfg.embed.max_cycle_secs {
+            if summary.skip_reason == "locked" {
                 warn::emit(WarnEvent {
-                    code: "EMBED_FAILED",
+                    code: "EMBED_LOCKED",
                     stage: "embed",
-                    action: "run-embed",
+                    action: "acquire-lock",
                     session: &usage.session_id,
                     archive: "na",
                     source: "na",
                     retry: "retry-next-cycle",
-                    reason: "timeout",
-                    err: "embed-run-exceeded-max-cycle-secs",
+                    reason: "embed-lock-active",
+                    err: "embed-lock-active",
                 });
-                let timeout_note = format!("timeout max_cycle_secs={}", cfg.embed.max_cycle_secs);
-                let _ = audit::append_event(&paths, "embed", "degraded", &timeout_note);
-                if let Some(current) = embed_result.take() {
-                    embed_result = Some(format!("{current} {timeout_note}"));
-                } else {
-                    embed_result = Some(timeout_note);
-                }
+            } else if summary.skip_reason == "capability-missing" {
+                warn::emit(WarnEvent {
+                    code: "EMBED_CAPABILITY_MISSING",
+                    stage: "embed",
+                    action: "check-capability",
+                    session: &usage.session_id,
+                    archive: "na",
+                    source: "na",
+                    retry: "retry-next-cycle",
+                    reason: "embed-capability-missing",
+                    err: "qmd-embed-capability-missing",
+                });
             }
+
+            embed_result = Some(line);
         }
-    } else {
-        embed_result = Some("skipped reason=manual-mode".to_string());
+        Err(err) => {
+            let (code, action, reason) = match &err {
+                EmbedRunError::CapabilityMissing(_) => (
+                    "EMBED_CAPABILITY_MISSING",
+                    "check-capability",
+                    "capability-missing",
+                ),
+                EmbedRunError::Locked(_) => ("EMBED_LOCKED", "acquire-lock", "embed-lock-active"),
+                EmbedRunError::StatusFailed(_) => {
+                    ("EMBED_STATUS_FAILED", "run-embed", "embed-status-failed")
+                }
+                EmbedRunError::Failed(_) => ("EMBED_FAILED", "run-embed", "embed-failed"),
+            };
+            warn::emit(WarnEvent {
+                code,
+                stage: "embed",
+                action,
+                session: &usage.session_id,
+                archive: "na",
+                source: "na",
+                retry: "retry-next-cycle",
+                reason,
+                err: &format!("{err}"),
+            });
+            let line = format!("failed error={err}");
+            let _ = audit::append_event(&paths, "embed", "degraded", &line);
+            embed_result = Some(line);
+        }
+    }
+
+    if embed_started.elapsed().as_secs() > cfg.embed.max_cycle_secs {
+        warn::emit(WarnEvent {
+            code: "EMBED_FAILED",
+            stage: "embed",
+            action: "run-embed",
+            session: &usage.session_id,
+            archive: "na",
+            source: "na",
+            retry: "retry-next-cycle",
+            reason: "timeout",
+            err: "embed-run-exceeded-max-cycle-secs",
+        });
+        let timeout_note = format!("timeout max_cycle_secs={}", cfg.embed.max_cycle_secs);
+        let _ = audit::append_event(&paths, "embed", "degraded", &timeout_note);
+        if let Some(current) = embed_result.take() {
+            embed_result = Some(format!("{current} {timeout_note}"));
+        } else {
+            embed_result = Some(timeout_note);
+        }
     }
 
     if let Some(summary) = cleanup_expired_distilled_archives(
