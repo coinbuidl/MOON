@@ -31,7 +31,7 @@ pub fn run(opts: &MoonEmbedOptions) -> Result<CommandReport> {
         max_docs: opts.max_docs,
         dry_run: opts.dry_run,
         caller,
-        max_cycle_secs: None,
+        max_cycle_secs: Some(300), // Default 300s for manual/command-line runs
     };
 
     let run_result = embed::run(&paths, &mut state, &cfg.embed, &run_opts);

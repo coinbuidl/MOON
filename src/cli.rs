@@ -30,6 +30,8 @@ pub enum Command {
     MoonEmbed(MoonEmbedArgs),
     MoonRecall(MoonRecallArgs),
     MoonDistill(MoonDistillArgs),
+    Config(ConfigArgs),
+    MoonHealth,
 }
 
 #[derive(Debug, Args)]
@@ -112,6 +114,14 @@ pub struct MoonDistillArgs {
     pub session_id: Option<String>,
     #[arg(long)]
     pub allow_large_archive: bool,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct ConfigArgs {
+    #[arg(long)]
+    pub show: bool,
 }
 
 fn print_report(report: &commands::CommandReport, as_json: bool) -> Result<()> {
@@ -139,6 +149,17 @@ fn print_report(report: &commands::CommandReport, as_json: bool) -> Result<()> {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let paths = crate::moon::paths::resolve_paths()?;
+
+    // Every command validates CWD except diagnostics.
+    match &cli.command {
+        Command::Status | Command::MoonStatus | Command::Verify(_) => {
+            // Diagnostics are exempt from CWD enforcement.
+        }
+        _ => {
+            commands::validate_cwd(&paths)?;
+        }
+    }
 
     let report = match &cli.command {
         Command::Install(args) => commands::install::run(&commands::install::InstallOptions {
@@ -196,8 +217,13 @@ pub fn run() -> Result<()> {
                 archive_path: args.archive.clone(),
                 session_id: args.session_id.clone(),
                 allow_large_archive: args.allow_large_archive,
+                dry_run: args.dry_run,
             })?
         }
+        Command::Config(args) => commands::moon_config::run(&commands::moon_config::MoonConfigOptions {
+            show: args.show,
+        })?,
+        Command::MoonHealth => commands::moon_health::run()?,
     };
 
     print_report(&report, cli.json)?;

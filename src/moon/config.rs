@@ -474,7 +474,63 @@ pub fn load_config() -> Result<MoonConfig> {
     cfg.embed.mode = normalize_embed_mode(&cfg.embed.mode);
 
     validate(&cfg)?;
+    audit_env_vars();
     Ok(cfg)
+}
+
+pub fn mask_secret(secret: &str) -> String {
+    if secret.is_empty() {
+        return String::new();
+    }
+    if secret.len() <= 8 {
+        return "****".to_string();
+    }
+    format!("{}***{}", &secret[..4], &secret[secret.len() - 4..])
+}
+
+fn audit_env_vars() {
+    let allowlist = [
+        "MOON_HOME",
+        "MOON_CONFIG_PATH",
+        "MOON_STATE_FILE",
+        "MOON_STATE_DIR",
+        "MOON_ARCHIVES_DIR",
+        "MOON_MEMORY_DIR",
+        "MOON_MEMORY_FILE",
+        "MOON_LOGS_DIR",
+        "MOON_TRIGGER_RATIO",
+        "MOON_THRESHOLD_COMPACTION_RATIO",
+        "MOON_THRESHOLD_PRUNE_RATIO",
+        "MOON_THRESHOLD_ARCHIVE_RATIO",
+        "MOON_POLL_INTERVAL_SECS",
+        "MOON_COOLDOWN_SECS",
+        "MOON_INBOUND_WATCH_ENABLED",
+        "MOON_INBOUND_RECURSIVE",
+        "MOON_INBOUND_EVENT_MODE",
+        "MOON_INBOUND_WATCH_PATHS",
+        "MOON_DISTILL_MODE",
+        "MOON_DISTILL_IDLE_SECS",
+        "MOON_DISTILL_MAX_PER_CYCLE",
+        "MOON_RESIDENTIAL_TIMEZONE",
+        "MOON_TOPIC_DISCOVERY",
+        "MOON_RETENTION_ACTIVE_DAYS",
+        "MOON_RETENTION_WARM_DAYS",
+        "MOON_RETENTION_COLD_DAYS",
+        "MOON_EMBED_MODE",
+        "MOON_EMBED_IDLE_SECS",
+        "MOON_EMBED_COOLDOWN_SECS",
+        "MOON_EMBED_MAX_DOCS_PER_CYCLE",
+        "MOON_EMBED_MIN_PENDING_DOCS",
+        "MOON_EMBED_MAX_CYCLE_SECS",
+        "MOON_HIGH_TOKEN_ALERT_THRESHOLD",
+        "MOON_DISTILL_CHUNK_TRIGGER_BYTES",
+    ];
+
+    for (key, _) in env::vars() {
+        if key.starts_with("MOON_") && !allowlist.contains(&key.as_str()) {
+            eprintln!("WARN: unrecognized environment variable: {key}");
+        }
+    }
 }
 
 fn has_explicit_context_policy_env() -> bool {

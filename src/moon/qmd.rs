@@ -57,10 +57,10 @@ fn is_existing_collection_error(stdout: &str, stderr: &str) -> bool {
 }
 
 fn collection_pattern(qmd_bin: &Path, collection_name: &str) -> Result<Option<String>> {
-    let output = Command::new(qmd_bin)
-        .arg("collection")
-        .arg("list")
-        .output()
+    let mut cmd = Command::new(qmd_bin);
+    cmd.arg("collection")
+        .arg("list");
+    let output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30))
         .with_context(|| format!("failed to run `{}`", qmd_bin.display()))?;
     if !output.status.success() {
         anyhow::bail!(
@@ -101,15 +101,15 @@ pub fn collection_add_or_update(
     collection_name: &str,
 ) -> Result<CollectionSyncResult> {
     let bin = resolve_qmd_bin(qmd_bin)?;
-    let add_output = Command::new(&bin)
-        .arg("collection")
+    let mut cmd = Command::new(&bin);
+    cmd.arg("collection")
         .arg("add")
         .arg(archives_dir)
         .arg("--name")
         .arg(collection_name)
         .arg("--mask")
-        .arg(ARCHIVE_COLLECTION_MASK)
-        .output()
+        .arg(ARCHIVE_COLLECTION_MASK);
+    let add_output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30))
         .with_context(|| format!("failed to run `{}`", bin.display()))?;
 
     if add_output.status.success() {
@@ -124,11 +124,11 @@ pub fn collection_add_or_update(
             .as_deref()
             .is_some_and(|pattern| pattern != ARCHIVE_COLLECTION_MASK)
         {
-            let remove_output = Command::new(&bin)
-                .arg("collection")
+            let mut cmd = Command::new(&bin);
+            cmd.arg("collection")
                 .arg("remove")
-                .arg(collection_name)
-                .output()
+                .arg(collection_name);
+            let remove_output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30))
                 .with_context(|| format!("failed to run `{}`", bin.display()))?;
             if !remove_output.status.success() {
                 anyhow::bail!(
@@ -139,15 +139,15 @@ pub fn collection_add_or_update(
                 );
             }
 
-            let recreate_output = Command::new(&bin)
-                .arg("collection")
+            let mut cmd = Command::new(&bin);
+            cmd.arg("collection")
                 .arg("add")
                 .arg(archives_dir)
                 .arg("--name")
                 .arg(collection_name)
                 .arg("--mask")
-                .arg(ARCHIVE_COLLECTION_MASK)
-                .output()
+                .arg(ARCHIVE_COLLECTION_MASK);
+            let recreate_output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30))
                 .with_context(|| format!("failed to run `{}`", bin.display()))?;
             if recreate_output.status.success() {
                 return Ok(CollectionSyncResult::Recreated);
@@ -161,9 +161,9 @@ pub fn collection_add_or_update(
             );
         }
 
-        let update_output = Command::new(&bin)
-            .arg("update")
-            .output()
+        let mut cmd = Command::new(&bin);
+        cmd.arg("update");
+        let update_output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30))
             .with_context(|| format!("failed to run `{}`", bin.display()))?;
 
         if update_output.status.success() {
@@ -186,12 +186,12 @@ pub fn collection_add_or_update(
 
 pub fn search(qmd_bin: &Path, collection_name: &str, query: &str) -> Result<String> {
     let bin = resolve_qmd_bin(qmd_bin)?;
-    let output = Command::new(&bin)
-        .arg("search")
+    let mut cmd = Command::new(&bin);
+    cmd.arg("search")
         .arg(collection_name)
         .arg(query)
-        .arg("--json")
-        .output()
+        .arg("--json");
+    let output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30))
         .with_context(|| format!("failed to run `{}`", bin.display()))?;
 
     if output.status.success() {
@@ -207,9 +207,9 @@ pub fn search(qmd_bin: &Path, collection_name: &str, query: &str) -> Result<Stri
 
 pub fn update(qmd_bin: &Path) -> Result<()> {
     let bin = resolve_qmd_bin(qmd_bin)?;
-    let output = Command::new(&bin)
-        .arg("update")
-        .output()
+    let mut cmd = Command::new(&bin);
+    cmd.arg("update");
+    let output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30))
         .with_context(|| format!("failed to run `{}`", bin.display()))?;
 
     if output.status.success() {
@@ -234,7 +234,9 @@ pub fn probe_embed_capability(qmd_bin: &Path) -> EmbedCapabilityProbe {
         }
     };
 
-    let output = match Command::new(&bin).arg("embed").arg("--help").output() {
+    let mut cmd = Command::new(&bin);
+    cmd.arg("embed").arg("--help");
+    let output = match crate::moon::util::run_command_with_optional_timeout(&mut cmd, Some(30)) {
         Ok(output) => output,
         Err(err) => {
             return EmbedCapabilityProbe {
@@ -285,7 +287,7 @@ pub fn embed_bounded(
         .arg(collection_name)
         .arg("--max-docs")
         .arg(max_docs.to_string());
-    let output = run_command_with_optional_timeout(&mut cmd, timeout_secs)
+    let output = crate::moon::util::run_command_with_optional_timeout(&mut cmd, timeout_secs)
         .with_context(|| format!("failed to run `{}`", bin.display()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -330,26 +332,4 @@ pub fn output_indicates_embed_status_failed(stdout: &str, stderr: &str) -> bool 
         .is_some_and(|ok| !ok)
 }
 
-fn run_command_with_optional_timeout(
-    cmd: &mut Command,
-    timeout_secs: Option<u64>,
-) -> Result<Output> {
-    let Some(timeout_secs) = timeout_secs else {
-        return Ok(cmd.output()?);
-    };
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn()?;
-    let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
-        }
-        if started.elapsed() >= Duration::from_secs(timeout_secs) {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("command timed out after {}s", timeout_secs);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
+

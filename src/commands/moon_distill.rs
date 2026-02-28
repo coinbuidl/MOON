@@ -14,6 +14,7 @@ pub struct MoonDistillOptions {
     pub archive_path: String,
     pub session_id: Option<String>,
     pub allow_large_archive: bool,
+    pub dry_run: bool,
 }
 
 fn infer_archive_epoch_secs(path: &Path) -> Option<u64> {
@@ -51,6 +52,13 @@ pub fn run(opts: &MoonDistillOptions) -> Result<CommandReport> {
         .clone()
         .unwrap_or_else(|| "manual-distill".to_string());
     let archive_epoch_secs = infer_archive_epoch_secs(archive_file);
+
+    if opts.dry_run {
+        report.detail("distill.dry_run=true".to_string());
+        report.detail(format!("archive_size_bytes={archive_size}"));
+        report.detail(format!("chunk_threshold_bytes={chunk_threshold_bytes}"));
+        return Ok(report);
+    }
 
     let out = if archive_size > chunk_threshold_bytes && !opts.allow_large_archive {
         let chunked = run_chunked_archive_distillation(

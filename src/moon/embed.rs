@@ -185,10 +185,7 @@ fn pending_docs<'a>(state: &MoonState, docs: &'a [ProjectionDoc]) -> Vec<&'a Pro
 }
 
 fn pid_alive(pid: u32) -> bool {
-    let Ok(status) = Command::new("kill").arg("-0").arg(pid.to_string()).status() else {
-        return false;
-    };
-    status.success()
+    crate::moon::util::pid_alive(pid)
 }
 
 fn read_lock_payload(lock_path: &Path) -> Option<EmbedLockPayload> {

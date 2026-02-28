@@ -12,6 +12,7 @@ pub struct MoonPaths {
     pub openclaw_sessions_dir: PathBuf,
     pub qmd_bin: PathBuf,
     pub qmd_db: PathBuf,
+    pub moon_home_is_explicit: bool,
 }
 
 fn required_home_dir() -> Result<PathBuf> {
@@ -30,7 +31,10 @@ fn env_or_default_path(var: &str, fallback: PathBuf) -> PathBuf {
 
 pub fn resolve_paths() -> Result<MoonPaths> {
     let home = required_home_dir()?;
-    let moon_home = env_or_default_path("MOON_HOME", home.join("moon"));
+    let (moon_home, is_explicit) = match env::var("MOON_HOME") {
+        Ok(v) if !v.trim().is_empty() => (PathBuf::from(v.trim()), true),
+        _ => (home.join("moon"), false),
+    };
 
     let archives_dir = env_or_default_path("MOON_ARCHIVES_DIR", moon_home.join("archives"));
     let memory_dir = env_or_default_path("MOON_MEMORY_DIR", moon_home.join("memory"));
@@ -52,5 +56,6 @@ pub fn resolve_paths() -> Result<MoonPaths> {
         openclaw_sessions_dir,
         qmd_bin,
         qmd_db,
+        moon_home_is_explicit: is_explicit,
     })
 }

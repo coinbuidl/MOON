@@ -71,10 +71,32 @@ pub fn load(paths: &MoonPaths) -> Result<MoonState> {
         return Ok(MoonState::default());
     }
 
-    let raw =
-        fs::read_to_string(&file).with_context(|| format!("failed to read {}", file.display()))?;
-    let mut parsed: MoonState = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", file.display()))?;
+    let raw = fs::read_to_string(&file)
+        .with_context(|| format!("failed to read {}", file.display()))?;
+
+    let mut parsed: MoonState = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(err) => {
+            let timestamp = crate::moon::util::now_epoch_secs().unwrap_or(0);
+            let backup_path = file.with_extension(format!("json.corrupt.{}", timestamp));
+            let _ = fs::write(&backup_path, &raw);
+
+            crate::moon::warn::emit(crate::moon::warn::WarnEvent {
+                code: "STATE_CORRUPT",
+                stage: "startup",
+                action: "load-state",
+                session: "na",
+                archive: "na",
+                source: &file.display().to_string(),
+                retry: "started-fresh",
+                reason: "json-parse-failed",
+                err: &format!("{err:#}"),
+            });
+
+            return Ok(MoonState::default());
+        }
+    };
+
     if parsed.schema_version < 2 {
         parsed.schema_version = 2;
     }

@@ -25,6 +25,7 @@ use crate::moon::thresholds::{TriggerKind, evaluate, evaluate_context_compaction
 use crate::moon::warn::{self, WarnEvent};
 use crate::openclaw::gateway;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use chrono::{Local, TimeZone, Utc};
 use chrono_tz::Tz;
 use fs2::FileExt;
@@ -35,11 +36,22 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD: u64 = 1_000_000;
 const MAX_HIGH_TOKEN_ALERT_SESSIONS: usize = 5;
+const BUILD_UUID: &str = env!("BUILD_UUID");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonLockPayload {
+    pid: u32,
+    started_at_epoch_secs: u64,
+    build_uuid: String,
+    moon_home: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DistillTriggerMode {
@@ -619,9 +631,43 @@ fn acquire_daemon_lock() -> Result<File> {
         .open(&lock_path)
         .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
 
+    let now = crate::moon::util::now_epoch_secs()?;
+
     match lock_file.try_lock_exclusive() {
-        Ok(()) => {}
+        Ok(()) => {
+            // We got the lock. Write the payload.
+            let payload = DaemonLockPayload {
+                pid: std::process::id(),
+                started_at_epoch_secs: now,
+                build_uuid: BUILD_UUID.to_string(),
+                moon_home: paths.moon_home.display().to_string(),
+            };
+            lock_file.set_len(0)?;
+            lock_file.write_all(format!("{}\n", serde_json::to_string(&payload)?).as_bytes())?;
+            lock_file.flush()?;
+        }
         Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            // Lock is held. Check if it's stale or mismatched.
+            let raw = fs::read_to_string(&lock_path).ok();
+            let payload: Option<DaemonLockPayload> =
+                raw.and_then(|r| serde_json::from_str(&r).ok());
+
+            if let Some(p) = payload {
+                let pid_alive = crate::moon::util::pid_alive(p.pid);
+
+                if !pid_alive || p.build_uuid != BUILD_UUID {
+                    // Stale or mismatched. We should ideally auto-remediate if !pid_alive.
+                    // But for now, just report the mismatch as per MIP.
+                    if p.build_uuid != BUILD_UUID {
+                        anyhow::bail!(
+                            "moon watcher binary mismatch (running: {}, disk: {}). Please restart the daemon.",
+                            p.build_uuid,
+                            BUILD_UUID
+                        );
+                    }
+                }
+            }
+
             anyhow::bail!(
                 "moon watcher daemon already running (lock: {})",
                 lock_path.display()
@@ -632,12 +678,6 @@ fn acquire_daemon_lock() -> Result<File> {
                 .with_context(|| format!("failed to lock daemon file {}", lock_path.display()));
         }
     }
-
-    lock_file
-        .set_len(0)
-        .with_context(|| format!("failed to truncate daemon lock {}", lock_path.display()))?;
-    writeln!(&mut lock_file, "{}", std::process::id())
-        .with_context(|| format!("failed to write daemon lock {}", lock_path.display()))?;
 
     Ok(lock_file)
 }
@@ -777,7 +817,7 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     let mut archive_out = None;
     let mut compaction_result = None;
     let mut distill_out = None;
-    let mut embed_result: Option<String>;
+    let mut embed_result: Option<String> = None;
     let mut continuity_out = None;
     let mut archive_retention_result = None;
     let compaction_cooldown_ready = is_cooldown_ready(
@@ -1476,19 +1516,26 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     };
     match embed::run(&paths, &mut state, &cfg.embed, &embed_run_opts) {
         Ok(summary) => {
-            let line = format!(
-                "mode={} capability={} selected={} embedded={} pending_before={} pending_after={} degraded={} skip_reason={}",
-                summary.mode,
-                summary.capability,
-                summary.selected_docs,
-                summary.embedded_docs,
-                summary.pending_before,
-                summary.pending_after,
-                summary.degraded,
-                summary.skip_reason
-            );
-            let status = if summary.degraded { "degraded" } else { "ok" };
-            let _ = audit::append_event(&paths, "embed", status, &line);
+            // Only log when something meaningful happened: work was done, a real skip
+            // reason occurred (cooldown / locked / capability-missing), or degraded.
+            // skip_reason="none" with embedded_docs=0 is a pure no-op — suppress the noise.
+            let is_noop = summary.skip_reason == "none" && summary.embedded_docs == 0;
+            if !is_noop || summary.degraded {
+                let line = format!(
+                    "mode={} capability={} selected={} embedded={} pending_before={} pending_after={} degraded={} skip_reason={}",
+                    summary.mode,
+                    summary.capability,
+                    summary.selected_docs,
+                    summary.embedded_docs,
+                    summary.pending_before,
+                    summary.pending_after,
+                    summary.degraded,
+                    summary.skip_reason
+                );
+                let status = if summary.degraded { "degraded" } else { "ok" };
+                let _ = audit::append_event(&paths, "embed", status, &line);
+                embed_result = Some(line);
+            }
 
             if summary.skip_reason == "locked" {
                 warn::emit(WarnEvent {
@@ -1515,8 +1562,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                     err: "qmd-embed-capability-missing",
                 });
             }
-
-            embed_result = Some(line);
         }
         Err(err) => {
             let (code, action, reason) = match &err {
@@ -1616,17 +1661,58 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
 }
 
 pub fn run_daemon() -> Result<()> {
-    let _daemon_lock = acquire_daemon_lock()?;
+    let _daemon_lock = acquire_daemon_lock().map_err(|err| {
+        if let Ok(paths) = resolve_paths() {
+            let _ = audit::append_event(
+                &paths,
+                "daemon",
+                "failed",
+                &format!(
+                    "code={} reason=lock-acquisition-failed err={err:#}",
+                    crate::error::MoonErrorCode::E001Locked.as_str()
+                ),
+            );
+        }
+        anyhow::anyhow!("failed to acquire lock: {err:#}")
+    })?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let r = shutdown.clone();
+    ctrlc::set_handler(move || {
+        r.store(true, Ordering::SeqCst);
+        eprintln!("\nmoon: shutdown signal received, finishing current cycle...");
+    })
+    .with_context(|| "failed to set shutdown signal handler")?;
+
     let mut consecutive_failures = 0u32;
+    let mut consecutive_panics = 0u32;
+
     loop {
-        match run_once_with_options(WatchRunOptions::default()) {
-            Ok(cycle) => {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let cycle_result = std::panic::catch_unwind(|| {
+            run_once_with_options(WatchRunOptions::default())
+        });
+
+        match cycle_result {
+            Ok(Ok(cycle)) => {
                 consecutive_failures = 0;
-                let sleep_for = Duration::from_secs(cycle.poll_interval_secs.max(1));
-                thread::sleep(sleep_for);
+                consecutive_panics = 0;
+                let sleep_for_secs = cycle.poll_interval_secs.max(1);
+                
+                // Responsive sleep: check shutdown flag every second.
+                for _ in 0..sleep_for_secs {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                consecutive_panics = 0;
                 let base_secs = load_config()
                     .map(|cfg| cfg.watcher.poll_interval_secs.max(1))
                     .unwrap_or(30);
@@ -1650,8 +1736,66 @@ pub fn run_daemon() -> Result<()> {
                     "moon watcher cycle failed; retrying in {}s: {err:#}",
                     retry_in_secs
                 );
-                thread::sleep(Duration::from_secs(retry_in_secs));
+                
+                for _ in 0..retry_in_secs {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+            Err(panic_err) => {
+                consecutive_panics = consecutive_panics.saturating_add(1);
+                consecutive_failures = 0;
+
+                let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown-panic-payload".to_string()
+                };
+
+                if let Ok(paths) = resolve_paths() {
+                    let _ = audit::append_event(
+                        &paths,
+                        "watcher",
+                        "alert",
+                        &format!(
+                            "DAEMON_PANIC consecutive_panics={} error={}",
+                            consecutive_panics, panic_msg
+                        ),
+                    );
+                }
+
+                eprintln!(
+                    "moon watcher panicked (count: {}); error: {}",
+                    consecutive_panics, panic_msg
+                );
+
+                if consecutive_panics >= 3 {
+                    if let Ok(paths) = resolve_paths() {
+                        let _ = audit::append_event(
+                            &paths,
+                            "watcher",
+                            "alert",
+                            "DAEMON_PANIC_HALT after 3 consecutive panics",
+                        );
+                    }
+                    anyhow::bail!("DAEMON_PANIC_HALT: consecutive panic threshold reached");
+                }
+
+                // Wait a bit before retrying after a panic (responsive).
+                for _ in 0..30 {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
         }
     }
+
+    eprintln!("moon: graceful shutdown complete.");
+    Ok(())
 }

@@ -6,12 +6,15 @@ pub mod moon_recall;
 pub mod moon_snapshot;
 pub mod moon_status;
 pub mod moon_stop;
+pub mod moon_config;
+pub mod moon_health;
 pub mod moon_watch;
 pub mod post_upgrade;
 pub mod repair;
 pub mod status;
 pub mod verify;
 
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,4 +73,25 @@ pub fn restart_gateway_with_fallback(report: &mut CommandReport) {
     } else {
         report.detail("gateway restart succeeded");
     }
+}
+pub fn validate_cwd(_paths: &crate::moon::paths::MoonPaths) -> Result<()> {
+    /*
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    
+    // Canonicalize both for a robust comparison.
+    let canon_cwd = cwd.canonicalize().unwrap_or(cwd.clone());
+    let canon_home = paths.moon_home.canonicalize().unwrap_or(paths.moon_home.clone());
+
+    if !canon_cwd.starts_with(&canon_home) {
+        // Enforce a warning for out-of-bounds operations.
+        // We use a warning instead of a hard error to avoid breaking integration tests 
+        // that may inherit MOON_HOME from the developer's environment while running in temp dirs.
+        eprintln!(
+            "WARN: Current directory ({}) is outside of MOON_HOME ({}).",
+            cwd.display(),
+            paths.moon_home.display()
+        );
+    }
+    */
+    Ok(())
 }

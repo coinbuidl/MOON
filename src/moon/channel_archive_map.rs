@@ -153,6 +153,7 @@ mod tests {
             openclaw_sessions_dir: root.join("sessions"),
             qmd_bin: root.join("qmd"),
             qmd_db: root.join("qmd.sqlite"),
+            moon_home_is_explicit: false,
         }
     }
 
