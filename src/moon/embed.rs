@@ -219,6 +219,39 @@ fn lock_is_stale(payload: &EmbedLockPayload, now_epoch: u64) -> bool {
     now_epoch.saturating_sub(payload.started_at_epoch_secs) > EMBED_LOCK_STALE_TTL_SECS
 }
 
+fn clear_stale_lock_payload_if_unheld(paths: &MoonPaths, now_epoch: u64) {
+    let lock_path = paths.logs_dir.join("moon-embed.lock");
+    if !lock_path.exists() {
+        return;
+    }
+
+    let Some(payload) = read_lock_payload(&lock_path) else {
+        return;
+    };
+    if !lock_is_stale(&payload, now_epoch) {
+        return;
+    }
+
+    let Ok(mut lock_file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        return;
+    };
+
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {
+            // Re-read after lock acquisition to avoid clearing fresh metadata from a race.
+            if read_lock_payload(&lock_path)
+                .map(|p| lock_is_stale(&p, now_epoch))
+                .unwrap_or(true)
+            {
+                let _ = lock_file.set_len(0);
+                let _ = lock_file.flush();
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+        Err(_) => {}
+    }
+}
+
 fn acquire_lock(
     paths: &MoonPaths,
     mode: EmbedCaller,
@@ -242,12 +275,7 @@ fn acquire_lock(
             write_lock_payload(&mut lock_file, mode, collection_name, now_epoch)?;
             Ok(Some(EmbedLockGuard { _file: lock_file }))
         }
-        Err(err) if err.kind() == ErrorKind::WouldBlock => {
-            let _ = read_lock_payload(&lock_path)
-                .map(|payload| lock_is_stale(&payload, now_epoch))
-                .unwrap_or(false);
-            Ok(None)
-        }
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
         Err(err) => Err(err).with_context(|| format!("failed to lock {}", lock_path.display())),
     }
 }
@@ -295,6 +323,7 @@ pub fn run(
 ) -> std::result::Result<EmbedRunSummary, EmbedRunError> {
     let started = Instant::now();
     let now_epoch = now_epoch_secs().map_err(|err| EmbedRunError::Failed(format!("{err:#}")))?;
+    clear_stale_lock_payload_if_unheld(paths, now_epoch);
 
     let docs = projection_docs(paths).map_err(|err| EmbedRunError::Failed(format!("{err:#}")))?;
     let pending = pending_docs(state, &docs);

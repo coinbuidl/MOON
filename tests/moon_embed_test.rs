@@ -270,3 +270,37 @@ fn moon_embed_manual_ignores_watcher_cooldown_and_keeps_watcher_clock() {
         .success()
         .stdout(contains("embed.skip_reason=cooldown"));
 }
+
+#[test]
+fn moon_embed_watcher_clears_stale_unheld_lock_payload() {
+    let tmp = tempdir().expect("tempdir");
+    let moon_home = tmp.path().join("moon");
+    fs::create_dir_all(moon_home.join("archives/mlib")).expect("mkdir mlib");
+    fs::create_dir_all(moon_home.join("memory")).expect("mkdir memory");
+    let logs_dir = moon_home.join("moon/logs");
+    fs::create_dir_all(&logs_dir).expect("mkdir logs");
+
+    let lock_path = logs_dir.join("moon-embed.lock");
+    fs::write(
+        &lock_path,
+        r#"{"pid":999999,"started_at_epoch_secs":1,"mode":"watcher","collection":"history"}"#,
+    )
+    .expect("write stale embed lock payload");
+
+    assert_cmd::cargo::cargo_bin_cmd!("moon")
+        .current_dir(tmp.path())
+        .env("MOON_HOME", &moon_home)
+        .arg("--json")
+        .arg("moon-embed")
+        .arg("--watcher-trigger")
+        .assert()
+        .success()
+        .stdout(contains("embed.pending_before=0"))
+        .stdout(contains("embed.selected_docs=0"));
+
+    let after = fs::read_to_string(&lock_path).expect("read lock payload");
+    assert!(
+        after.trim().is_empty(),
+        "expected stale lock payload to be cleared"
+    );
+}
