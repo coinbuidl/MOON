@@ -5,7 +5,7 @@ For least-privilege sub-agents, use `SKILL_SUBAGENT.md` instead.
 
 This skill covers:
 1. Plugin lifecycle (`install`, `verify`, `repair`, `post-upgrade`).
-2. moon workflows (`moon-watch`, `moon-stop`, `moon-snapshot`, `moon-index`, `moon-embed`, `moon-recall`, `moon-distill`).
+2. moon workflows (`moon-watch`, `moon-stop`, `moon-snapshot`, `moon-index`, `moon-embed`, `moon-recall`, `distill`).
 
 ## Operating Rule
 

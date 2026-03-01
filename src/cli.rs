@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::commands;
@@ -32,7 +33,8 @@ pub enum Command {
     MoonWatch(MoonWatchArgs),
     MoonEmbed(MoonEmbedArgs),
     MoonRecall(MoonRecallArgs),
-    MoonDistill(MoonDistillArgs),
+    #[command(name = "distill", visible_alias = "moon-distill")]
+    Distill(DistillArgs),
     Config(ConfigArgs),
     MoonHealth,
 }
@@ -112,14 +114,16 @@ pub struct MoonEmbedArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct MoonDistillArgs {
-    #[arg(long)]
-    pub archive: String,
-    #[arg(long)]
+pub struct DistillArgs {
+    #[arg(long = "mode", default_value = "norm")]
+    pub mode: String,
+    #[arg(long = "archive")]
+    pub archive: Option<String>,
+    #[arg(long = "file")]
+    pub files: Vec<String>,
+    #[arg(long = "session-id")]
     pub session_id: Option<String>,
-    #[arg(long)]
-    pub allow_large_archive: bool,
-    #[arg(long)]
+    #[arg(long = "dry-run")]
     pub dry_run: bool,
 }
 
@@ -152,8 +156,37 @@ fn print_report(report: &commands::CommandReport, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+fn normalize_single_dash_long_flags() -> Vec<OsString> {
+    std::env::args_os()
+        .map(|arg| {
+            let Some(raw) = arg.to_str() else {
+                return arg;
+            };
+
+            let rewritten = match raw {
+                "-mode" => Some("--mode".to_string()),
+                "-archive" => Some("--archive".to_string()),
+                "-file" => Some("--file".to_string()),
+                "-session-id" => Some("--session-id".to_string()),
+                "-dry-run" => Some("--dry-run".to_string()),
+                _ if raw.starts_with("-mode=")
+                    || raw.starts_with("-archive=")
+                    || raw.starts_with("-file=")
+                    || raw.starts_with("-session-id=")
+                    || raw.starts_with("-dry-run=") =>
+                {
+                    Some(format!("--{}", &raw[1..]))
+                }
+                _ => None,
+            };
+
+            rewritten.map(OsString::from).unwrap_or(arg)
+        })
+        .collect()
+}
+
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_single_dash_long_flags());
     let paths = crate::moon::paths::resolve_paths()?;
 
     // Every command validates CWD except diagnostics.
@@ -222,11 +255,12 @@ pub fn run() -> Result<()> {
                 channel_key: args.channel_key.clone(),
             })?
         }
-        Command::MoonDistill(args) => {
+        Command::Distill(args) => {
             commands::moon_distill::run(&commands::moon_distill::MoonDistillOptions {
+                mode: args.mode.clone(),
                 archive_path: args.archive.clone(),
+                files: args.files.clone(),
                 session_id: args.session_id.clone(),
-                allow_large_archive: args.allow_large_archive,
                 dry_run: args.dry_run,
             })?
         }

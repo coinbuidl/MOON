@@ -544,7 +544,6 @@ fn env_allowlist() -> &'static [&'static str] {
         "MOON_EMBED_MAX_DOCS_PER_CYCLE",
         "MOON_EMBED_MIN_PENDING_DOCS",
         "MOON_EMBED_MAX_CYCLE_SECS",
-        "MOON_HIGH_TOKEN_ALERT_THRESHOLD",
         "MOON_DISTILL_CHUNK_TRIGGER_BYTES",
     ]
 }

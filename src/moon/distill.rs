@@ -3,13 +3,16 @@ use crate::moon::paths::MoonPaths;
 use crate::moon::util::{now_epoch_secs, truncate_with_ellipsis};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Local, TimeZone};
+use fs2::FileExt;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,26 @@ pub struct ChunkedDistillOutput {
     pub chunk_count: usize,
     pub chunk_target_bytes: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WisdomDistillInput {
+    pub trigger: String,
+    pub day_epoch_secs: Option<u64>,
+    pub source_paths: Vec<String>,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DistillAuditEvent {
+    at_epoch_secs: u64,
+    mode: String,
+    trigger: String,
+    source_path: String,
+    target_path: String,
+    input_hash: String,
+    output_hash: String,
+    provider: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +172,16 @@ const MAX_ROLLUP_TOTAL_LINES: usize = 120;
 const MAX_ARCHIVE_SCAN_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARCHIVE_SCAN_LINES: usize = 200_000;
 const MAX_ARCHIVE_CANDIDATES: usize = 2_000;
+const MAX_WISDOM_LINES: usize = 240;
+const MAX_WISDOM_ITEMS_PER_SECTION: usize = 8;
+const WISDOM_CONTEXT_SAFETY_RATIO: f64 = 0.90;
+const WISDOM_PROMPT_OVERHEAD_BYTES: usize = 8 * 1024;
+const WISDOM_MIN_DAILY_CHUNK_BYTES: usize = 16 * 1024;
+const DAILY_MEMORY_FORMAT_MARKER: &str = "<!-- moon_memory_format: conversation_v1 -->";
+const SESSION_BLOCK_BEGIN_PREFIX: &str = "<!-- MOON_SESSION_BEGIN:";
+const SESSION_BLOCK_END_PREFIX: &str = "<!-- MOON_SESSION_END:";
+const MEMORY_LOCK_FILE: &str = "memory.md.lock";
+const DISTILL_AUDIT_FILE: &str = "distill.audit.log";
 const ENTITY_ANCHORS_BEGIN: &str = "<!-- MOON_ENTITY_ANCHORS_BEGIN -->";
 const ENTITY_ANCHORS_END: &str = "<!-- MOON_ENTITY_ANCHORS_END -->";
 const TOPIC_STOPWORDS: [&str; 38] = [
@@ -311,9 +344,13 @@ fn resolve_remote_config() -> Option<RemoteModelConfig> {
     })
 }
 
-fn token_limit_to_chunk_bytes(tokens: u64) -> usize {
-    let estimated = (tokens as f64) * AUTO_CHUNK_BYTES_PER_TOKEN * AUTO_CHUNK_SAFETY_RATIO;
+fn token_limit_to_bytes_with_ratio(tokens: u64, safety_ratio: f64) -> usize {
+    let estimated = (tokens as f64) * AUTO_CHUNK_BYTES_PER_TOKEN * safety_ratio;
     (estimated as usize).clamp(MIN_DISTILL_CHUNK_BYTES, MAX_AUTO_CHUNK_BYTES)
+}
+
+fn token_limit_to_chunk_bytes(tokens: u64) -> usize {
+    token_limit_to_bytes_with_ratio(tokens, AUTO_CHUNK_SAFETY_RATIO)
 }
 
 fn parse_env_u64(var: &str) -> Option<u64> {
@@ -2095,76 +2132,1509 @@ pub fn run_chunked_archive_distillation(
     paths: &MoonPaths,
     input: &DistillInput,
 ) -> Result<ChunkedDistillOutput> {
-    fs::create_dir_all(&paths.memory_dir)
-        .with_context(|| format!("failed to create {}", paths.memory_dir.display()))?;
-
-    let chunk_target_bytes = distill_chunk_bytes();
-    let max_chunks = distill_max_chunks();
-
-    let mut rollup = ChunkSummaryRollup::default();
-    let mut provider_counts = BTreeMap::<String, usize>::new();
-
-    let (chunk_count, truncated) = stream_archive_chunks(
-        &input.archive_path,
-        chunk_target_bytes,
-        max_chunks,
-        |chunk_index, chunk_text| {
-            let chunk_input = DistillInput {
-                session_id: format!("{} [chunk {}]", input.session_id, chunk_index),
-                archive_path: format!("{}#chunk={}", input.archive_path, chunk_index),
-                archive_text: chunk_text,
-                archive_epoch_secs: input.archive_epoch_secs,
-            };
-            let (provider, summary) = distill_summary(&chunk_input)?;
-            *provider_counts.entry(provider).or_insert(0) += 1;
-            rollup.ingest_summary(&summary);
-            Ok(())
-        },
-    )?;
-
-    let provider = summarize_provider_mix(&provider_counts);
-    let summary = clamp_summary(&rollup.render(
-        &input.session_id,
-        &input.archive_path,
-        chunk_count,
-        chunk_target_bytes,
-        max_chunks,
-        truncated,
-    ));
-    let out = append_distilled_summary(paths, input, provider.clone(), summary.clone())?;
-
+    // Layer 1 is conversation-preserving normalization. Chunked mode is retained as a
+    // compatibility wrapper and delegates to single-pass output generation.
+    let out = run_distillation(paths, input)?;
     Ok(ChunkedDistillOutput {
-        provider,
-        summary,
+        provider: out.provider.clone(),
+        summary: out.summary.clone(),
         summary_path: out.summary_path,
         audit_log_path: out.audit_log_path,
         created_at_epoch_secs: out.created_at_epoch_secs,
-        chunk_count,
-        chunk_target_bytes,
-        truncated,
+        chunk_count: 1,
+        chunk_target_bytes: distill_chunk_bytes(),
+        truncated: false,
     })
+}
+
+fn session_block_markers(session_id: &str) -> (String, String) {
+    (
+        format!("{SESSION_BLOCK_BEGIN_PREFIX}{session_id} -->"),
+        format!("{SESSION_BLOCK_END_PREFIX}{session_id} -->"),
+    )
+}
+
+fn normalize_turn_text(raw: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("[tool-input]") || trimmed.starts_with("[toolResult]") {
+            continue;
+        }
+        if is_poll_heartbeat_noise(trimmed) || is_status_echo_noise(trimmed) {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn strip_projection_bullet_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some(end_idx) = rest.find(']')
+    {
+        return rest[end_idx + 1..].trim().to_string();
+    }
+    trimmed.to_string()
+}
+
+fn extract_layer1_from_projection_markdown(
+    projection_md: &str,
+) -> (Vec<(String, String)>, Option<Vec<String>>, usize, usize) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        None,
+        User,
+        Assistant,
+        Tool,
+    }
+
+    let mut section = Section::None;
+    let mut turns = Vec::<(String, String)>::new();
+    let mut tool_lines = Vec::<String>::new();
+    let mut message_count: Option<usize> = None;
+    let mut filtered_noise_count: Option<usize> = None;
+
+    for raw_line in projection_md.lines() {
+        let line = raw_line.trim();
+        if let Some(raw_count) = line.strip_prefix("message_count:")
+            && message_count.is_none()
+        {
+            message_count = raw_count.trim().parse::<usize>().ok();
+        }
+        if let Some(raw_count) = line.strip_prefix("filtered_noise_count:")
+            && filtered_noise_count.is_none()
+        {
+            filtered_noise_count = raw_count.trim().parse::<usize>().ok();
+        }
+
+        if line.starts_with("### User Queries") {
+            section = Section::User;
+            continue;
+        }
+        if line.starts_with("### Assistant Responses") {
+            section = Section::Assistant;
+            continue;
+        }
+        if line.starts_with("## Tool Activity") {
+            section = Section::Tool;
+            continue;
+        }
+        if line.starts_with("## ")
+            && !line.starts_with("## Tool Activity")
+            && !line.starts_with("## Conversations")
+        {
+            section = Section::None;
+            continue;
+        }
+
+        let Some(raw_bullet) = line.strip_prefix("- ") else {
+            continue;
+        };
+        if raw_bullet.eq_ignore_ascii_case("none") {
+            continue;
+        }
+
+        let content = strip_projection_bullet_text(raw_bullet);
+        if content.is_empty() {
+            continue;
+        }
+
+        match section {
+            Section::User => {
+                if let Some(cleaned) = normalize_turn_text(&content) {
+                    turns.push(("user".to_string(), cleaned));
+                }
+            }
+            Section::Assistant => {
+                if let Some(cleaned) = normalize_turn_text(&content) {
+                    turns.push(("assistant".to_string(), cleaned));
+                }
+            }
+            Section::Tool => {
+                if let Some(cleaned) = clean_candidate_text(&content) {
+                    tool_lines.push(cleaned);
+                }
+            }
+            Section::None => {}
+        }
+    }
+
+    let execution_summary = build_execution_summary_from_turns_and_tools(&turns, &tool_lines);
+    let fallback_messages = turns.len().saturating_add(tool_lines.len());
+    (
+        turns,
+        execution_summary,
+        message_count.unwrap_or(fallback_messages),
+        filtered_noise_count.unwrap_or(0),
+    )
+}
+
+fn find_notable_blocker(data: &ProjectionData) -> Option<String> {
+    let keywords = ["error", "failed", "retry", "timeout", "blocked", "denied"];
+    for entry in data.entries.iter().rev() {
+        for candidate in [
+            Some(entry.content.as_str()),
+            entry.coupled_result.as_deref(),
+        ] {
+            let Some(text) = candidate else {
+                continue;
+            };
+            let lower = text.to_ascii_lowercase();
+            if keywords.iter().any(|kw| lower.contains(kw))
+                && let Some(cleaned) = clean_candidate_text(text)
+            {
+                return Some(cleaned);
+            }
+        }
+    }
+    None
+}
+
+fn build_execution_summary_from_turns_and_tools(
+    turns: &[(String, String)],
+    tool_lines: &[String],
+) -> Option<Vec<String>> {
+    if tool_lines.is_empty() {
+        return None;
+    }
+
+    let goal = turns
+        .iter()
+        .find(|(role, _)| role == "user")
+        .map(|(_, text)| truncate_with_ellipsis(text, 220))
+        .unwrap_or_else(|| "Complete the requested task from conversation context.".to_string());
+
+    let mut seen = BTreeSet::new();
+    let mut actions = Vec::new();
+    for line in tool_lines {
+        let action = truncate_with_ellipsis(line, 140);
+        if seen.insert(action.to_ascii_lowercase()) {
+            actions.push(action);
+        }
+        if actions.len() >= 4 {
+            break;
+        }
+    }
+    if actions.is_empty() {
+        return None;
+    }
+
+    let outcome = turns
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "assistant")
+        .map(|(_, text)| truncate_with_ellipsis(text, 220))
+        .unwrap_or_else(|| "Task progressed based on the available execution steps.".to_string());
+
+    let mut lines = vec![
+        format!("- Goal: {goal}"),
+        format!("- Key actions: {}", actions.join("; ")),
+        format!("- Outcome: {outcome}"),
+    ];
+
+    let keywords = ["error", "failed", "retry", "timeout", "blocked", "denied"];
+    if let Some(blocker) = tool_lines
+        .iter()
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            keywords.iter().any(|kw| lower.contains(kw))
+        })
+        .map(|line| truncate_with_ellipsis(line, 220))
+    {
+        lines.push(format!("- Notable blocker/retry: {blocker}"));
+    }
+
+    Some(lines)
+}
+
+fn build_execution_summary_lines(data: &ProjectionData) -> Option<Vec<String>> {
+    let goal = data
+        .entries
+        .iter()
+        .find(|entry| entry.role == "user")
+        .and_then(|entry| normalize_turn_text(&entry.content))
+        .map(|text| truncate_with_ellipsis(&text, 220))
+        .unwrap_or_else(|| "Clarify and complete the requested task.".to_string());
+
+    let mut actions = Vec::new();
+    let mut seen_actions = BTreeSet::new();
+    for entry in &data.entries {
+        if entry.role != "assistant" {
+            continue;
+        }
+        let Some(tool_name) = entry.tool_name.as_deref() else {
+            continue;
+        };
+        let action = if let Some(target) = entry.tool_target.as_deref() {
+            let trimmed = target.trim();
+            if trimmed.is_empty() {
+                format!("used `{tool_name}`")
+            } else {
+                format!(
+                    "used `{tool_name}` on {}",
+                    truncate_with_ellipsis(trimmed, 120)
+                )
+            }
+        } else {
+            format!("used `{tool_name}`")
+        };
+        if seen_actions.insert(action.clone()) {
+            actions.push(action);
+        }
+        if actions.len() >= 4 {
+            break;
+        }
+    }
+    if actions.is_empty() {
+        return None;
+    }
+
+    let outcome = data
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.role == "assistant")
+        .and_then(|entry| normalize_turn_text(&entry.content))
+        .map(|text| truncate_with_ellipsis(&text, 220))
+        .unwrap_or_else(|| "Task progressed based on the conversation state.".to_string());
+
+    let mut lines = vec![
+        format!("- Goal: {goal}"),
+        format!("- Key actions: {}", actions.join("; ")),
+        format!("- Outcome: {outcome}"),
+    ];
+    if let Some(blocker) = find_notable_blocker(data) {
+        lines.push(format!(
+            "- Notable blocker/retry: {}",
+            truncate_with_ellipsis(&blocker, 220)
+        ));
+    }
+    Some(lines)
+}
+
+fn build_layer1_signal_summary(
+    session_id: &str,
+    archive_path: &str,
+    turns: &[(String, String)],
+    execution_summary: Option<&[String]>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("## L1 Normalisation Session Digest\n");
+    out.push_str(&format!("- session_id: {session_id}\n"));
+    out.push_str(&format!("- archive_path: {archive_path}\n"));
+    if let Some(lines) = execution_summary {
+        for line in lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    } else {
+        out.push_str("- Key actions: none captured\n");
+        let highlights = turns
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .take(3)
+            .map(|(_, text)| format!("- User signal: {}", truncate_with_ellipsis(text, 180)))
+            .collect::<Vec<_>>();
+        if highlights.is_empty() {
+            out.push_str("- Outcome: no user/assistant turns captured\n");
+        } else {
+            for line in highlights {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn render_layer1_session_block(
+    input: &DistillInput,
+    message_count: usize,
+    filtered_noise_count: usize,
+    turns: &[(String, String)],
+    execution_summary: Option<&[String]>,
+) -> String {
+    let (begin_marker, end_marker) = session_block_markers(&input.session_id);
+    let mut out = String::new();
+    out.push_str(&begin_marker);
+    out.push('\n');
+    out.push_str(&format!("## Session {}\n", input.session_id));
+    out.push_str(&format!("- Source Archive: `{}`\n", input.archive_path));
+    out.push_str(&format!("- Message Count: {message_count}\n"));
+    out.push_str(&format!("- Noise Filtered: {filtered_noise_count}\n\n"));
+    out.push_str("### Conversation\n");
+    if turns.is_empty() {
+        out.push_str("- No user/assistant turns captured.\n");
+    } else {
+        for (role, text) in turns {
+            let role_label = if role == "user" { "User" } else { "Assistant" };
+            out.push_str(&format!("**{role_label}:** "));
+            let mut lines = text.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(first.trim());
+                out.push('\n');
+            } else {
+                out.push('\n');
+            }
+            for line in lines {
+                out.push_str(line.trim());
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+    }
+    if let Some(summary_lines) = execution_summary {
+        out.push_str("### Execution Summary\n");
+        for line in summary_lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(&end_marker);
+    out.push('\n');
+    out
+}
+
+fn upsert_marked_block(
+    existing: &str,
+    begin_marker: &str,
+    end_marker: &str,
+    block: &str,
+) -> String {
+    if let Some(start) = existing.find(begin_marker)
+        && let Some(end_rel) = existing[start..].find(end_marker)
+    {
+        let end = start + end_rel + end_marker.len();
+        let mut out = String::new();
+        out.push_str(&existing[..start]);
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(block.trim_end());
+        out.push('\n');
+        let tail = existing[end..].trim_start_matches('\n');
+        if !tail.is_empty() {
+            out.push('\n');
+            out.push_str(tail);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        return out;
+    }
+
+    let mut out = existing.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(block.trim_end());
+    out.push('\n');
+    out
+}
+
+fn ensure_daily_memory_header(existing: &str, date_label: &str) -> String {
+    if !existing.trim().is_empty() {
+        return existing.to_string();
+    }
+    format!("# Daily Memory {date_label}\n{DAILY_MEMORY_FORMAT_MARKER}\n\n")
+}
+
+fn today_daily_memory_path(paths: &MoonPaths, epoch_secs: u64) -> String {
+    daily_memory_path(paths, Some(epoch_secs))
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("memory.md");
+    let tmp_name = format!(".{file_name}.{}.tmp", std::process::id());
+    let tmp_path = path.with_file_name(tmp_name);
+    fs::write(&tmp_path, content)
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to atomically move {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn acquire_memory_lock(paths: &MoonPaths) -> Result<fs::File> {
+    fs::create_dir_all(&paths.logs_dir)
+        .with_context(|| format!("failed to create {}", paths.logs_dir.display()))?;
+    let lock_path = paths.logs_dir.join(MEMORY_LOCK_FILE);
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(lock_file)
+}
+
+fn append_distill_audit_event(paths: &MoonPaths, event: &DistillAuditEvent) -> Result<String> {
+    fs::create_dir_all(&paths.logs_dir)
+        .with_context(|| format!("failed to create {}", paths.logs_dir.display()))?;
+    let path = paths.logs_dir.join(DISTILL_AUDIT_FILE);
+    let line = format!("{}\n", serde_json::to_string(event)?);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("failed to append {}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
+fn push_unique_limited(
+    out: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    raw: &str,
+    max_items: usize,
+) {
+    if out.len() >= max_items {
+        return;
+    }
+    let Some(cleaned) = clean_candidate_text(raw) else {
+        return;
+    };
+    if seen.insert(cleaned.to_ascii_lowercase()) {
+        out.push(cleaned);
+    }
+}
+
+fn extract_layer1_memory_lines(daily_memory: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut user = Vec::new();
+    let mut assistant = Vec::new();
+    let mut exec = Vec::new();
+    let mut in_exec = false;
+
+    for raw_line in daily_memory.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("### Execution Summary") {
+            in_exec = true;
+            continue;
+        }
+        if line.starts_with("### ") && !line.starts_with("### Execution Summary") {
+            in_exec = false;
+        }
+        if let Some(rest) = line.strip_prefix("**User:**") {
+            user.push(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("**Assistant:**") {
+            assistant.push(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("- [user]") {
+            user.push(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("- [assistant]") {
+            assistant.push(rest.trim().to_string());
+            continue;
+        }
+        if in_exec && line.starts_with("- ") {
+            exec.push(line.trim_start_matches("- ").trim().to_string());
+        }
+    }
+
+    (user, assistant, exec)
+}
+
+fn local_wisdom_sections(
+    daily_memory: &str,
+    current_memory: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (user_lines, assistant_lines, execution_lines) = extract_layer1_memory_lines(daily_memory);
+    let mut lessons = Vec::new();
+    let mut prefs = Vec::new();
+    let mut durable = Vec::new();
+    let mut lessons_seen = BTreeSet::new();
+    let mut prefs_seen = BTreeSet::new();
+    let mut durable_seen = BTreeSet::new();
+
+    let pref_keywords = [
+        "prefer", "like", "likes", "want", "wants", "please", "must", "should", "always", "never",
+        "no ",
+    ];
+    for line in &user_lines {
+        let lower = line.to_ascii_lowercase();
+        if pref_keywords.iter().any(|kw| lower.contains(kw)) {
+            push_unique_limited(
+                &mut prefs,
+                &mut prefs_seen,
+                line,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+        if lower.contains("decision")
+            || lower.contains("rule")
+            || lower.contains("keep")
+            || lower.contains("use")
+        {
+            push_unique_limited(
+                &mut durable,
+                &mut durable_seen,
+                line,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+    }
+
+    let mut user_counts = BTreeMap::<String, usize>::new();
+    for line in &user_lines {
+        let key = line.to_ascii_lowercase();
+        *user_counts.entry(key).or_insert(0) += 1;
+    }
+    for line in &user_lines {
+        let key = line.to_ascii_lowercase();
+        if user_counts.get(&key).copied().unwrap_or(0) >= 2 {
+            push_unique_limited(
+                &mut prefs,
+                &mut prefs_seen,
+                line,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+    }
+
+    for line in &execution_lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("outcome")
+            || lower.contains("lesson")
+            || lower.contains("blocker")
+            || lower.contains("retry")
+        {
+            push_unique_limited(
+                &mut lessons,
+                &mut lessons_seen,
+                line,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+    }
+
+    for line in &assistant_lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("fixed")
+            || lower.contains("resolved")
+            || lower.contains("learned")
+            || lower.contains("failed")
+            || lower.contains("retry")
+        {
+            push_unique_limited(
+                &mut lessons,
+                &mut lessons_seen,
+                line,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+        if lower.contains("decision")
+            || lower.contains("rule")
+            || lower.contains("must")
+            || lower.contains("keep")
+        {
+            push_unique_limited(
+                &mut durable,
+                &mut durable_seen,
+                line,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+    }
+
+    if lessons.is_empty() && !execution_lines.is_empty() {
+        for line in execution_lines.iter().take(3) {
+            push_unique_limited(
+                &mut lessons,
+                &mut lessons_seen,
+                line,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+    }
+    if lessons.is_empty() {
+        push_unique_limited(
+            &mut lessons,
+            &mut lessons_seen,
+            "Completed daily synthesis and retained actionable signals.",
+            MAX_WISDOM_ITEMS_PER_SECTION,
+        );
+    }
+    if prefs.is_empty() {
+        push_unique_limited(
+            &mut prefs,
+            &mut prefs_seen,
+            "No explicit repeated preference was detected today.",
+            MAX_WISDOM_ITEMS_PER_SECTION,
+        );
+    }
+    if durable.is_empty() {
+        if !current_memory.trim().is_empty() {
+            push_unique_limited(
+                &mut durable,
+                &mut durable_seen,
+                "Preserved prior durable context from existing MEMORY.md.",
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        } else {
+            push_unique_limited(
+                &mut durable,
+                &mut durable_seen,
+                "No new durable decision was identified today.",
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            );
+        }
+    }
+
+    (lessons, prefs, durable)
+}
+
+fn render_wisdom_summary(lessons: &[String], prefs: &[String], durable: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str("## Lessons Learned\n");
+    for line in lessons.iter().take(MAX_WISDOM_ITEMS_PER_SECTION) {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str("## User Preferences\n");
+    for line in prefs.iter().take(MAX_WISDOM_ITEMS_PER_SECTION) {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str("## Durable Decisions & Context\n");
+    for line in durable.iter().take(MAX_WISDOM_ITEMS_PER_SECTION) {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn normalize_wisdom_summary(raw: &str, daily_memory: &str, current_memory: &str) -> String {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        Lessons,
+        Prefs,
+        Durable,
+        Unknown,
+    }
+
+    let mut section = Section::Unknown;
+    let mut lessons = Vec::new();
+    let mut prefs = Vec::new();
+    let mut durable = Vec::new();
+    let mut lessons_seen = BTreeSet::new();
+    let mut prefs_seen = BTreeSet::new();
+    let mut durable_seen = BTreeSet::new();
+
+    for raw_line in raw.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("##") || line.starts_with('#') {
+            let lower = line.to_ascii_lowercase();
+            section = if lower.contains("lesson") {
+                Section::Lessons
+            } else if lower.contains("preference") || lower.contains("like") {
+                Section::Prefs
+            } else if lower.contains("durable")
+                || lower.contains("decision")
+                || lower.contains("context")
+            {
+                Section::Durable
+            } else {
+                Section::Unknown
+            };
+            continue;
+        }
+
+        let normalized = line
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim();
+        if normalized.is_empty()
+            || normalized.starts_with("**User:**")
+            || normalized.starts_with("**Assistant:**")
+        {
+            continue;
+        }
+
+        let lower = normalized.to_ascii_lowercase();
+        let target = if section != Section::Unknown {
+            section
+        } else if lower.contains("prefer")
+            || lower.contains("like")
+            || lower.contains("repeat")
+            || lower.contains("wants")
+        {
+            Section::Prefs
+        } else if lower.contains("decision")
+            || lower.contains("rule")
+            || lower.contains("context")
+            || lower.contains("durable")
+        {
+            Section::Durable
+        } else {
+            Section::Lessons
+        };
+
+        match target {
+            Section::Lessons => push_unique_limited(
+                &mut lessons,
+                &mut lessons_seen,
+                normalized,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            ),
+            Section::Prefs => push_unique_limited(
+                &mut prefs,
+                &mut prefs_seen,
+                normalized,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            ),
+            Section::Durable => push_unique_limited(
+                &mut durable,
+                &mut durable_seen,
+                normalized,
+                MAX_WISDOM_ITEMS_PER_SECTION,
+            ),
+            Section::Unknown => {}
+        }
+    }
+
+    let (fallback_lessons, fallback_prefs, fallback_durable) =
+        local_wisdom_sections(daily_memory, current_memory);
+    if lessons.is_empty() {
+        lessons = fallback_lessons;
+    }
+    if prefs.is_empty() {
+        prefs = fallback_prefs;
+    }
+    if durable.is_empty() {
+        durable = fallback_durable;
+    }
+    render_wisdom_summary(&lessons, &prefs, &durable)
+}
+
+fn validate_wisdom_summary(summary: &str) -> Result<()> {
+    let lower = summary.to_ascii_lowercase();
+    if !lower.contains("## lessons learned") {
+        anyhow::bail!("wisdom summary missing `Lessons Learned` section");
+    }
+    if !lower.contains("## user preferences") {
+        anyhow::bail!("wisdom summary missing `User Preferences` section");
+    }
+    if !lower.contains("## durable decisions & context") {
+        anyhow::bail!("wisdom summary missing `Durable Decisions & Context` section");
+    }
+    if summary.lines().count() > MAX_WISDOM_LINES {
+        anyhow::bail!("wisdom summary exceeds concise line budget");
+    }
+    if summary.contains("**User:**") || summary.contains("**Assistant:**") {
+        anyhow::bail!("wisdom summary contains raw dialogue markers");
+    }
+    Ok(())
+}
+
+fn build_wisdom_prompt(day_key: &str, daily_memory: &str, current_memory: &str) -> String {
+    format!(
+        concat!(
+            "You are maintaining MEMORY.md from daily conversation memory.\n",
+            "Date: {day_key}\n",
+            "Return markdown only with exactly these sections:\n",
+            "## Lessons Learned\n",
+            "## User Preferences\n",
+            "## Durable Decisions & Context\n",
+            "Rules:\n",
+            "- Keep concise, high-signal bullets only.\n",
+            "- Prefer repeated user preferences and durable decisions.\n",
+            "- Do not include raw dialogue transcripts.\n",
+            "- Merge with existing MEMORY context and avoid duplicates.\n\n",
+            "Current MEMORY.md:\n{current_memory}\n\n",
+            "Today's daily memory:\n{daily_memory}\n"
+        ),
+        day_key = day_key,
+        current_memory = current_memory,
+        daily_memory = daily_memory
+    )
+}
+
+fn build_wisdom_chunk_prompt(
+    day_key: &str,
+    chunk_index: usize,
+    chunk_total: usize,
+    daily_chunk: &str,
+    current_memory: &str,
+) -> String {
+    format!(
+        concat!(
+            "You are maintaining MEMORY.md from daily conversation memory.\n",
+            "Date: {day_key}\n",
+            "Chunk: {chunk_index}/{chunk_total}\n",
+            "Return markdown only with exactly these sections:\n",
+            "## Lessons Learned\n",
+            "## User Preferences\n",
+            "## Durable Decisions & Context\n",
+            "Rules:\n",
+            "- Keep concise, high-signal bullets only.\n",
+            "- Prefer repeated user preferences and durable decisions.\n",
+            "- Do not include raw dialogue transcripts.\n",
+            "- Treat this as partial input; preserve only durable points.\n\n",
+            "Current MEMORY.md (bounded):\n{current_memory}\n\n",
+            "Daily memory chunk:\n{daily_chunk}\n"
+        ),
+        day_key = day_key,
+        chunk_index = chunk_index,
+        chunk_total = chunk_total,
+        current_memory = current_memory,
+        daily_chunk = daily_chunk
+    )
+}
+
+fn truncate_text_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.as_bytes().len() <= max_bytes {
+        return text.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if max_bytes <= 32 {
+        return truncate_with_ellipsis(text, max_bytes);
+    }
+
+    let limit = max_bytes.saturating_sub(28);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = ch.len_utf8();
+        if used.saturating_add(width) > limit {
+            break;
+        }
+        out.push(ch);
+        used = used.saturating_add(width);
+    }
+    out.push_str("\n[truncated]");
+    out
+}
+
+fn split_text_by_max_bytes(text: &str, max_chunk_bytes: usize) -> Vec<String> {
+    if text.trim().is_empty() {
+        return vec![String::new()];
+    }
+    if max_chunk_bytes == 0 {
+        return vec![truncate_text_to_bytes(text, WISDOM_MIN_DAILY_CHUNK_BYTES)];
+    }
+    if text.as_bytes().len() <= max_chunk_bytes {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_bytes = 0usize;
+
+    for line in text.lines() {
+        let line_with_nl = format!("{line}\n");
+        let line_bytes = line_with_nl.as_bytes().len();
+
+        if line_bytes > max_chunk_bytes {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            chunks.push(truncate_text_to_bytes(&line_with_nl, max_chunk_bytes));
+            continue;
+        }
+
+        if current_bytes.saturating_add(line_bytes) > max_chunk_bytes && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+
+        current.push_str(&line_with_nl);
+        current_bytes = current_bytes.saturating_add(line_bytes);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(truncate_text_to_bytes(text, max_chunk_bytes));
+    }
+    chunks
+}
+
+fn detect_wisdom_context_tokens(remote: &RemoteModelConfig) -> u64 {
+    if let Some(tokens) = parse_env_u64("MOON_WISDOM_CONTEXT_TOKENS") {
+        return tokens;
+    }
+    if let Some(tokens) = detect_context_tokens_from_remote(remote) {
+        return tokens;
+    }
+    infer_context_tokens_from_model(remote.provider, &remote.model)
+}
+
+fn resolve_wisdom_remote_config() -> Result<Option<RemoteModelConfig>> {
+    let raw_provider = env_non_empty("MOON_WISDOM_PROVIDER").ok_or_else(|| {
+        anyhow::anyhow!(
+            "syns skipped: missing MOON_WISDOM_PROVIDER. Configure MOON_WISDOM_PROVIDER and MOON_WISDOM_MODEL for `moon distill -mode syns`."
+        )
+    })?;
+    if raw_provider.eq_ignore_ascii_case("local") {
+        return Ok(None);
+    }
+
+    let provider = parse_provider_alias(&raw_provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "syns skipped: invalid MOON_WISDOM_PROVIDER `{}`. Use one of: openai, anthropic, gemini, openai-compatible, local.",
+            raw_provider
+        )
+    })?;
+
+    let model = env_non_empty("MOON_WISDOM_MODEL").ok_or_else(|| {
+        anyhow::anyhow!(
+            "syns skipped: missing MOON_WISDOM_MODEL. Configure a primary synthesis model (for example gpt-4.1)."
+        )
+    })?;
+    let (_, normalized_model) = parse_prefixed_model(&model);
+    if normalized_model.trim().is_empty() {
+        anyhow::bail!("syns skipped: MOON_WISDOM_MODEL is empty after normalization");
+    }
+
+    let base_url = match provider {
+        RemoteProvider::OpenAiCompatible => resolve_compatible_base_url(&normalized_model),
+        _ => None,
+    };
+    let api_key = resolve_api_key(provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "syns skipped: missing API key for provider `{}`. Fix the primary model credentials.",
+            provider.label()
+        )
+    })?;
+
+    Ok(Some(RemoteModelConfig {
+        provider,
+        model: normalized_model,
+        api_key,
+        base_url,
+    }))
+}
+
+fn call_remote_prompt(remote: &RemoteModelConfig, prompt: &str) -> Result<String> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .build()?;
+
+    match remote.provider {
+        RemoteProvider::Gemini => {
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                remote.model, remote.api_key
+            );
+            let payload = serde_json::json!({
+                "contents": [
+                    {
+                        "parts": [{"text": prompt}]
+                    }
+                ]
+            });
+            let response = client.post(&url).json(&payload).send()?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "gemini wisdom call failed with status {}",
+                    response.status()
+                );
+            }
+            let json: Value = response.json()?;
+            let text = json
+                .get("candidates")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.get("content"))
+                .and_then(|v| v.get("parts"))
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|v| v.get("text"))
+                .and_then(Value::as_str)
+                .context("gemini wisdom response missing text content")?;
+            Ok(text.to_string())
+        }
+        RemoteProvider::OpenAi => {
+            let payload = serde_json::json!({
+                "model": remote.model,
+                "input": prompt,
+                "temperature": 0.2
+            });
+            let response = client
+                .post("https://api.openai.com/v1/responses")
+                .bearer_auth(&remote.api_key)
+                .json(&payload)
+                .send()?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "openai wisdom call failed with status {}",
+                    response.status()
+                );
+            }
+            let json: Value = response.json()?;
+            extract_openai_text(&json).context("openai wisdom response missing text content")
+        }
+        RemoteProvider::Anthropic => {
+            let payload = serde_json::json!({
+                "model": remote.model,
+                "max_tokens": 1400,
+                "temperature": 0.2,
+                "messages": [{"role":"user", "content": prompt}]
+            });
+            let response = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &remote.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&payload)
+                .send()?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "anthropic wisdom call failed with status {}",
+                    response.status()
+                );
+            }
+            let json: Value = response.json()?;
+            extract_anthropic_text(&json).context("anthropic wisdom response missing text content")
+        }
+        RemoteProvider::OpenAiCompatible => {
+            let base = remote
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com")
+                .trim_end_matches('/');
+            let url = format!("{base}/v1/chat/completions");
+            let payload = serde_json::json!({
+                "model": remote.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.2
+            });
+            let response = client
+                .post(&url)
+                .bearer_auth(&remote.api_key)
+                .json(&payload)
+                .send()?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "openai-compatible wisdom call failed with status {}",
+                    response.status()
+                );
+            }
+            let json: Value = response.json()?;
+            extract_openai_compatible_text(&json)
+                .context("openai-compatible wisdom response missing text content")
+        }
+    }
+}
+
+fn generate_wisdom_summary(
+    day_key: &str,
+    daily_memory: &str,
+    current_memory: &str,
+) -> Result<(String, String)> {
+    if let Some(remote) = resolve_wisdom_remote_config()? {
+        let context_tokens = detect_wisdom_context_tokens(&remote);
+        let context_budget_bytes =
+            token_limit_to_bytes_with_ratio(context_tokens, WISDOM_CONTEXT_SAFETY_RATIO);
+        let bounded_current_budget = context_budget_bytes
+            .saturating_div(3)
+            .max(WISDOM_MIN_DAILY_CHUNK_BYTES);
+        let bounded_current_memory = truncate_text_to_bytes(current_memory, bounded_current_budget);
+
+        let daily_chunk_budget = context_budget_bytes
+            .saturating_sub(bounded_current_memory.as_bytes().len())
+            .saturating_sub(WISDOM_PROMPT_OVERHEAD_BYTES)
+            .max(WISDOM_MIN_DAILY_CHUNK_BYTES);
+        let daily_chunks = split_text_by_max_bytes(daily_memory, daily_chunk_budget);
+
+        let mut partial_summaries = Vec::new();
+        let mut first_remote_error: Option<anyhow::Error> = None;
+        for (idx, chunk) in daily_chunks.iter().enumerate() {
+            let mut chunk_body = chunk.clone();
+            let mut prompt = build_wisdom_chunk_prompt(
+                day_key,
+                idx + 1,
+                daily_chunks.len(),
+                &chunk_body,
+                &bounded_current_memory,
+            );
+
+            while prompt.as_bytes().len() > context_budget_bytes
+                && chunk_body.as_bytes().len() > WISDOM_MIN_DAILY_CHUNK_BYTES
+            {
+                let next_budget = chunk_body
+                    .as_bytes()
+                    .len()
+                    .saturating_mul(8)
+                    .saturating_div(10);
+                chunk_body = truncate_text_to_bytes(&chunk_body, next_budget);
+                prompt = build_wisdom_chunk_prompt(
+                    day_key,
+                    idx + 1,
+                    daily_chunks.len(),
+                    &chunk_body,
+                    &bounded_current_memory,
+                );
+            }
+
+            if prompt.as_bytes().len() > context_budget_bytes {
+                continue;
+            }
+
+            match call_remote_prompt(&remote, &prompt) {
+                Ok(raw) => {
+                    let normalized = normalize_wisdom_summary(&raw, &chunk_body, current_memory);
+                    partial_summaries.push(normalized);
+                }
+                Err(err) => {
+                    if first_remote_error.is_none() {
+                        first_remote_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        if !partial_summaries.is_empty() {
+            let merged = if partial_summaries.len() == 1 {
+                partial_summaries.remove(0)
+            } else {
+                normalize_wisdom_summary(
+                    &partial_summaries.join("\n\n"),
+                    daily_memory,
+                    current_memory,
+                )
+            };
+            return Ok((remote.provider.label().to_string(), merged));
+        }
+
+        // Single bounded attempt before failing synthesis for this run.
+        let bounded_daily = truncate_text_to_bytes(
+            daily_memory,
+            context_budget_bytes
+                .saturating_sub(bounded_current_memory.as_bytes().len())
+                .saturating_sub(WISDOM_PROMPT_OVERHEAD_BYTES)
+                .max(WISDOM_MIN_DAILY_CHUNK_BYTES),
+        );
+        let prompt = build_wisdom_prompt(day_key, &bounded_daily, &bounded_current_memory);
+        if prompt.as_bytes().len() <= context_budget_bytes
+            && let Ok(raw) = call_remote_prompt(&remote, &prompt)
+        {
+            let normalized = normalize_wisdom_summary(&raw, daily_memory, current_memory);
+            return Ok((remote.provider.label().to_string(), normalized));
+        }
+
+        if let Some(err) = first_remote_error {
+            return Err(err).context(
+                "syns skipped: configured primary model failed. Fix MOON_WISDOM_PROVIDER / MOON_WISDOM_MODEL and provider credentials.",
+            );
+        }
+        anyhow::bail!(
+            "syns skipped: configured primary model produced no usable output. Fix MOON_WISDOM_PROVIDER / MOON_WISDOM_MODEL and retry."
+        );
+    }
+
+    let (lessons, prefs, durable) = local_wisdom_sections(daily_memory, current_memory);
+    Ok((
+        "local".to_string(),
+        render_wisdom_summary(&lessons, &prefs, &durable),
+    ))
 }
 
 pub fn run_distillation(paths: &MoonPaths, input: &DistillInput) -> Result<DistillOutput> {
     fs::create_dir_all(&paths.memory_dir)
         .with_context(|| format!("failed to create {}", paths.memory_dir.display()))?;
 
-    let (provider_used, summary) = distill_summary(input)?;
-    append_distilled_summary(paths, input, provider_used, summary)
+    let source_is_markdown = Path::new(&input.archive_path)
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+
+    let (turns, execution_summary, message_count, filtered_noise_count) = if source_is_markdown {
+        let projection_md = fs::read_to_string(&input.archive_path)
+            .with_context(|| format!("failed to read {}", input.archive_path))?;
+        extract_layer1_from_projection_markdown(&projection_md)
+    } else {
+        let projection = extract_projection_data(&input.archive_path)
+            .with_context(|| format!("failed to parse archive {}", input.archive_path))?;
+        let turns = projection
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                if entry.role != "user" && entry.role != "assistant" {
+                    return None;
+                }
+                normalize_turn_text(&entry.content).map(|text| (entry.role.clone(), text))
+            })
+            .collect::<Vec<_>>();
+        let execution_summary = build_execution_summary_lines(&projection);
+        (
+            turns,
+            execution_summary,
+            projection.message_count,
+            projection.filtered_noise_count,
+        )
+    };
+
+    let summary = build_layer1_signal_summary(
+        &input.session_id,
+        &input.archive_path,
+        &turns,
+        execution_summary.as_deref(),
+    );
+    let session_block = render_layer1_session_block(
+        input,
+        message_count,
+        filtered_noise_count,
+        &turns,
+        execution_summary.as_deref(),
+    );
+
+    let summary_path = daily_memory_path(paths, input.archive_epoch_secs);
+    let date_label = Path::new(&summary_path)
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("1970-01-01");
+    let existing = fs::read_to_string(&summary_path).unwrap_or_default();
+    let seeded = ensure_daily_memory_header(&existing, date_label);
+    let (begin_marker, end_marker) = session_block_markers(&input.session_id);
+    let full_text = upsert_marked_block(&seeded, &begin_marker, &end_marker, &session_block);
+
+    fs::write(&summary_path, full_text)
+        .with_context(|| format!("failed to write {}", summary_path))?;
+
+    audit::append_event(
+        paths,
+        "distill",
+        "ok",
+        &format!(
+            "l1_normalised session={} source={} target={}",
+            input.session_id, input.archive_path, summary_path
+        ),
+    )?;
+
+    Ok(DistillOutput {
+        provider: "l1-normaliser".to_string(),
+        summary,
+        summary_path: summary_path.clone(),
+        audit_log_path: paths.logs_dir.join("audit.log").display().to_string(),
+        created_at_epoch_secs: now_epoch_secs()?,
+    })
+}
+
+pub fn run_wisdom_distillation(
+    paths: &MoonPaths,
+    input: &WisdomDistillInput,
+) -> Result<DistillOutput> {
+    fs::create_dir_all(&paths.memory_dir)
+        .with_context(|| format!("failed to create {}", paths.memory_dir.display()))?;
+    fs::create_dir_all(&paths.logs_dir)
+        .with_context(|| format!("failed to create {}", paths.logs_dir.display()))?;
+
+    let epoch = input.day_epoch_secs.unwrap_or(now_epoch_secs()?);
+    let default_today = today_daily_memory_path(paths, epoch);
+    let memory_path = paths.memory_file.display().to_string();
+    let explicit_sources = input
+        .source_paths
+        .iter()
+        .any(|path| !path.trim().is_empty());
+
+    let mut selected_sources = Vec::new();
+    if explicit_sources {
+        let mut seen = BTreeSet::new();
+        for raw in &input.source_paths {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                selected_sources.push(trimmed.to_string());
+            }
+        }
+    } else {
+        selected_sources.push(default_today.clone());
+        selected_sources.push(memory_path.clone());
+    }
+
+    if selected_sources.is_empty() {
+        anyhow::bail!("no synthesis source files provided");
+    }
+
+    let mut source_blocks = Vec::new();
+    let mut participating_sources = Vec::new();
+    for source_path in selected_sources {
+        match fs::read_to_string(&source_path) {
+            Ok(content) => {
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    if explicit_sources {
+                        anyhow::bail!("synthesis source file is empty: {}", source_path);
+                    }
+                    continue;
+                }
+                participating_sources.push(source_path.clone());
+                source_blocks.push(format!("## Source: {}\n{}\n", source_path, trimmed));
+            }
+            Err(err) => {
+                if !explicit_sources && source_path == memory_path {
+                    // Default synthesis tolerates missing MEMORY.md and uses today's file only.
+                    continue;
+                }
+                return Err(err)
+                    .with_context(|| format!("failed to read synthesis source {}", source_path));
+            }
+        }
+    }
+
+    if participating_sources.is_empty() {
+        anyhow::bail!("no non-empty synthesis sources available");
+    }
+
+    let synthesis_label = if explicit_sources {
+        format!("files:{}", participating_sources.len())
+    } else {
+        "default:today+memory".to_string()
+    };
+    let synthesis_input = source_blocks.join("\n");
+    let (provider, summary) = generate_wisdom_summary(&synthesis_label, &synthesis_input, "")
+        .with_context(
+            || "syns skipped: failed to run synthesis with the configured primary model",
+        )?;
+    validate_wisdom_summary(&summary)?;
+
+    if input.dry_run {
+        return Ok(DistillOutput {
+            provider,
+            summary,
+            summary_path: paths.memory_file.display().to_string(),
+            audit_log_path: paths
+                .logs_dir
+                .join(DISTILL_AUDIT_FILE)
+                .display()
+                .to_string(),
+            created_at_epoch_secs: now_epoch_secs()?,
+        });
+    }
+
+    let _lock_file = acquire_memory_lock(paths)?;
+    let latest_memory = fs::read_to_string(&paths.memory_file).unwrap_or_default();
+    let merged_memory = format!("# MEMORY\n\n{}\n", summary.trim_end());
+    validate_wisdom_summary(&summary)?;
+
+    let input_hash = sha256_hex(&synthesis_input);
+    let output_hash = sha256_hex(&merged_memory);
+
+    let previous_snapshot = latest_memory.clone();
+    atomic_write_file(&paths.memory_file, &merged_memory)?;
+
+    let event = DistillAuditEvent {
+        at_epoch_secs: now_epoch_secs()?,
+        mode: "syns".to_string(),
+        trigger: input.trigger.clone(),
+        source_path: participating_sources.join(";"),
+        target_path: paths.memory_file.display().to_string(),
+        input_hash,
+        output_hash,
+        provider: provider.clone(),
+    };
+    let audit_log_path = match append_distill_audit_event(paths, &event) {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = atomic_write_file(&paths.memory_file, &previous_snapshot);
+            return Err(err);
+        }
+    };
+
+    let _ = audit::append_event(
+        paths,
+        "distill",
+        "ok",
+        &format!(
+            "mode=syns trigger={} sources={} target={} provider={}",
+            input.trigger,
+            participating_sources.join(";"),
+            paths.memory_file.display(),
+            provider
+        ),
+    );
+
+    Ok(DistillOutput {
+        provider,
+        summary,
+        summary_path: paths.memory_file.display().to_string(),
+        audit_log_path,
+        created_at_epoch_secs: now_epoch_secs()?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ChunkSummaryRollup, DistillInput, Distiller, LocalDistiller, MAX_SUMMARY_CHARS,
-        RemoteProvider, clamp_summary, extract_anthropic_text, extract_openai_compatible_text,
-        extract_openai_text, infer_provider_from_model, parse_prefixed_model,
-        sanitize_model_summary, stream_archive_chunks, summarize_provider_mix,
+        RemoteProvider, WisdomDistillInput, clamp_summary, extract_anthropic_text,
+        extract_openai_compatible_text, extract_openai_text, infer_provider_from_model,
+        parse_prefixed_model, run_distillation, run_wisdom_distillation, sanitize_model_summary,
+        stream_archive_chunks, summarize_provider_mix,
     };
+    use crate::moon::paths::MoonPaths;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
+
+    fn make_test_paths(root: &std::path::Path) -> MoonPaths {
+        MoonPaths {
+            moon_home: root.join("moon-home"),
+            archives_dir: root.join("archives"),
+            memory_dir: root.join("memory"),
+            memory_file: root.join("MEMORY.md"),
+            logs_dir: root.join("moon/logs"),
+            openclaw_sessions_dir: root.join("sessions"),
+            qmd_bin: root.join("qmd"),
+            qmd_db: root.join("qmd.db"),
+            moon_home_is_explicit: true,
+        }
+    }
 
     #[test]
     fn local_distiller_avoids_raw_jsonl_payloads() {
@@ -2594,5 +4064,265 @@ mod tests {
         assert!(tags.iter().any(|t| t == "#qmd"));
         assert!(!tags.iter().any(|t| t.contains("2026")));
         assert!(!tags.iter().any(|t| t.contains("archive_jsonl_path")));
+    }
+
+    #[test]
+    fn run_distillation_writes_conversation_first_daily_memory() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = make_test_paths(tmp.path());
+        fs::create_dir_all(&paths.memory_dir).expect("mkdir memory");
+        fs::create_dir_all(&paths.logs_dir).expect("mkdir logs");
+
+        let archive = tmp.path().join("session.jsonl");
+        let user = json!({
+            "message": {
+                "role": "user",
+                "timestamp": 1_700_000_000u64,
+                "content": [{"type":"text","text":"Please keep responses concise and actionable."}]
+            }
+        });
+        let assistant_tool = json!({
+            "message": {
+                "role": "assistant",
+                "timestamp": 1_700_000_001u64,
+                "content": [
+                    {"type":"text","text":"I will patch the parser and run tests."},
+                    {"type":"toolUse","name":"exec","input":{"command":"cargo test"}}
+                ]
+            }
+        });
+        let tool_result = json!({
+            "message": {
+                "role": "toolResult",
+                "timestamp": 1_700_000_002u64,
+                "content": [{"type":"text","text":"test result: ok. 42 passed"}]
+            }
+        });
+        let assistant = json!({
+            "message": {
+                "role": "assistant",
+                "timestamp": 1_700_000_003u64,
+                "content": [{"type":"text","text":"Done. Tests are passing."}]
+            }
+        });
+        fs::write(
+            &archive,
+            format!("{user}\n{assistant_tool}\n{tool_result}\n{assistant}\n"),
+        )
+        .expect("write archive");
+
+        let out = run_distillation(
+            &paths,
+            &DistillInput {
+                session_id: "s1".to_string(),
+                archive_path: archive.display().to_string(),
+                archive_text: String::new(),
+                archive_epoch_secs: Some(1_700_000_000),
+            },
+        )
+        .expect("layer1 distill should succeed");
+
+        let daily = fs::read_to_string(&out.summary_path).expect("read daily memory");
+        assert!(daily.contains("moon_memory_format: conversation_v1"));
+        assert!(daily.contains("## Session s1"));
+        assert!(daily.contains("**User:** Please keep responses concise and actionable."));
+        assert!(daily.contains("**Assistant:** I will patch the parser and run tests."));
+        assert!(daily.contains("### Execution Summary"));
+        assert!(!daily.contains("[tool-input]"));
+    }
+
+    #[test]
+    fn run_distillation_accepts_projection_markdown_source() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = make_test_paths(tmp.path());
+        fs::create_dir_all(&paths.memory_dir).expect("mkdir memory");
+        fs::create_dir_all(&paths.logs_dir).expect("mkdir logs");
+
+        let projection = tmp.path().join("session-projection.md");
+        fs::write(
+            &projection,
+            r#"---
+moon_archive_projection: 2
+message_count: 7
+filtered_noise_count: 2
+---
+
+## Conversations
+
+### User Queries
+- [10:00:01Z] Please keep answers concise.
+- [10:00:20Z] Please keep answers concise.
+
+### Assistant Responses
+- [10:00:15Z] I will update the command flow and rerun tests.
+- [10:00:50Z] Done, everything is green.
+
+## Tool Activity
+### exec
+- [10:00:30Z] `cargo test` -> ok
+"#,
+        )
+        .expect("write projection");
+
+        let out = run_distillation(
+            &paths,
+            &DistillInput {
+                session_id: "md1".to_string(),
+                archive_path: projection.display().to_string(),
+                archive_text: String::new(),
+                archive_epoch_secs: Some(1_700_000_100),
+            },
+        )
+        .expect("layer1 distill from projection should succeed");
+
+        let daily = fs::read_to_string(out.summary_path).expect("read daily memory");
+        assert!(daily.contains("## Session md1"));
+        assert!(daily.contains("Please keep answers concise."));
+        assert!(daily.contains("I will update the command flow and rerun tests."));
+        assert!(daily.contains("### Execution Summary"));
+    }
+
+    #[test]
+    fn split_text_by_max_bytes_produces_bounded_chunks() {
+        let text = (0..2000)
+            .map(|idx| format!("line {idx} keep this memory signal"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let max_bytes = 1024usize;
+        let chunks = super::split_text_by_max_bytes(&text, max_bytes);
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            assert!(chunk.as_bytes().len() <= max_bytes + 32);
+        }
+    }
+
+    #[test]
+    fn run_wisdom_distillation_updates_memory_file_and_audit_log() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = make_test_paths(tmp.path());
+        fs::create_dir_all(&paths.memory_dir).expect("mkdir memory");
+        fs::create_dir_all(&paths.logs_dir).expect("mkdir logs");
+        fs::write(&paths.memory_file, "# MEMORY\n").expect("write memory");
+        let prior_provider = std::env::var("MOON_WISDOM_PROVIDER").ok();
+        unsafe {
+            std::env::set_var("MOON_WISDOM_PROVIDER", "local");
+        }
+
+        let epoch = 1_700_000_000u64;
+        let daily_path = super::daily_memory_path(&paths, Some(epoch));
+        fs::write(
+            &daily_path,
+            r#"# Daily Memory 2023-11-14
+<!-- moon_memory_format: conversation_v1 -->
+
+## Session s1
+### Conversation
+**User:** I prefer concise answers.
+**Assistant:** I updated the parser and tests.
+**User:** I prefer concise answers.
+
+### Execution Summary
+- Goal: fix parser test failure
+- Key actions: used `exec` on cargo test
+- Outcome: tests pass
+"#,
+        )
+        .expect("write daily");
+
+        let out = run_wisdom_distillation(
+            &paths,
+            &WisdomDistillInput {
+                trigger: "test".to_string(),
+                day_epoch_secs: Some(epoch),
+                source_paths: Vec::new(),
+                dry_run: false,
+            },
+        )
+        .expect("wisdom distill should succeed");
+
+        let memory = fs::read_to_string(&paths.memory_file).expect("read memory");
+        assert!(memory.starts_with("# MEMORY"));
+        assert!(memory.contains("## Lessons Learned"));
+        assert!(memory.contains("## User Preferences"));
+        assert!(memory.contains("## Durable Decisions & Context"));
+        assert!(!memory.contains("MOON_WISDOM_BEGIN"));
+        assert_eq!(out.summary_path, paths.memory_file.display().to_string());
+
+        let audit_path = PathBuf::from(&out.audit_log_path);
+        let audit = fs::read_to_string(audit_path).expect("read distill audit log");
+        assert!(audit.contains("\"mode\":\"syns\""));
+        assert!(audit.contains("\"trigger\":\"test\""));
+
+        if let Some(previous) = prior_provider {
+            unsafe {
+                std::env::set_var("MOON_WISDOM_PROVIDER", previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("MOON_WISDOM_PROVIDER");
+            }
+        }
+    }
+
+    #[test]
+    fn run_wisdom_distillation_explicit_sources_do_not_implicitly_include_memory() {
+        let tmp = tempdir().expect("tempdir");
+        let paths = make_test_paths(tmp.path());
+        fs::create_dir_all(&paths.memory_dir).expect("mkdir memory");
+        fs::create_dir_all(&paths.logs_dir).expect("mkdir logs");
+        fs::write(
+            &paths.memory_file,
+            "# MEMORY\n\n## Lessons Learned\n- Legacy sentinel should be removed.\n",
+        )
+        .expect("write memory");
+
+        let source = tmp.path().join("custom-source.md");
+        fs::write(
+            &source,
+            r#"## Session x
+### Conversation
+**User:** Keep responses concise and practical.
+**Assistant:** Updated implementation and test flow.
+
+### Execution Summary
+- Goal: verify targeted synthesis
+- Key actions: selected explicit file sources only
+- Outcome: done
+"#,
+        )
+        .expect("write source");
+
+        let prior_provider = std::env::var("MOON_WISDOM_PROVIDER").ok();
+        unsafe {
+            std::env::set_var("MOON_WISDOM_PROVIDER", "local");
+        }
+
+        run_wisdom_distillation(
+            &paths,
+            &WisdomDistillInput {
+                trigger: "explicit-sources".to_string(),
+                day_epoch_secs: Some(1_700_000_000),
+                source_paths: vec![source.display().to_string()],
+                dry_run: false,
+            },
+        )
+        .expect("wisdom distill should succeed");
+
+        let memory = fs::read_to_string(&paths.memory_file).expect("read memory");
+        assert!(memory.starts_with("# MEMORY"));
+        assert!(!memory.contains("Legacy sentinel should be removed"));
+        assert!(memory.contains("## Lessons Learned"));
+        assert!(memory.contains("## User Preferences"));
+        assert!(memory.contains("## Durable Decisions & Context"));
+
+        if let Some(previous) = prior_provider {
+            unsafe {
+                std::env::set_var("MOON_WISDOM_PROVIDER", previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("MOON_WISDOM_PROVIDER");
+            }
+        }
     }
 }

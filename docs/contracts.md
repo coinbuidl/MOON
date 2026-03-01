@@ -38,7 +38,7 @@ Rules:
 Fields:
 1. `session_id: String`
 2. `archive_path: String`
-3. `provider: String` (`local` or `gemini-2.5-flash-lite`)
+3. `provider: String` (for example `l1-normaliser`, `local`, `openai`, `anthropic`, `gemini`, `openai-compatible`)
 4. `summary_path: String`
 5. `audit_log_path: String`
 6. `created_at_epoch_secs: u64`
@@ -60,6 +60,7 @@ Rules:
 2. Selection is deterministic: oldest pending archive day first, then up to `max_per_cycle`.
 3. `daily` mode attempts layer-2 distillation once per residential day after the latest archive has been idle for `idle_secs`.
 4. `manual` mode disables automatic layer-2 distillation; manual trigger is `moon-watch --once --distill-now`.
+5. Direct CLI triggers: `moon distill -mode norm` (L1 Normalisation) and `moon distill -mode syns` (L2 Synthesis).
 
 ## DaemonLockPayload
 

@@ -10,8 +10,7 @@ use crate::moon::config::{
 use crate::moon::continuity::{ContinuityOutcome, build_continuity};
 use crate::moon::daemon_lock::{DaemonLockPayload, daemon_lock_path, parse_daemon_lock_payload};
 use crate::moon::distill::{
-    DistillInput, DistillOutput, archive_file_size, distill_chunk_bytes, load_archive_excerpt,
-    run_chunked_archive_distillation, run_distillation,
+    DistillInput, DistillOutput, WisdomDistillInput, run_distillation, run_wisdom_distillation,
 };
 use crate::moon::embed::{self, EmbedCaller, EmbedRunError, EmbedRunOptions};
 use crate::moon::inbound_watch::{self, InboundWatchOutcome};
@@ -32,7 +31,6 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -42,8 +40,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD: u64 = 1_000_000;
-const MAX_HIGH_TOKEN_ALERT_SESSIONS: usize = 5;
 const BUILD_UUID: &str = env!("BUILD_UUID");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,22 +191,6 @@ fn effective_compaction_start_ratio(
         return policy.compaction_start_ratio;
     }
     cfg.thresholds.trigger_ratio
-}
-
-fn high_token_alert_threshold() -> u64 {
-    match env::var("MOON_HIGH_TOKEN_ALERT_THRESHOLD") {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD;
-            }
-            trimmed
-                .parse::<u64>()
-                .ok()
-                .unwrap_or(DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD)
-        }
-        Err(_) => DEFAULT_HIGH_TOKEN_ALERT_THRESHOLD,
-    }
 }
 
 fn resolve_session_file_from_id(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> {
@@ -526,7 +506,6 @@ fn select_pending_distill_candidates(
     paths: &crate::moon::paths::MoonPaths,
     state: &crate::moon::state::MoonState,
     max_per_cycle: u64,
-    distill_chunk_trigger_bytes: u64,
 ) -> Result<DistillSelection> {
     let mut notes = Vec::new();
     let mut distill_candidates = Vec::<(crate::moon::archive::ArchiveRecord, String)>::new();
@@ -593,10 +572,9 @@ fn select_pending_distill_candidates(
             }
         }
         notes.push(format!(
-            "selected_day={} selected={} chunk_trigger_bytes={} oversized_archives=chunked",
+            "selected_day={} selected={} source=projection-md",
             day_key,
             distill_candidates.len(),
-            distill_chunk_trigger_bytes
         ));
         if skipped_non_distillable > 0 {
             notes.push(format!(
@@ -742,47 +720,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     state.last_session_id = Some(usage.session_id.clone());
     state.last_usage_ratio = Some(usage.usage_ratio);
     state.last_provider = Some(usage.provider.clone());
-
-    let high_token_threshold = high_token_alert_threshold();
-    if high_token_threshold > 0 {
-        let mut high_token_sessions = Vec::<SessionUsageSnapshot>::new();
-        if let Some(batch) = &usage_batch {
-            high_token_sessions = batch
-                .sessions
-                .iter()
-                .filter(|snapshot| snapshot.used_tokens >= high_token_threshold)
-                .cloned()
-                .collect::<Vec<_>>();
-        } else if usage.used_tokens >= high_token_threshold {
-            high_token_sessions.push(usage.clone());
-        }
-
-        if !high_token_sessions.is_empty() {
-            high_token_sessions.sort_by(|left, right| right.used_tokens.cmp(&left.used_tokens));
-            let preview = high_token_sessions
-                .iter()
-                .take(MAX_HIGH_TOKEN_ALERT_SESSIONS)
-                .map(|snapshot| {
-                    format!(
-                        "{}:{}:{:.4}",
-                        snapshot.session_id, snapshot.used_tokens, snapshot.usage_ratio
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            audit::append_event(
-                &paths,
-                "watcher",
-                "alert",
-                &format!(
-                    "high-token usage threshold={} sessions={} top={}",
-                    high_token_threshold,
-                    high_token_sessions.len(),
-                    preview
-                ),
-            )?;
-        }
-    }
 
     let context_policy = cfg.context.as_ref();
     let effective_trigger_threshold = effective_compaction_start_ratio(&cfg, context_policy);
@@ -1134,7 +1071,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
 
     let mut distill_notes = Vec::<String>::new();
     let mut distill_candidates = Vec::<(crate::moon::archive::ArchiveRecord, String)>::new();
-    let distill_chunk_trigger_bytes = distill_chunk_bytes() as u64;
 
     let distill_trigger_mode = DistillTriggerMode::from_config_mode(&cfg.distill.mode);
     let residential_tz = parse_residential_tz(&cfg);
@@ -1149,12 +1085,7 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
             distill_notes.push("skipped reason=compaction-active".to_string());
         } else {
             distill_notes.push("manual_trigger=true".to_string());
-            match select_pending_distill_candidates(
-                &paths,
-                &state,
-                cfg.distill.max_per_cycle,
-                distill_chunk_trigger_bytes,
-            ) {
+            match select_pending_distill_candidates(&paths, &state, cfg.distill.max_per_cycle) {
                 Ok((candidates, notes)) => {
                     distill_candidates = candidates;
                     distill_notes.extend(notes);
@@ -1211,7 +1142,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                                 &paths,
                                 &state,
                                 cfg.distill.max_per_cycle,
-                                distill_chunk_trigger_bytes,
                             ) {
                                 Ok((candidates, notes)) => {
                                     distill_candidates = candidates;
@@ -1305,7 +1235,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                                 &paths,
                                 &state,
                                 cfg.distill.max_per_cycle,
-                                distill_chunk_trigger_bytes,
                             ) {
                                 Ok((candidates, notes)) => {
                                     distill_candidates = candidates;
@@ -1351,6 +1280,7 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         distill_notes.push("skipped reason=manual-mode".to_string());
     }
 
+    let mut layer1_distilled_any = false;
     if !distill_candidates.is_empty() {
         if !distill_notes.is_empty() {
             let selection_status = if distill_notes.iter().any(|note| {
@@ -1370,126 +1300,10 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
 
         for (record, distill_source_path) in distill_candidates {
             let archive_path = record.archive_path.clone();
-            let archive_size = match archive_file_size(&distill_source_path) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    audit::append_event(
-                        &paths,
-                        "distill",
-                        "degraded",
-                        &format!(
-                            "mode=idle archive={} distill_source={} source={} session={} reason=archive-stat-failed error={err:#}",
-                            record.archive_path,
-                            distill_source_path,
-                            record.source_path,
-                            record.session_id
-                        ),
-                    )?;
-                    continue;
-                }
-            };
-            if archive_size > distill_chunk_trigger_bytes {
-                let chunked_input = DistillInput {
-                    session_id: record.session_id.clone(),
-                    archive_path: distill_source_path.clone(),
-                    archive_text: String::new(),
-                    archive_epoch_secs: Some(record.created_at_epoch_secs),
-                };
-                match run_chunked_archive_distillation(&paths, &chunked_input) {
-                    Ok(chunked) => {
-                        let distill = DistillOutput {
-                            provider: chunked.provider,
-                            summary: chunked.summary,
-                            summary_path: chunked.summary_path,
-                            audit_log_path: chunked.audit_log_path,
-                            created_at_epoch_secs: chunked.created_at_epoch_secs,
-                        };
-
-                        state.last_distill_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-                        state
-                            .distilled_archives
-                            .insert(archive_path.clone(), usage.captured_at_epoch_secs);
-
-                        match build_continuity(
-                            &paths,
-                            &record.session_id,
-                            &record.archive_path,
-                            &distill.summary_path,
-                            extract_key_decisions(&distill.summary),
-                        ) {
-                            Ok(outcome) => {
-                                continuity_out = Some(outcome);
-                            }
-                            Err(err) => {
-                                warn::emit(WarnEvent {
-                                    code: "CONTINUITY_FAILED",
-                                    stage: "continuity",
-                                    action: "build-continuity",
-                                    session: &record.session_id,
-                                    archive: &record.archive_path,
-                                    source: &record.source_path,
-                                    retry: "retry-next-cycle",
-                                    reason: "continuity-build-failed",
-                                    err: &format!("{err:#}"),
-                                });
-                            }
-                        }
-                        distill_out = Some(distill);
-                    }
-                    Err(err) => {
-                        warn::emit(WarnEvent {
-                            code: "DISTILL_CHUNKED_FAILED",
-                            stage: "distill",
-                            action: "chunked-distill",
-                            session: &record.session_id,
-                            archive: &record.archive_path,
-                            source: &record.source_path,
-                            retry: "retry-next-cycle",
-                            reason: "chunked-distillation-failed",
-                            err: &format!("{err:#}"),
-                        });
-                        audit::append_event(
-                            &paths,
-                            "distill",
-                            "degraded",
-                            &format!(
-                                "mode=idle-chunked archive={} distill_source={} source={} session={} bytes={} chunk_trigger_bytes={} error={err:#}",
-                                record.archive_path,
-                                distill_source_path,
-                                record.source_path,
-                                record.session_id,
-                                archive_size,
-                                distill_chunk_trigger_bytes
-                            ),
-                        )?;
-                    }
-                }
-                continue;
-            }
-
-            let archive_text = match load_archive_excerpt(&distill_source_path) {
-                Ok(text) => text,
-                Err(err) => {
-                    audit::append_event(
-                        &paths,
-                        "distill",
-                        "degraded",
-                        &format!(
-                            "mode=idle archive={} distill_source={} source={} session={} reason=archive-read-failed error={err:#}",
-                            record.archive_path,
-                            distill_source_path,
-                            record.source_path,
-                            record.session_id
-                        ),
-                    )?;
-                    continue;
-                }
-            };
-
             let input = DistillInput {
                 session_id: record.session_id.clone(),
                 archive_path: distill_source_path.clone(),
-                archive_text,
+                archive_text: String::new(),
                 archive_epoch_secs: Some(record.created_at_epoch_secs),
             };
 
@@ -1524,6 +1338,7 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                             });
                         }
                     }
+                    layer1_distilled_any = true;
                     distill_out = Some(distill);
                 }
                 Err(err) => {
@@ -1543,15 +1358,51 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
                         "distill",
                         "degraded",
                         &format!(
-                            "mode=idle archive={} distill_source={} source={} session={} bytes={} error={err:#}",
+                            "mode=idle archive={} distill_source={} source={} session={} error={err:#}",
                             record.archive_path,
                             distill_source_path,
                             record.source_path,
-                            record.session_id,
-                            archive_size
+                            record.session_id
                         ),
                     )?;
                 }
+            }
+        }
+    }
+
+    if layer1_distilled_any {
+        match run_wisdom_distillation(
+            &paths,
+            &WisdomDistillInput {
+                trigger: "watcher".to_string(),
+                day_epoch_secs: Some(usage.captured_at_epoch_secs),
+                source_paths: Vec::new(),
+                dry_run: false,
+            },
+        ) {
+            Ok(wisdom) => {
+                distill_out = Some(wisdom);
+            }
+            Err(err) => {
+                warn::emit(WarnEvent {
+                    code: "WISDOM_DISTILL_FAILED",
+                    stage: "distill",
+                    action: "run-wisdom-distill",
+                    session: &usage.session_id,
+                    archive: "na",
+                    source: "na",
+                    retry: "retry-next-cycle",
+                    reason: "wisdom-distillation-failed",
+                    err: &format!("{err:#}"),
+                });
+                let _ = audit::append_event(
+                    &paths,
+                    "distill",
+                    "degraded",
+                    &format!(
+                        "mode=syns trigger=watcher error={err:#} fix=configure-primary-wisdom-model"
+                    ),
+                );
             }
         }
     }

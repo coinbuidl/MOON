@@ -1,4 +1,4 @@
-# Ã°Å¸Å’â„¢ M.O.O.N.
+# M.O.O.N.
 > **Strategic Memory Augmentation & Context Distillation System**
 
 ### <span style="font-family:'Orbitron','Bank Gothic','Eurostile',sans-serif;"><font color="#dd0000">M</font>emory</span>
@@ -8,7 +8,7 @@
 
 ---
 
-## Ã°Å¸â€ºÂ°Ã¯Â¸Â Tactical Overview
+## Tactical Overview
 **M.O.O.N.** is a high-performance, background-active memory optimiser designed to enhance AI systems with autonomous memory management. Like a tactical drone deployed in the heat of battle, it monitors, archives, and distills overwhelming context streams into high-signal structural intelligence.
 
 It optimizes the **OpenClaw** context window by minimizing token usage while ensuring the agent retains seamless retrieval of historical knowledge.
@@ -20,15 +20,15 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
 2.  **Semantic Context Retrieval**: moon writes a structured v2 markdown projection (`archives/mlib/*.md`) for each raw session archive (`archives/raw/*.jsonl`). Projections include:
     * Timeline table with UTC + local timestamps
     * Conversation summaries (user queries / assistant responses)
-    * Tool activity with contextual stitching (toolUse Ã¢â€ â€™ toolResult coupling)
+    * Tool activity with contextual stitching (`toolUse -> toolResult` coupling)
     * Pre-emptive noise filtering (`NO_REPLY`, process poll chatter, repetitive status echoes)
     * Keywords, topics, and compaction anchors
     * Natural language time markers for improved semantic recall
     * Side-effect priority classification for tool entries
-3.  **Tiered Distillation Pipeline**:
-    *   **Phase 1 (Raw Distillation)**: Automatically distills archive projection markdown (`archives/mlib/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) using cost-effective model tiers.
-    *   **Librarian Optimizations**: semantic de-duplication keeps final-state conclusions, and optional topic discovery (`distill.topic_discovery=true` in `moon.toml`) maintains a top-of-file entity anchor block in each daily memory file.
-    *   **Phase 2 (Strategic Integration)**: Facilitates the "upgrade" of daily insights into the global `MEMORY.md` by the primary agent.
+3.  **Two-Layer Memory Pipeline**:
+    *   **L1 Normalisation (`distill -mode norm`)**: deterministic filtering/normalisation from projection markdown (`archives/mlib/*.md`) into daily logs (`memory/YYYY-MM-DD.md`) without LLM summarisation.
+    *   **L2 Synthesis (`distill -mode syns`)**: model-driven synthesis that rewrites `memory.md` from selected source files.
+    *   **Source control for synthesis**: default is `today + memory.md`; explicit `-file` inputs synthesize only those files.
 4.  **Embed Lifecycle Management**:
     * Manual command: `moon moon-embed --name history --max-docs 25`
     * Capability negotiation against installed QMD (`bounded` required; otherwise treated as missing/degraded)
@@ -40,8 +40,8 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
 
 To ensure reliable long-term memory and optimal token hygiene, it is recommended to explicitly define the boundary between the **M.O.O.N.** (automated) and the **Agent** (strategic) within your workspace rules (e.g., `AGENTS.md`):
 
-*   **M.O.O.N. (Automated Lifecycle)**: Handles technical executionÃ¢â‚¬â€token compaction, short-term session state maintenance, and daily raw context distillation (writes to `memory/YYYY-MM-DD.md`).
-*   **Agent (Strategic Distillation)**: Responsible for high-level cognitive reviewÃ¢â‚¬â€auditing daily logs and migrating key strategic insights into the long-term `MEMORY.md`.
+*   **M.O.O.N. (Automated Lifecycle)**: Handles token compaction, short-term session state maintenance, L1 Normalisation to daily memory, and L2 Synthesis to `memory.md`.
+*   **Agent (Strategic Review)**: Audits memory quality, adjusts prompts/rules, and curates long-term memory direction.
 
 This modular architecture prevents the Agent from being overwhelmed by raw session data while ensuring that distilled knowledge is persisted with high signal-to-noise ratios.
 
@@ -50,7 +50,7 @@ This modular architecture prevents the Agent from being overwhelmed by raw sessi
 Keep both skill source files in this repo root:
 
 1. `SKILL.md` for admin/operator tasks (`install`, `verify`, `repair`, watcher lifecycle).
-2. `SKILL_SUBAGENT.md` for least-privilege sub-agent tasks (`moon-recall`, `moon-distill`, bounded `moon-embed`).
+2. `SKILL_SUBAGENT.md` for least-privilege sub-agent tasks (`moon-recall`, `distill`, bounded `moon-embed`).
 
 If your runtime expects installed skills at `$CODEX_HOME/skills/<name>/SKILL.md`,
 copy them as:
@@ -241,14 +241,22 @@ When `compaction_authority = "moon"`:
 5. OpenClaw may still auto-compact as a fallback on overflow/threshold paths.
 6. `moon status` reports a policy violation (`ok=false`) if OpenClaw config drifts from the expected mode for the selected authority.
 
-Cheaper distill profile (recommended for the agent):
+Synthesis model profile (recommended for the agent):
 
 ```bash
-# Distillation is the only stage that needs an LLM API key.
-# Use a low-cost model for daily distill jobs.
-MOON_DISTILL_PROVIDER=gemini
-MOON_DISTILL_MODEL=gemini-2.5-flash-lite
-GEMINI_API_KEY=...
+# `norm` uses no LLM.
+# LLM calls are used only by `syns`.
+# Recommend a high-reasoning model for better durable memory quality.
+MOON_WISDOM_PROVIDER=openai
+MOON_WISDOM_MODEL=gpt-4.1
+OPENAI_API_KEY=...
+
+# Alternative high-reasoning options:
+# MOON_WISDOM_PROVIDER=anthropic
+# MOON_WISDOM_MODEL=claude-3-7-sonnet-latest
+#
+# MOON_WISDOM_PROVIDER=gemini
+# MOON_WISDOM_MODEL=gemini-2.5-pro
 ```
 
 Distill safety guardrails (recommended):
@@ -282,29 +290,16 @@ Env-only guardrails (keep these in `.env`):
 
 ```bash
 
-# Archives larger than this threshold are chunk-distilled automatically.
-# Use `auto` to infer a safe chunk size from model context limits
-# when the provider exposes them (fallback heuristics are applied).
-# `auto` is also the runtime default if this variable is unset.
-MOON_DISTILL_CHUNK_BYTES=auto
+# Optional explicit context-window hints for `syns` large-file chunk planning.
+# If unset, moon auto-detects/infers context window per provider/model.
+# MOON_WISDOM_CONTEXT_TOKENS=200000
 
-# Safety ceiling for number of chunks processed per archive run.
-MOON_DISTILL_MAX_CHUNKS=128
-
-# Optional explicit model context hint for `auto` mode.
-# This only influences moon distill chunk sizing; it does NOT set
-# `agents.defaults.contextTokens` in OpenClaw.
-# MOON_DISTILL_MODEL_CONTEXT_TOKENS=250000
-
-# Background watcher alert threshold for extreme token usage (0 disables alert).
-# Default is 1,000,000 tokens.
-MOON_HIGH_TOKEN_ALERT_THRESHOLD=1000000
 ```
 
-Cheapest possible mode (zero API cost, local-only distillation):
+Cheapest possible mode (zero API cost, local-only synthesis):
 
 ```bash
-MOON_DISTILL_PROVIDER=local
+MOON_WISDOM_PROVIDER=local
 ```
 
 Run a few basics (assuming `moon` is installed in `$PATH`, otherwise prefix with `cargo run -- `):
@@ -347,9 +342,12 @@ Commands:
 10. `moon-stop`
 11. `moon-embed [--name <collection>] [--max-docs <N>] [--dry-run] [--watcher-trigger]`
 12. `moon-recall --query <text> [--name <collection>]`
-13. `moon-distill --archive <path> [--session-id <id>] [--allow-large-archive] [--dry-run]`
-    - default: archives larger than `MOON_DISTILL_CHUNK_BYTES` are auto-distilled in chunks
-    - `--allow-large-archive`: force single-pass distill above the chunk threshold
+13. `distill -mode <norm|syns> [-archive <path>] [-session-id <id>] [-file <path> ...] [-dry-run]`
+    - `-mode norm` (default): L1 Normalisation for one projection file (`archives/mlib/*.md`) into daily memory
+    - `-mode syns`: L2 Synthesis rewrites the whole `memory.md` from synthesis output
+    - `-mode syns` default sources: today's daily memory + current `memory.md`
+    - `-mode syns -file <path> ...`: distill only those files together; `memory.md` participates only if explicitly included as a `-file`
+    - `moon-distill` remains as a backward-compatible alias
 14. `config [--show]`
 15. `moon-health`
 
@@ -494,22 +492,19 @@ Most-used `.env` variables:
 4. `MOON_CONFIG_PATH`
 5. `MOON_STATE_FILE` / `MOON_STATE_DIR`
 6. `OPENCLAW_SESSIONS_DIR`
-7. `MOON_DISTILL_PROVIDER`
-8. `MOON_DISTILL_MODEL`
-9. `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `AI_API_KEY` (distill only)
-10. `MOON_DISTILL_CHUNK_BYTES` (default `auto`; use numeric bytes to force a fixed threshold)
-11. `MOON_DISTILL_MAX_CHUNKS` (default `128`)
-12. `MOON_DISTILL_MODEL_CONTEXT_TOKENS` (optional context hint used by `MOON_DISTILL_CHUNK_BYTES=auto`)
-13. `MOON_HIGH_TOKEN_ALERT_THRESHOLD` (default `1000000`; set `0` to disable)
-14. `MOON_ENABLE_COMPACTION_WRITE`
-15. `MOON_ENABLE_SESSION_ROLLOVER`
-16. `MOON_EMBED_MODE` (`auto`; legacy aliases `idle` and `manual` normalize to `auto`)
-17. `MOON_EMBED_IDLE_SECS` (legacy compatibility knob; no watcher gate effect)
-18. `MOON_EMBED_COOLDOWN_SECS`
-19. `MOON_EMBED_MAX_DOCS_PER_CYCLE`
-20. `MOON_EMBED_MIN_PENDING_DOCS`
-21. `MOON_EMBED_MAX_CYCLE_SECS`
-22. `MOON_HEALTH_MAX_CYCLE_AGE_SECS` (health freshness threshold; default `600`)
+7. `MOON_WISDOM_PROVIDER` (primary provider selector for `distill -mode syns`)
+8. `MOON_WISDOM_MODEL` (primary model selector for `syns`)
+9. `MOON_WISDOM_CONTEXT_TOKENS` (optional context-window hint for large-file chunk planning in `syns`)
+10. `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `AI_API_KEY` (for `syns`)
+11. `MOON_ENABLE_COMPACTION_WRITE`
+12. `MOON_ENABLE_SESSION_ROLLOVER`
+13. `MOON_EMBED_MODE` (`auto`; legacy aliases `idle` and `manual` normalize to `auto`)
+14. `MOON_EMBED_IDLE_SECS` (legacy compatibility knob; no watcher gate effect)
+15. `MOON_EMBED_COOLDOWN_SECS`
+16. `MOON_EMBED_MAX_DOCS_PER_CYCLE`
+17. `MOON_EMBED_MIN_PENDING_DOCS`
+18. `MOON_EMBED_MAX_CYCLE_SECS`
+19. `MOON_HEALTH_MAX_CYCLE_AGE_SECS` (health freshness threshold; default `600`)
 
 Config hardening behaviors:
 

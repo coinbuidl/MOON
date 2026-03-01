@@ -48,8 +48,32 @@ moon moon-health
 ## Manual Distill
 
 ```bash
-moon moon-distill --archive $MOON_ARCHIVES_DIR/raw/<file>.jsonl --session-id <id>
+moon distill -mode norm -archive $MOON_ARCHIVES_DIR/mlib/<file>.md -session-id <id>
 ```
+
+Manual Layer-2 distillation:
+
+```bash
+moon distill -mode syns
+```
+
+Recommended `syns` model config (high reasoning quality):
+
+```bash
+MOON_WISDOM_PROVIDER=openai
+MOON_WISDOM_MODEL=gpt-4.1
+OPENAI_API_KEY=...
+```
+
+Default `syns` sources are today's `memory/YYYY-MM-DD.md` plus current `memory.md`.
+
+Layer-2 distillation from explicit file set only:
+
+```bash
+moon distill -mode syns -file $MOON_MEMORY_DIR/2026-03-01.md -file $MOON_MEMORY_DIR/2026-03-02.md
+```
+
+When `-file` is provided, only the listed files participate. `memory.md` is included only if explicitly listed.
 
 Manual layer-2 queue trigger (same selection logic as watcher):
 
@@ -94,9 +118,9 @@ moon moon-index --name history
 2. QMD indexing/search fails:
 - set `QMD_BIN`
 - verify `qmd collection add` and `qmd search` work manually
-3. Distill not using Gemini:
-- set `GEMINI_API_KEY`
-- optional model override: `MOON_GEMINI_MODEL`
+3. `syns` not using remote reasoning model:
+- set one provider API key (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` or `AI_API_KEY`)
+- set `MOON_WISDOM_PROVIDER` and `MOON_WISDOM_MODEL`
 4. Session rollover fails:
 - set `MOON_SESSION_ROLLOVER_CMD` to your environment-specific command
 - continuity map still persists with `rollover_ok=false`

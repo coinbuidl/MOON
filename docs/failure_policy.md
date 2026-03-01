@@ -12,7 +12,7 @@
 
 1. `INDEX_FAILED`
 2. `DISTILL_FAILED`
-3. `DISTILL_CHUNKED_FAILED`
+3. `WISDOM_DISTILL_FAILED`
 4. `CONTINUITY_FAILED`
 5. `RETENTION_DELETE_FAILED`
 6. `LEDGER_READ_FAILED`
@@ -27,7 +27,7 @@
 ## Warning Triage
 
 1. `INDEX_FAILED`: verify `QMD_BIN`, `qmd collection add`, and `qmd update`.
-2. `DISTILL_FAILED` / `DISTILL_CHUNKED_FAILED`: verify distill provider credentials/model and archive readability.
+2. `DISTILL_FAILED` / `WISDOM_DISTILL_FAILED`: verify distill provider credentials/model and source readability.
 3. `CONTINUITY_FAILED`: verify session rollover command and continuity map write permissions.
 4. `RETENTION_DELETE_FAILED`: verify archive file permissions and filesystem health.
 5. `LEDGER_READ_FAILED`: verify `archives/ledger.jsonl` exists and contains valid JSONL records.
@@ -95,12 +95,12 @@ Policy:
 ## Distill Stage
 
 Failure:
-1. Gemini API unavailable/timeout.
+1. Remote synthesis provider unavailable/timeout.
 2. Parsing/output contract failure.
 
 Policy:
-1. Fallback to local distiller.
-2. If local also fails, skip continuity rollover and keep archive for recall.
+1. Skip synthesis for this run and emit a degraded warning.
+2. Ask user/operator to fix primary synthesis configuration (`MOON_WISDOM_PROVIDER`, `MOON_WISDOM_MODEL`, provider API key), then retry.
 
 ## Continuity/Rollover Stage
 

@@ -6,9 +6,13 @@ Use this skill when a sub-agent needs memory search/distill/embed functions only
 
 1. Search history:
 `moon moon-recall --name history --query "<keywords>"`
-2. Distill one archive:
-`moon moon-distill --archive <path-to-archive-jsonl>`
-3. Embed bounded batches:
+2. L1 Normalisation (one projection file):
+`moon distill -mode norm -archive <path-to-archive-md> [-session-id <id>]`
+3. L2 Synthesis (whole `memory.md` rewrite):
+`moon distill -mode syns`
+4. L2 Synthesis from explicit sources only:
+`moon distill -mode syns -file <path> [-file <path> ...]`
+5. Embed bounded batches:
 `moon moon-embed --name history --max-docs <N>`
 
 ## Operating Rules
