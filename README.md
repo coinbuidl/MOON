@@ -33,7 +33,7 @@ It optimizes the **OpenClaw** context window by minimizing token usage while ens
     * Manual command: `moon moon-embed --name history --max-docs 25`
     * Capability negotiation against installed QMD (`bounded` required; otherwise treated as missing/degraded)
     * Single-flight lock (`$MOON_LOGS_DIR/moon-embed.lock`) to avoid overlapping embed workers
-    * Watcher embed runs automatically near the end of each cycle (after compaction/distill stages), then continues on cooldown-driven cycles
+    * Watcher embed runs automatically after compaction/L1 stages and before daily `syns`, then continues on cooldown-driven cycles
     * Bounded-only execution (`--max-docs`): no unbounded fallback path
 
 ## Recommended Agent Integration
@@ -460,7 +460,7 @@ Retention lifecycle windows:
 Embed lifecycle windows:
 
 1. Watcher embed is always auto (legacy `embed.mode` values normalize to `auto`).
-2. Watcher attempts embed near the end of each cycle (after compaction/distill stages), then on subsequent cycles.
+2. Watcher attempts embed after compaction/L1 stages and before daily `syns` when `syns` is due.
 3. Watcher execution is gated by `embed.cooldown_secs` and `embed.min_pending_docs`.
 4. Manual `moon-embed` runs immediately and bypasses watcher cooldown gating.
 5. Manual `moon-embed` does not reset the watcher cooldown clock.

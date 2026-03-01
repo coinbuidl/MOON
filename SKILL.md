@@ -21,7 +21,7 @@ This skill covers:
 10. On current OpenClaw versions, auto-compaction cannot be hard-disabled via config mode; treat moon as primary compaction orchestrator with OpenClaw fallback.
 11. If `moon status` reports `context policy drift`, fix with `moon install` (or `moon repair`) and re-check before continuing.
 12. Use `moon moon-embed` for manual embedding refresh (`--max-docs` bounded sprint runs). Manual runs trigger immediately and bypass watcher cooldown gates.
-13. Watcher embed is always auto and runs near the end of each cycle (after compaction/distill stages), then on cooldown-driven cycles. Gating is `[embed].cooldown_secs` + `[embed].min_pending_docs`; `[embed].idle_secs` is legacy compatibility only.
+13. Watcher embed is always auto and runs after compaction/L1 stages and before daily `syns` when due. Gating is `[embed].cooldown_secs` + `[embed].min_pending_docs`; `[embed].idle_secs` is legacy compatibility only.
 14. Manual embed must not alter watcher cooldown timing; watcher cooldown continues from watcher-trigger timestamps only.
 15. Keep embed bounded-only. If QMD lacks `--max-docs`, watcher degrades and manual embed returns capability-missing (no unbounded fallback).
 16. Embed lock is non-blocking: watcher reports degraded/locked and retries next cycle; manual command returns lock error immediately (no queue/wait behavior).

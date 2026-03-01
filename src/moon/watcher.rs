@@ -1388,53 +1388,6 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         }
     }
 
-    // Run L2 synthesis once per residential day (first watcher cycle after midnight),
-    // targeting today's daily memory file only.
-    if last_syns_day_key.as_deref() != Some(current_day_key.as_str()) {
-        let syns_source_day_key =
-            previous_day_key_for_epoch_in_timezone(usage.captured_at_epoch_secs, residential_tz);
-        let mut syns_sources = vec![daily_memory_path_for_day_key(&paths, &syns_source_day_key)];
-        if paths.memory_file.exists() {
-            syns_sources.push(paths.memory_file.display().to_string());
-        }
-        match run_wisdom_distillation(
-            &paths,
-            &WisdomDistillInput {
-                trigger: "watcher".to_string(),
-                day_epoch_secs: Some(usage.captured_at_epoch_secs),
-                source_paths: syns_sources,
-                dry_run: false,
-            },
-        ) {
-            Ok(wisdom) => {
-                state.last_syns_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-                distill_out = Some(wisdom);
-            }
-            Err(err) => {
-                state.last_syns_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-                warn::emit(WarnEvent {
-                    code: "WISDOM_DISTILL_FAILED",
-                    stage: "distill",
-                    action: "run-wisdom-distill",
-                    session: &usage.session_id,
-                    archive: "na",
-                    source: "na",
-                    retry: "retry-next-cycle",
-                    reason: "wisdom-distillation-failed",
-                    err: &format!("{err:#}"),
-                });
-                let _ = audit::append_event(
-                    &paths,
-                    "distill",
-                    "degraded",
-                    &format!(
-                        "mode=syns trigger=watcher error={err:#} fix=configure-primary-wisdom-model"
-                    ),
-                );
-            }
-        }
-    }
-
     let embed_started = Instant::now();
     let embed_run_opts = EmbedRunOptions {
         collection_name: "history".to_string(),
@@ -1540,6 +1493,53 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
             embed_result = Some(format!("{current} {timeout_note}"));
         } else {
             embed_result = Some(timeout_note);
+        }
+    }
+
+    // Run L2 synthesis once per residential day (first watcher cycle after midnight),
+    // after embed stage. Sources: yesterday daily memory + current memory.md (if present).
+    if last_syns_day_key.as_deref() != Some(current_day_key.as_str()) {
+        let syns_source_day_key =
+            previous_day_key_for_epoch_in_timezone(usage.captured_at_epoch_secs, residential_tz);
+        let mut syns_sources = vec![daily_memory_path_for_day_key(&paths, &syns_source_day_key)];
+        if paths.memory_file.exists() {
+            syns_sources.push(paths.memory_file.display().to_string());
+        }
+        match run_wisdom_distillation(
+            &paths,
+            &WisdomDistillInput {
+                trigger: "watcher".to_string(),
+                day_epoch_secs: Some(usage.captured_at_epoch_secs),
+                source_paths: syns_sources,
+                dry_run: false,
+            },
+        ) {
+            Ok(wisdom) => {
+                state.last_syns_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
+                distill_out = Some(wisdom);
+            }
+            Err(err) => {
+                state.last_syns_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
+                warn::emit(WarnEvent {
+                    code: "WISDOM_DISTILL_FAILED",
+                    stage: "distill",
+                    action: "run-wisdom-distill",
+                    session: &usage.session_id,
+                    archive: "na",
+                    source: "na",
+                    retry: "retry-next-cycle",
+                    reason: "wisdom-distillation-failed",
+                    err: &format!("{err:#}"),
+                });
+                let _ = audit::append_event(
+                    &paths,
+                    "distill",
+                    "degraded",
+                    &format!(
+                        "mode=syns trigger=watcher error={err:#} fix=configure-primary-wisdom-model"
+                    ),
+                );
+            }
         }
     }
 
