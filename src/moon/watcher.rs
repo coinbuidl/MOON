@@ -1101,35 +1101,29 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
         .map(|epoch| day_key_for_epoch_in_timezone(epoch, residential_tz));
 
     if run_opts.force_distill_now {
-        if !compaction_targets.is_empty() {
-            distill_notes.push("skipped reason=compaction-active".to_string());
-        } else {
-            distill_notes.push("manual_trigger=true".to_string());
-            match select_pending_distill_candidates(&paths, &state, cfg.distill.max_per_cycle) {
-                Ok((candidates, notes)) => {
-                    distill_candidates = candidates;
-                    distill_notes.extend(notes);
-                }
-                Err(err) => {
-                    warn::emit(WarnEvent {
-                        code: "LEDGER_READ_FAILED",
-                        stage: "distill-selection",
-                        action: "read-ledger",
-                        session: "na",
-                        archive: "na",
-                        source: "na",
-                        retry: "retry-next-cycle",
-                        reason: "ledger-read-failed",
-                        err: &format!("{err:#}"),
-                    });
-                    distill_notes.push(format!("skipped reason=ledger-read-failed error={err:#}"))
-                }
+        distill_notes.push("manual_trigger=true".to_string());
+        match select_pending_distill_candidates(&paths, &state, cfg.distill.max_per_cycle) {
+            Ok((candidates, notes)) => {
+                distill_candidates = candidates;
+                distill_notes.extend(notes);
+            }
+            Err(err) => {
+                warn::emit(WarnEvent {
+                    code: "LEDGER_READ_FAILED",
+                    stage: "distill-selection",
+                    action: "read-ledger",
+                    session: "na",
+                    archive: "na",
+                    source: "na",
+                    retry: "retry-next-cycle",
+                    reason: "ledger-read-failed",
+                    err: &format!("{err:#}"),
+                });
+                distill_notes.push(format!("skipped reason=ledger-read-failed error={err:#}"))
             }
         }
     } else if matches!(distill_trigger_mode, DistillTriggerMode::Idle) {
-        if !compaction_targets.is_empty() {
-            distill_notes.push("skipped reason=compaction-active".to_string());
-        } else if !is_cooldown_ready(
+        if !is_cooldown_ready(
             state.last_distill_trigger_epoch_secs,
             usage.captured_at_epoch_secs,
             cfg.watcher.cooldown_secs,
@@ -1204,9 +1198,7 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
             }
         }
     } else if matches!(distill_trigger_mode, DistillTriggerMode::Daily) {
-        if !compaction_targets.is_empty() {
-            distill_notes.push("skipped reason=compaction-active".to_string());
-        } else if last_distill_day_key.as_deref() == Some(current_day_key.as_str()) {
+        if last_distill_day_key.as_deref() == Some(current_day_key.as_str()) {
             distill_notes.push(format!(
                 "skipped reason=already-attempted-today day_key={} timezone={}",
                 current_day_key,
