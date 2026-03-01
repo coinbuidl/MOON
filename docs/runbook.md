@@ -31,7 +31,7 @@ Distill trigger behavior:
 
 Retention windows:
 
-1. Active (`<=7` days), warm (`8-30` days), cold candidate (`>=31` days).
+1. Active (`<= active_days`), warm (`<= warm_days`), cold candidate (`>= cold_days`).
 2. Cold deletion requires a distill marker in state for that archive.
 
 ## Start Daemon

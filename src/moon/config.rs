@@ -4,6 +4,10 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+mod generated_env_allowlist {
+    include!(concat!(env!("OUT_DIR"), "/moon_env_allowlist.rs"));
+}
+
 pub const SECRET_ENV_KEYS: [&str; 4] = [
     "GEMINI_API_KEY",
     "OPENAI_API_KEY",
@@ -65,6 +69,12 @@ pub struct MoonDistillConfig {
     pub residential_timezone: String,
     #[serde(default)]
     pub topic_discovery: bool,
+    #[serde(default)]
+    pub chunk_bytes: Option<String>,
+    #[serde(default)]
+    pub max_chunks: Option<u64>,
+    #[serde(default)]
+    pub model_context_tokens: Option<u64>,
 }
 
 fn default_residential_timezone() -> String {
@@ -77,6 +87,9 @@ impl Default for MoonDistillConfig {
             max_per_cycle: 1,
             residential_timezone: "UTC".to_string(),
             topic_discovery: false,
+            chunk_bytes: None,
+            max_chunks: None,
+            model_context_tokens: None,
         }
     }
 }
@@ -294,6 +307,22 @@ fn validate(cfg: &MoonConfig) -> Result<()> {
     if cfg.distill.max_per_cycle == 0 {
         return Err(anyhow!("invalid distill max per cycle: must be >= 1"));
     }
+    if let Some(max_chunks) = cfg.distill.max_chunks
+        && max_chunks == 0
+    {
+        return Err(anyhow!("invalid distill max_chunks: must be >= 1"));
+    }
+    if let Some(chunk_bytes) = &cfg.distill.chunk_bytes {
+        let trimmed = chunk_bytes.trim();
+        if !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case("auto")
+            && trimmed.parse::<usize>().ok().filter(|v| *v > 0).is_none()
+        {
+            return Err(anyhow!(
+                "invalid distill chunk_bytes: use `auto` or a positive integer"
+            ));
+        }
+    }
     if cfg.retention.active_days == 0 {
         return Err(anyhow!("invalid retention active days: must be >= 1"));
     }
@@ -497,39 +526,7 @@ pub fn masked_env_secret(var: &str) -> String {
 }
 
 fn env_allowlist() -> &'static [&'static str] {
-    &[
-        "MOON_HOME",
-        "MOON_CONFIG_PATH",
-        "MOON_STATE_FILE",
-        "MOON_STATE_DIR",
-        "MOON_ARCHIVES_DIR",
-        "MOON_MEMORY_DIR",
-        "MOON_MEMORY_FILE",
-        "MOON_LOGS_DIR",
-        "MOON_TRIGGER_RATIO",
-        "MOON_THRESHOLD_COMPACTION_RATIO",
-        "MOON_THRESHOLD_PRUNE_RATIO",
-        "MOON_THRESHOLD_ARCHIVE_RATIO",
-        "MOON_POLL_INTERVAL_SECS",
-        "MOON_COOLDOWN_SECS",
-        "MOON_INBOUND_WATCH_ENABLED",
-        "MOON_INBOUND_RECURSIVE",
-        "MOON_INBOUND_EVENT_MODE",
-        "MOON_INBOUND_WATCH_PATHS",
-        "MOON_DISTILL_MAX_PER_CYCLE",
-        "MOON_RESIDENTIAL_TIMEZONE",
-        "MOON_TOPIC_DISCOVERY",
-        "MOON_RETENTION_ACTIVE_DAYS",
-        "MOON_RETENTION_WARM_DAYS",
-        "MOON_RETENTION_COLD_DAYS",
-        "MOON_EMBED_MODE",
-        "MOON_EMBED_IDLE_SECS",
-        "MOON_EMBED_COOLDOWN_SECS",
-        "MOON_EMBED_MAX_DOCS_PER_CYCLE",
-        "MOON_EMBED_MIN_PENDING_DOCS",
-        "MOON_EMBED_MAX_CYCLE_SECS",
-        "MOON_DISTILL_CHUNK_TRIGGER_BYTES",
-    ]
+    generated_env_allowlist::GENERATED_MOON_ENV_ALLOWLIST
 }
 
 fn levenshtein_distance(left: &str, right: &str) -> usize {

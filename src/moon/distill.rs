@@ -481,6 +481,11 @@ fn detect_auto_chunk_bytes() -> usize {
     if let Some(tokens) = parse_env_u64("MOON_DISTILL_MODEL_CONTEXT_TOKENS") {
         return token_limit_to_chunk_bytes(tokens);
     }
+    if let Ok(cfg) = crate::moon::config::load_config()
+        && let Some(tokens) = cfg.distill.model_context_tokens
+    {
+        return token_limit_to_chunk_bytes(tokens);
+    }
 
     if let Some(remote) = resolve_remote_config() {
         if let Some(tokens) = detect_context_tokens_from_remote(&remote) {
@@ -513,7 +518,23 @@ pub fn distill_chunk_bytes() -> usize {
                 .unwrap_or(DEFAULT_DISTILL_CHUNK_BYTES)
                 .max(MIN_DISTILL_CHUNK_BYTES)
         }
-        Err(_) => auto(),
+        Err(_) => {
+            if let Ok(cfg) = crate::moon::config::load_config()
+                && let Some(raw) = cfg.distill.chunk_bytes
+            {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+                    return auto();
+                }
+                return trimmed
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_DISTILL_CHUNK_BYTES)
+                    .max(MIN_DISTILL_CHUNK_BYTES);
+            }
+            auto()
+        }
     }
 }
 
@@ -530,7 +551,17 @@ fn distill_max_chunks() -> usize {
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_DISTILL_MAX_CHUNKS)
         }
-        Err(_) => DEFAULT_DISTILL_MAX_CHUNKS,
+        Err(_) => {
+            if let Ok(cfg) = crate::moon::config::load_config()
+                && let Some(max_chunks) = cfg.distill.max_chunks
+            {
+                return usize::try_from(max_chunks)
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .unwrap_or(DEFAULT_DISTILL_MAX_CHUNKS);
+            }
+            DEFAULT_DISTILL_MAX_CHUNKS
+        }
     }
 }
 

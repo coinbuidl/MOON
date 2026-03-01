@@ -1,7 +1,7 @@
 [context]
-window_mode = "inherit"
+window_mode = "fixed"
 # Required when window_mode = "fixed"
-# window_tokens = 200000
+window_tokens = 200000
 prune_mode = "disabled"
 compaction_authority = "moon"
 compaction_start_ratio = 0.5
@@ -9,22 +9,26 @@ compaction_emergency_ratio = 0.90
 
 [watcher]
 poll_interval_secs = 30
-cooldown_secs = 60
+cooldown_secs = 30
 
 [distill]
 max_per_cycle = 3
 residential_timezone = "UTC"
 topic_discovery = true
+# L1 archive chunk controls (optional; env fallback still supported).
+# chunk_bytes = "auto"
+# max_chunks = 128
+# model_context_tokens = 200000
 
 [retention]
 active_days = 7
 warm_days = 30
-cold_days = 31
+cold_days = 60
 
 [embed]
 mode = "auto"
 cooldown_secs = 60
-max_docs_per_cycle = 10
+max_docs_per_cycle = 3
 min_pending_docs = 1
 max_cycle_secs = 300
 

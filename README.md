@@ -224,11 +224,11 @@ Context policy (optional but recommended when moon owns compaction):
 
 ```toml
 [context]
-window_mode = "inherit"            # or "fixed" with window_tokens
-# window_tokens = 200000
+window_mode = "fixed"
+window_tokens = 200000
 prune_mode = "disabled"            # "disabled" or "guarded"
 compaction_authority = "moon"      # "moon" or "openclaw"
-compaction_start_ratio = 0.78
+compaction_start_ratio = 0.50
 compaction_emergency_ratio = 0.90
 ```
 
@@ -263,28 +263,40 @@ Distill safety guardrails (recommended):
 
 ```toml
 [context]
-window_mode = "inherit"
+window_mode = "fixed"
+window_tokens = 200000
 prune_mode = "disabled"
 compaction_authority = "moon"
-compaction_start_ratio = 0.78
+compaction_start_ratio = 0.50
 compaction_emergency_ratio = 0.90
 
 [watcher]
 poll_interval_secs = 30
-cooldown_secs = 60
+cooldown_secs = 30
 
 [distill]
 max_per_cycle = 3
 residential_timezone = "UTC"
 topic_discovery = true
+# Optional L1 chunk planning controls:
+# chunk_bytes = "auto"
+# max_chunks = 128
+# model_context_tokens = 200000
 
 [retention]
 active_days = 7
 warm_days = 30
-cold_days = 31
+cold_days = 60
+
+[embed]
+mode = "auto"
+cooldown_secs = 60
+max_docs_per_cycle = 3
+min_pending_docs = 1
+max_cycle_secs = 300
 ```
 
-Env-only guardrails (keep these in `.env`):
+Optional env overrides (keep these in `.env` only when needed):
 
 ```bash
 
@@ -508,7 +520,7 @@ Most-used `.env` variables:
 
 Config hardening behaviors:
 
-1. Unknown `MOON_*` variables are warned on startup, with typo suggestions when close matches exist.
+1. Unknown `MOON_*` variables are warned on startup, with typo suggestions when close matches exist (allowlist is generated from source at build time).
 2. `moon config --show` prints fully resolved config values (defaults -> `moon.toml` -> env overrides).
 3. Secret env values are masked in diagnostics (`moon-status`, `config --show`).
 
@@ -516,7 +528,7 @@ Primary tuning belongs in `moon.toml`:
 
 1. `[context] window_mode`, `window_tokens`, `prune_mode`, `compaction_authority`, `compaction_start_ratio`, `compaction_emergency_ratio`
 2. `[watcher] poll_interval_secs`, `cooldown_secs`
-3. `[distill] max_per_cycle`, `residential_timezone`, `topic_discovery`
+3. `[distill] max_per_cycle`, `residential_timezone`, `topic_discovery`, `chunk_bytes`, `max_chunks`, `model_context_tokens`
 4. `[retention] active_days`, `warm_days`, `cold_days`
 5. `[embed] mode` (fixed `auto`; legacy aliases normalize), `idle_secs` (legacy compatibility), `cooldown_secs`, `max_docs_per_cycle`, `min_pending_docs`, `max_cycle_secs`
 6. `[inbound_watch] enabled`, `recursive`, `watch_paths`, `event_mode`

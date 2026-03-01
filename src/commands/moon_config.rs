@@ -68,6 +68,12 @@ pub fn run(opts: &MoonConfigOptions) -> Result<CommandReport> {
             "distill.topic_discovery={}",
             cfg.distill.topic_discovery
         ));
+        report.detail(format!("distill.chunk_bytes={:?}", cfg.distill.chunk_bytes));
+        report.detail(format!("distill.max_chunks={:?}", cfg.distill.max_chunks));
+        report.detail(format!(
+            "distill.model_context_tokens={:?}",
+            cfg.distill.model_context_tokens
+        ));
         report.detail(format!(
             "retention.active_days={}",
             cfg.retention.active_days

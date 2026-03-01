@@ -53,6 +53,9 @@ Fields:
 1. `watcher.cooldown_secs: u64`
 2. `distill.max_per_cycle: u64`
 3. `distill.residential_timezone: String` (IANA TZ; default `UTC`)
+4. `distill.chunk_bytes: Option<String>` (`"auto"` or positive integer)
+5. `distill.max_chunks: Option<u64>` (`>= 1` when set)
+6. `distill.model_context_tokens: Option<u64>` (`>= 1` when set)
 
 Rules:
 1. Watcher auto L1 runs only when cooldown passes and pending projection markdown exists in `archives/mlib/*.md`.
