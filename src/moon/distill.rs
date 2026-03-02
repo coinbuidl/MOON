@@ -3669,8 +3669,40 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
+
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe {
+                    std::env::set_var(self.key, previous);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     fn make_test_paths(root: &std::path::Path) -> MoonPaths {
         MoonPaths {
@@ -4248,15 +4280,14 @@ filtered_noise_count: 2
 
     #[test]
     fn run_wisdom_distillation_updates_memory_file_and_audit_log() {
+        let _env_lock = TEST_ENV_LOCK.lock().expect("lock test env");
+        let _provider = ScopedEnvVar::set("MOON_WISDOM_PROVIDER", "local");
+
         let tmp = tempdir().expect("tempdir");
         let paths = make_test_paths(tmp.path());
         fs::create_dir_all(&paths.memory_dir).expect("mkdir memory");
         fs::create_dir_all(&paths.logs_dir).expect("mkdir logs");
         fs::write(&paths.memory_file, "# MEMORY\n").expect("write memory");
-        let prior_provider = std::env::var("MOON_WISDOM_PROVIDER").ok();
-        unsafe {
-            std::env::set_var("MOON_WISDOM_PROVIDER", "local");
-        }
 
         let epoch = 1_700_000_000u64;
         let daily_path = super::daily_memory_path(&paths, Some(epoch));
@@ -4302,20 +4333,13 @@ filtered_noise_count: 2
         let audit = fs::read_to_string(audit_path).expect("read distill audit log");
         assert!(audit.contains("\"mode\":\"syns\""));
         assert!(audit.contains("\"trigger\":\"test\""));
-
-        if let Some(previous) = prior_provider {
-            unsafe {
-                std::env::set_var("MOON_WISDOM_PROVIDER", previous);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("MOON_WISDOM_PROVIDER");
-            }
-        }
     }
 
     #[test]
     fn run_wisdom_distillation_explicit_sources_do_not_implicitly_include_memory() {
+        let _env_lock = TEST_ENV_LOCK.lock().expect("lock test env");
+        let _provider = ScopedEnvVar::set("MOON_WISDOM_PROVIDER", "local");
+
         let tmp = tempdir().expect("tempdir");
         let paths = make_test_paths(tmp.path());
         fs::create_dir_all(&paths.memory_dir).expect("mkdir memory");
@@ -4342,11 +4366,6 @@ filtered_noise_count: 2
         )
         .expect("write source");
 
-        let prior_provider = std::env::var("MOON_WISDOM_PROVIDER").ok();
-        unsafe {
-            std::env::set_var("MOON_WISDOM_PROVIDER", "local");
-        }
-
         run_wisdom_distillation(
             &paths,
             &WisdomDistillInput {
@@ -4364,15 +4383,5 @@ filtered_noise_count: 2
         assert!(memory.contains("## Lessons Learned"));
         assert!(memory.contains("## User Preferences"));
         assert!(memory.contains("## Durable Decisions & Context"));
-
-        if let Some(previous) = prior_provider {
-            unsafe {
-                std::env::set_var("MOON_WISDOM_PROVIDER", previous);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("MOON_WISDOM_PROVIDER");
-            }
-        }
     }
 }
