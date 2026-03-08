@@ -9,6 +9,13 @@ use std::io::Write;
 
 const DEFAULT_MAX_CYCLE_AGE_SECS: u64 = 600;
 
+#[derive(Debug, Clone, Copy, Default)]
+struct HeartbeatStatus {
+    age_secs: Option<u64>,
+    max_age_secs: u64,
+    is_fresh: bool,
+}
+
 fn max_cycle_age_secs() -> u64 {
     std::env::var("MOON_HEALTH_MAX_CYCLE_AGE_SECS")
         .ok()
@@ -17,7 +24,14 @@ fn max_cycle_age_secs() -> u64 {
         .unwrap_or(DEFAULT_MAX_CYCLE_AGE_SECS)
 }
 
-fn check_state_file(paths: &crate::moon::paths::MoonPaths, report: &mut CommandReport) {
+fn check_state_file(
+    paths: &crate::moon::paths::MoonPaths,
+    report: &mut CommandReport,
+) -> HeartbeatStatus {
+    let mut heartbeat = HeartbeatStatus {
+        max_age_secs: max_cycle_age_secs(),
+        ..HeartbeatStatus::default()
+    };
     let state_path = state::state_file_path(paths);
     report.detail(format!("state.file={}", state_path.display()));
 
@@ -26,7 +40,7 @@ fn check_state_file(paths: &crate::moon::paths::MoonPaths, report: &mut CommandR
     if let Some(parent) = state_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
             report.issue(format!("state.dir=unwritable ({err})"));
-            return;
+            return heartbeat;
         }
         if state_exists {
             let writable = fs::OpenOptions::new()
@@ -35,14 +49,14 @@ fn check_state_file(paths: &crate::moon::paths::MoonPaths, report: &mut CommandR
                 .and_then(|mut f| f.write_all(b""));
             if let Err(err) = writable {
                 report.issue(format!("state.file=unwritable ({err})"));
-                return;
+                return heartbeat;
             }
         } else {
             let probe = parent.join(".moon-health-write-probe");
             let writable = fs::write(&probe, b"probe").and_then(|_| fs::remove_file(&probe));
             if let Err(err) = writable {
                 report.issue(format!("state.dir=unwritable ({err})"));
-                return;
+                return heartbeat;
             }
         }
     }
@@ -50,14 +64,14 @@ fn check_state_file(paths: &crate::moon::paths::MoonPaths, report: &mut CommandR
 
     if !state_exists {
         report.detail("state.file=not_found (will be created on first cycle)".to_string());
-        return;
+        return heartbeat;
     }
 
     let raw = match fs::read_to_string(&state_path) {
         Ok(raw) => raw,
         Err(err) => {
             report.issue(format!("state.file=unreadable ({err})"));
-            return;
+            return heartbeat;
         }
     };
 
@@ -65,30 +79,35 @@ fn check_state_file(paths: &crate::moon::paths::MoonPaths, report: &mut CommandR
         Ok(state) => state,
         Err(err) => {
             report.issue(format!("state.file=corrupt ({err})"));
-            return;
+            return heartbeat;
         }
     };
 
     report.detail("state.file=parse_ok".to_string());
     if parsed.last_heartbeat_epoch_secs == 0 {
         report.issue("state.last_heartbeat=missing".to_string());
-        return;
+        return heartbeat;
     }
 
     let now = now_epoch_secs().unwrap_or(parsed.last_heartbeat_epoch_secs);
     let age = now.saturating_sub(parsed.last_heartbeat_epoch_secs);
+    heartbeat.age_secs = Some(age);
     report.detail(format!("state.last_heartbeat_age_secs={age}"));
 
-    let max_age = max_cycle_age_secs();
-    if age > max_age {
+    if age > heartbeat.max_age_secs {
         report.issue(format!(
-            "state.last_heartbeat=stale age_secs={age} max_allowed_secs={max_age}"
+            "state.last_heartbeat=stale age_secs={age} max_allowed_secs={}",
+            heartbeat.max_age_secs
         ));
     } else {
+        heartbeat.is_fresh = true;
         report.detail(format!(
-            "state.last_heartbeat=fresh max_allowed_secs={max_age}"
+            "state.last_heartbeat=fresh max_allowed_secs={}",
+            heartbeat.max_age_secs
         ));
     }
+
+    heartbeat
 }
 
 pub fn run() -> Result<CommandReport> {
@@ -108,6 +127,8 @@ pub fn run() -> Result<CommandReport> {
             report.issue(format!("path.{name}=missing ({})", path.display()));
         }
     }
+
+    let heartbeat = check_state_file(&paths, &mut report);
 
     // Check daemon lock
     let lock_path = daemon_lock_path(&paths);
@@ -153,11 +174,15 @@ pub fn run() -> Result<CommandReport> {
                 report.issue(format!("daemon.lock=corrupt ({err})"));
             }
         }
+    } else if heartbeat.is_fresh {
+        let age_secs = heartbeat.age_secs.unwrap_or(0);
+        report.detail(format!(
+            "daemon.lock=not_found (recent heartbeat age_secs={age_secs} max_allowed_secs={}; daemon may still be running without a linked lockfile)",
+            heartbeat.max_age_secs
+        ));
     } else {
         report.detail("daemon.lock=not_found (daemon likely not running)".to_string());
     }
-
-    check_state_file(&paths, &mut report);
 
     Ok(report)
 }
