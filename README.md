@@ -359,7 +359,7 @@ Global flag:
 Commands:
 
 1. `install [--force] [--dry-run] [--apply true|false]`
-   - macOS default behavior: writes/refreshes `~/Library/LaunchAgents/com.moon.watch.plist`, then bootstraps and kickstarts the watcher service.
+   - macOS default behavior: writes/refreshes `~/Library/LaunchAgents/com.moon.watch.plist`, wraps the watcher with `/usr/bin/caffeinate -i -s`, then bootstraps and kickstarts the watcher service.
    - Windows/Linux behavior: service autostart wiring is not managed by `moon install` yet.
    - Safety guard: when running from development binaries (`target/debug` or `target/release`), autostart setup is skipped and a hint is printed.
 2. `verify [--strict]`

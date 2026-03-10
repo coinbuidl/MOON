@@ -42,7 +42,8 @@ moon install
 ```
 
 On macOS, `moon install` registers and starts a `launchd` watcher service
-(`com.moon.watch`) with auto-restart enabled.
+(`com.moon.watch`) with auto-restart enabled and wraps the watcher with
+`/usr/bin/caffeinate -i -s` to resist idle sleep.
 
 On Windows/Linux, autostart is not wired by `moon install`; start daemon
 manually with:

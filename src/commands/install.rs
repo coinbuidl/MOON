@@ -116,6 +116,8 @@ fn ensure_default_autostart(opts: &InstallOptions, report: &mut CommandReport) -
 const LAUNCHD_LABEL: &str = "com.moon.watch";
 #[cfg(target_os = "macos")]
 const LAUNCHD_PLIST_NAME: &str = "com.moon.watch.plist";
+#[cfg(target_os = "macos")]
+const CAFFEINATE_PATH: &str = "/usr/bin/caffeinate";
 
 #[cfg(target_os = "macos")]
 fn ensure_default_autostart(opts: &InstallOptions, report: &mut CommandReport) -> Result<()> {
@@ -160,6 +162,10 @@ fn ensure_default_autostart(opts: &InstallOptions, report: &mut CommandReport) -
     report.detail(format!(
         "autostart.launchd.binary={}",
         current_exe.display()
+    ));
+    report.detail(format!(
+        "autostart.launchd.wrapper={} -i -s",
+        CAFFEINATE_PATH
     ));
     report.detail(format!("autostart.launchd.plist={}", plist_path.display()));
     if opts.dry_run {
@@ -342,6 +348,9 @@ fn render_launchd_plist(
   <key>ProgramArguments</key>
   <array>
     <string>{}</string>
+    <string>-i</string>
+    <string>-s</string>
+    <string>{}</string>
     <string>watch</string>
     <string>--daemon</string>
   </array>
@@ -362,6 +371,7 @@ fn render_launchd_plist(
 </plist>
 "#,
         xml_escape(label),
+        xml_escape(CAFFEINATE_PATH),
         xml_escape(&binary_path.display().to_string()),
         xml_escape(&working_dir.display().to_string()),
         xml_escape(&home_dir.display().to_string()),
@@ -372,4 +382,33 @@ fn render_launchd_plist(
         xml_escape(&stdout_path.display().to_string()),
         xml_escape(&stderr_path.display().to_string()),
     )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::render_launchd_plist;
+    use std::path::Path;
+
+    #[test]
+    fn render_launchd_plist_wraps_watcher_with_caffeinate() {
+        let payload = render_launchd_plist(
+            "com.moon.watch",
+            Path::new("/Users/alice/.cargo/bin/moon"),
+            Path::new("/Users/alice"),
+            Path::new("/Users/alice/.moon"),
+            Path::new("/Users/alice/.moon/logs"),
+            Path::new("/Users/alice/.moon/logs/stdout.log"),
+            Path::new("/Users/alice/.moon/logs/stderr.log"),
+            Path::new("/Users/alice"),
+            "/Users/alice/.cargo/bin:/usr/bin:/bin",
+            None,
+        );
+
+        assert!(payload.contains("<string>/usr/bin/caffeinate</string>"));
+        assert!(payload.contains("<string>-i</string>"));
+        assert!(payload.contains("<string>-s</string>"));
+        assert!(payload.contains("<string>/Users/alice/.cargo/bin/moon</string>"));
+        assert!(payload.contains("<string>watch</string>"));
+        assert!(payload.contains("<string>--daemon</string>"));
+    }
 }
