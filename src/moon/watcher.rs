@@ -216,6 +216,50 @@ fn resolve_session_file_from_id(sessions_dir: &Path, session_id: &str) -> Option
     None
 }
 
+fn resolve_session_file_from_entry(sessions_dir: &Path, entry: &Value) -> Option<PathBuf> {
+    if let Some(session_file) = entry.get("sessionFile").and_then(Value::as_str) {
+        let trimmed = session_file.trim();
+        if !trimmed.is_empty() {
+            let candidate = PathBuf::from(trimmed);
+            if candidate.exists() && candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    let session_id = entry
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("id").and_then(Value::as_str))?;
+
+    if let Some(source) = resolve_session_file_from_id(sessions_dir, session_id) {
+        return Some(source);
+    }
+
+    let suffixes = [
+        format!("{session_id}.jsonl"),
+        format!("{session_id}.json"),
+        format!("_{session_id}.jsonl"),
+        format!("_{session_id}.json"),
+    ];
+
+    let entries = fs::read_dir(sessions_dir).ok()?;
+    for item in entries.flatten() {
+        let path = item.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if suffixes.iter().any(|suffix| name.ends_with(suffix)) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
 fn load_session_source_map(sessions_dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
     let store = sessions_dir.join("sessions.json");
     if !store.exists() {
@@ -232,19 +276,52 @@ fn load_session_source_map(sessions_dir: &Path) -> Result<BTreeMap<String, PathB
 
     let mut out = BTreeMap::new();
     for (key, entry) in object {
-        let Some(session_id) = entry
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .or_else(|| entry.get("id").and_then(Value::as_str))
-        else {
+        if !entry.is_object() {
             continue;
-        };
-        if let Some(source) = resolve_session_file_from_id(sessions_dir, session_id) {
+        }
+        if let Some(source) = resolve_session_file_from_entry(sessions_dir, entry) {
             out.insert(key.clone(), source);
         }
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_session_source_map;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn load_session_source_map_uses_session_file_for_timestamp_prefixed_sessions() {
+        let tmp = tempdir().expect("tempdir");
+        let sessions_dir = tmp.path();
+        let session_path = sessions_dir
+            .join("2026-03-09T01-23-35-028Z_27715212-d3cf-4100-8a06-c2ee9de2cccc.jsonl");
+        fs::write(&session_path, "{}\n").expect("write session file");
+        fs::write(
+            sessions_dir.join("sessions.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"agent:main:discord:channel:1480375183742206035\": {{\n",
+                    "    \"sessionId\": \"27715212-d3cf-4100-8a06-c2ee9de2cccc\",\n",
+                    "    \"sessionFile\": \"{}\"\n",
+                    "  }}\n",
+                    "}}\n"
+                ),
+                session_path.display()
+            ),
+        )
+        .expect("write sessions.json");
+
+        let map = load_session_source_map(sessions_dir).expect("load source map");
+        assert_eq!(
+            map.get("agent:main:discord:channel:1480375183742206035"),
+            Some(&session_path)
+        );
+    }
 }
 
 fn resolve_distill_source_path(
