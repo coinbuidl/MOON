@@ -1,20 +1,12 @@
-pub mod archive;
 pub mod audit;
-pub mod channel_archive_map;
 pub mod config;
-pub mod continuity;
 pub mod daemon_lock;
 #[allow(dead_code)]
 pub mod distill;
 pub mod embed;
-pub mod inbound_watch;
 pub mod paths;
 pub mod qmd;
-pub mod recall;
-pub mod session_usage;
-pub mod snapshot;
 pub mod state;
-pub mod thresholds;
 pub mod util;
 pub mod warn;
 pub mod watcher;

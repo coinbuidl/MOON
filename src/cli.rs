@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use crate::commands;
 
@@ -27,11 +26,8 @@ pub enum Command {
     Status,
     Stop,
     Restart,
-    Snapshot(MoonSnapshotArgs),
-    Index(MoonIndexArgs),
     Watch(MoonWatchArgs),
     Embed(MoonEmbedArgs),
-    Recall(MoonRecallArgs),
     #[command(name = "distill")]
     Distill(DistillArgs),
     Config(ConfigArgs),
@@ -61,22 +57,6 @@ pub struct RepairArgs {
 }
 
 #[derive(Debug, Args, Default)]
-pub struct MoonSnapshotArgs {
-    #[arg(long)]
-    pub source: Option<PathBuf>,
-    #[arg(long)]
-    pub dry_run: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct MoonIndexArgs {
-    #[arg(long, default_value = "history")]
-    pub name: String,
-    #[arg(long)]
-    pub dry_run: bool,
-}
-
-#[derive(Debug, Args, Default)]
 pub struct MoonWatchArgs {
     #[arg(long)]
     pub once: bool,
@@ -84,16 +64,6 @@ pub struct MoonWatchArgs {
     pub daemon: bool,
     #[arg(long)]
     pub dry_run: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct MoonRecallArgs {
-    #[arg(long)]
-    pub query: String,
-    #[arg(long, default_value = "history")]
-    pub name: String,
-    #[arg(long)]
-    pub channel_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -209,18 +179,6 @@ pub fn run() -> Result<()> {
         Command::Status => commands::moon_status::run()?,
         Command::Stop => commands::moon_stop::run()?,
         Command::Restart => commands::moon_restart::run()?,
-        Command::Snapshot(args) => {
-            commands::moon_snapshot::run(&commands::moon_snapshot::MoonSnapshotOptions {
-                source: args.source.clone(),
-                dry_run: args.dry_run,
-            })?
-        }
-        Command::Index(args) => {
-            commands::moon_index::run(&commands::moon_index::MoonIndexOptions {
-                collection_name: args.name.clone(),
-                dry_run: args.dry_run,
-            })?
-        }
         Command::Watch(args) => {
             commands::moon_watch::run(&commands::moon_watch::MoonWatchOptions {
                 once: args.once,
@@ -234,13 +192,6 @@ pub fn run() -> Result<()> {
                 max_docs: args.max_docs,
                 dry_run: args.dry_run,
                 watcher_trigger: args.watcher_trigger,
-            })?
-        }
-        Command::Recall(args) => {
-            commands::moon_recall::run(&commands::moon_recall::MoonRecallOptions {
-                query: args.query.clone(),
-                collection_name: args.name.clone(),
-                channel_key: args.channel_key.clone(),
             })?
         }
         Command::Distill(args) => {

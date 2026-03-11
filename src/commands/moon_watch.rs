@@ -67,103 +67,19 @@ pub fn run(opts: &MoonWatchOptions) -> Result<CommandReport> {
         cycle.heartbeat_epoch_secs
     ));
     report.detail(format!("poll_interval_secs={}", cycle.poll_interval_secs));
-    report.detail(format!("threshold.trigger={}", cycle.trigger_threshold));
-    report.detail(format!(
-        "compaction.authority={}",
-        cycle.compaction_authority
-    ));
-    if let Some(v) = cycle.compaction_emergency_ratio {
-        report.detail(format!("compaction.emergency_ratio={v}"));
-    }
-    if let Some(v) = cycle.compaction_recover_ratio {
-        report.detail(format!("compaction.recover_ratio={v}"));
-    }
     report.detail(format!(
         "distill.max_per_cycle={}",
         cycle.distill_max_per_cycle
     ));
-    report.detail(format!("embed.mode={}", cycle.embed_mode));
-    report.detail(format!("embed.idle_secs={}", cycle.embed_idle_secs));
-    report.detail(format!(
-        "embed.max_docs_per_cycle={}",
-        cycle.embed_max_docs_per_cycle
-    ));
-    report.detail(format!(
-        "retention.active_days={}",
-        cycle.retention_active_days
-    ));
-    report.detail(format!("retention.warm_days={}", cycle.retention_warm_days));
-    report.detail(format!("retention.cold_days={}", cycle.retention_cold_days));
-    report.detail(format!("usage.session_id={}", cycle.usage.session_id));
-    report.detail(format!("usage.provider={}", cycle.usage.provider));
-    report.detail(format!("usage.used_tokens={}", cycle.usage.used_tokens));
-    report.detail(format!("usage.max_tokens={}", cycle.usage.max_tokens));
-    report.detail(format!("usage.ratio={:.4}", cycle.usage.usage_ratio));
-    report.detail(format!("triggers={}", cycle.triggers.join(",")));
-    report.detail(format!(
-        "inbound_watch.enabled={}",
-        cycle.inbound_watch.enabled
-    ));
-    report.detail(format!(
-        "inbound_watch.watched_paths={}",
-        cycle.inbound_watch.watched_paths.join(",")
-    ));
-    report.detail(format!(
-        "inbound_watch.detected_files={}",
-        cycle.inbound_watch.detected_files
-    ));
-    report.detail(format!(
-        "inbound_watch.triggered_events={}",
-        cycle.inbound_watch.triggered_events
-    ));
-    report.detail(format!(
-        "inbound_watch.failed_events={}",
-        cycle.inbound_watch.failed_events
-    ));
-    for event in &cycle.inbound_watch.events {
-        report.detail(format!(
-            "inbound_watch.event={} status={} message={}",
-            event.file_path, event.status, event.message
-        ));
-    }
-
-    if let Some(archive) = cycle.archive {
-        report.detail(format!("archive.path={}", archive.record.archive_path));
-        if let Some(projection_path) = &archive.record.projection_path {
-            report.detail(format!("archive.projection_path={projection_path}"));
-        }
-        if let Some(filtered_noise_count) = archive.record.projection_filtered_noise_count {
-            report.detail(format!(
-                "archive.filtered_noise_count={filtered_noise_count}"
-            ));
-        }
-        report.detail(format!("archive.indexed={}", archive.record.indexed));
-        report.detail(format!("archive.deduped={}", archive.deduped));
-        report.detail(format!(
-            "archive.ledger_path={}",
-            archive.ledger_path.display()
-        ));
-    }
-    if let Some(result) = cycle.compaction_result {
-        report.detail(format!("compaction.result={result}"));
-    }
+    report.detail(format!("pending_mds_docs={}", cycle.pending_mds_docs));
+    report.detail(format!("distill.runs={}", cycle.distill_runs));
+    report.detail(format!("syns.due={}", cycle.syns_due));
     if let Some(distill) = cycle.distill {
         report.detail(format!("distill.provider={}", distill.provider));
         report.detail(format!("distill.summary_path={}", distill.summary_path));
     }
-    if let Some(result) = cycle.embed_result {
-        report.detail(format!("embed.result={result}"));
-    }
-    if let Some(result) = cycle.archive_retention_result {
-        report.detail(format!("archive_retention.result={result}"));
-    }
-    if let Some(continuity) = cycle.continuity {
-        report.detail(format!("continuity.map_path={}", continuity.map_path));
-        report.detail(format!(
-            "continuity.target_session_id={}",
-            continuity.target_session_id
-        ));
-        report.detail(format!("continuity.rollover_ok={}", continuity.rollover_ok));
+    if let Some(result) = cycle.syns_result {
+        report.detail(format!("syns.result={result}"));
     }
 
     Ok(report)

@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
-use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn ensure_executable_path(path: &Path) -> Result<()> {
     let meta = fs::metadata(path)
@@ -119,124 +117,6 @@ pub fn run_doctor() -> Result<()> {
 pub fn plugins_list_json() -> Result<String> {
     let out = run_openclaw_retry(&["plugins", "list", "--json"], 1)?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-pub fn run_system_event(text: &str, mode: &str) -> Result<()> {
-    run_openclaw_retry(&["system", "event", "--text", text, "--mode", mode], 1)?;
-    Ok(())
-}
-
-fn run_chat_send(session_key: &str, message: &str, label: &str) -> Result<String> {
-    let normalized_key = session_key.trim();
-    if normalized_key.is_empty() {
-        anyhow::bail!("chat.send {label} requires a non-empty session key");
-    }
-    if message.trim().is_empty() {
-        anyhow::bail!("chat.send {label} requires a non-empty message");
-    }
-
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before UNIX_EPOCH")?
-        .as_millis();
-    let idempotency_key = format!("moon-{label}-{}-{now_ms}", std::process::id());
-    let params = serde_json::json!({
-        "sessionKey": normalized_key,
-        "message": message,
-        "deliver": false,
-        "idempotencyKey": idempotency_key,
-    });
-    let params_str = serde_json::to_string(&params)?;
-
-    let out = run_openclaw_retry(
-        &[
-            "gateway",
-            "call",
-            "chat.send",
-            "--json",
-            "--params",
-            &params_str,
-        ],
-        1,
-    )?;
-
-    let parsed: Value =
-        serde_json::from_slice(&out.stdout).context("invalid JSON from chat.send")?;
-    let status = parsed
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    let run_id = parsed
-        .get("runId")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    if status == "started" && !run_id.is_empty() {
-        return Ok(format!(
-            "requested key={} mode=chat.send:{} run_id={}",
-            normalized_key, label, run_id
-        ));
-    }
-
-    if let Some(ok) = parsed.get("ok").and_then(Value::as_bool)
-        && ok
-    {
-        return Ok(format!(
-            "requested key={} mode=chat.send:{} status={}",
-            normalized_key, label, status
-        ));
-    }
-
-    anyhow::bail!(
-        "chat.send {label} returned unexpected response for key {}: {}",
-        normalized_key,
-        String::from_utf8_lossy(&out.stdout)
-    )
-}
-
-pub fn run_sessions_compact(key: &str) -> Result<String> {
-    run_chat_send(key, "/compact", "/compact")
-}
-
-pub fn run_sessions_index_note(
-    key: &str,
-    archive_path: &str,
-    projection_path: Option<&str>,
-    source_path: &str,
-    content_hash: &str,
-    collection_name: &str,
-) -> Result<String> {
-    let session_key = key.trim();
-    if session_key.is_empty() {
-        anyhow::bail!("index note requires a non-empty session key");
-    }
-
-    let mut message = format!(
-        concat!(
-            "[MOON_ARCHIVE_INDEX]\n",
-            "session_key={}\n",
-            "archive_path={}\n"
-        ),
-        session_key,
-        archive_path.trim()
-    );
-    if let Some(path) = projection_path.map(str::trim).filter(|v| !v.is_empty()) {
-        message.push_str(&format!("projection_path={path}\n"));
-    }
-    message.push_str(&format!(
-        concat!(
-            "source_path={}\n",
-            "content_hash={}\n",
-            "collection={}\n",
-            "lookup_hint=recall --name {} --query \"{}\""
-        ),
-        source_path.trim(),
-        content_hash.trim(),
-        collection_name.trim(),
-        collection_name.trim(),
-        session_key
-    ));
-    run_chat_send(session_key, &message, "index-note")
 }
 
 pub fn openclaw_available() -> bool {

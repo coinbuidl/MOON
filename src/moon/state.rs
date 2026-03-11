@@ -22,7 +22,6 @@ pub struct MoonState {
     pub last_provider: Option<String>,
     pub distilled_archives: BTreeMap<String, u64>,
     pub embedded_projections: BTreeMap<String, u64>,
-    pub compaction_hysteresis_active: BTreeMap<String, u64>,
     pub inbound_seen_files: BTreeMap<String, u64>,
 }
 
@@ -41,7 +40,6 @@ impl Default for MoonState {
             last_provider: None,
             distilled_archives: BTreeMap::new(),
             embedded_projections: BTreeMap::new(),
-            compaction_hysteresis_active: BTreeMap::new(),
             inbound_seen_files: BTreeMap::new(),
         }
     }
@@ -115,47 +113,6 @@ pub fn save(paths: &MoonPaths, state: &MoonState) -> Result<PathBuf> {
     fs::write(&file, format!("{data}\n"))
         .with_context(|| format!("failed to write {}", file.display()))?;
     Ok(file)
-}
-
-pub fn rewrite_distilled_archive_paths(
-    paths: &MoonPaths,
-    rewrites: &BTreeMap<String, String>,
-) -> Result<usize> {
-    if rewrites.is_empty() {
-        return Ok(0);
-    }
-
-    let mut state = load(paths)?;
-    if state.distilled_archives.is_empty() {
-        return Ok(0);
-    }
-
-    let mut rewritten = 0usize;
-    let mut normalized = BTreeMap::new();
-    for (archive_path, epoch_secs) in &state.distilled_archives {
-        let next = rewrites
-            .get(archive_path)
-            .cloned()
-            .unwrap_or_else(|| archive_path.clone());
-        if next != *archive_path {
-            rewritten += 1;
-        }
-        normalized
-            .entry(next)
-            .and_modify(|existing| {
-                if *existing < *epoch_secs {
-                    *existing = *epoch_secs;
-                }
-            })
-            .or_insert(*epoch_secs);
-    }
-
-    if rewritten > 0 {
-        state.distilled_archives = normalized;
-        save(paths, &state)?;
-    }
-
-    Ok(rewritten)
 }
 
 #[cfg(test)]

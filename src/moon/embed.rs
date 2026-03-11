@@ -162,7 +162,7 @@ fn gather_projection_docs(root: &Path, out: &mut Vec<ProjectionDoc>) -> Result<(
 
 fn projection_docs(paths: &MoonPaths) -> Result<Vec<ProjectionDoc>> {
     let mut docs = Vec::new();
-    gather_projection_docs(&paths.archives_dir.join("mlib"), &mut docs)?;
+    gather_projection_docs(&paths.moon_home.join("mds"), &mut docs)?;
     docs.sort_by(|a, b| {
         a.mtime_epoch_secs
             .cmp(&b.mtime_epoch_secs)

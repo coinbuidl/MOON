@@ -1,43 +1,20 @@
-use crate::moon::archive::{
-    ArchivePipelineOutcome, archive_and_index, projection_path_for_archive, read_ledger_records,
-    remove_ledger_records,
-};
-use crate::moon::audit;
-use crate::moon::channel_archive_map;
-use crate::moon::config::{
-    MoonContextCompactionAuthority, MoonContextConfig, MoonRetentionConfig, load_config,
-};
-use crate::moon::continuity::{ContinuityOutcome, build_continuity};
-use crate::moon::daemon_lock::{DaemonLockPayload, daemon_lock_path, parse_daemon_lock_payload};
+use crate::moon::config::load_config;
+use crate::moon::daemon_lock::{DaemonLockPayload, daemon_lock_path};
 use crate::moon::distill::{
     DistillInput, DistillOutput, WisdomDistillInput, run_distillation, run_wisdom_distillation,
 };
-use crate::moon::embed::{self, EmbedCaller, EmbedRunError, EmbedRunOptions};
-use crate::moon::inbound_watch::{self, InboundWatchOutcome};
-use crate::moon::paths::resolve_paths;
-use crate::moon::qmd;
-use crate::moon::session_usage::{
-    SessionUsageSnapshot, collect_openclaw_usage_batch, collect_usage,
-};
-use crate::moon::snapshot::latest_session_file;
+use crate::moon::paths::{MoonPaths, resolve_paths};
 use crate::moon::state::{load, save, state_file_path};
-use crate::moon::thresholds::{TriggerKind, evaluate, evaluate_context_compaction_candidate};
-use crate::moon::warn::{self, WarnEvent};
-use crate::openclaw::gateway;
 use anyhow::{Context, Result};
-use chrono::{TimeZone, Utc};
+use chrono::{LocalResult, TimeZone, Timelike};
 use chrono_tz::Tz;
-use fs2::FileExt;
-use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, UNIX_EPOCH};
 
 const BUILD_UUID: &str = env!("BUILD_UUID");
 
@@ -52,30 +29,111 @@ pub struct WatchCycleOutcome {
     pub state_file: String,
     pub heartbeat_epoch_secs: u64,
     pub poll_interval_secs: u64,
-    pub trigger_threshold: f64,
-    pub compaction_authority: String,
-    pub compaction_emergency_ratio: Option<f64>,
-    pub compaction_recover_ratio: Option<f64>,
     pub distill_max_per_cycle: u64,
-    pub embed_mode: String,
-    pub embed_idle_secs: u64,
-    pub embed_max_docs_per_cycle: u64,
-    pub retention_active_days: u64,
-    pub retention_warm_days: u64,
-    pub retention_cold_days: u64,
-    pub usage: SessionUsageSnapshot,
-    pub triggers: Vec<String>,
-    pub inbound_watch: InboundWatchOutcome,
-    pub archive: Option<ArchivePipelineOutcome>,
-    pub compaction_result: Option<String>,
+    pub pending_mds_docs: usize,
+    pub distill_runs: usize,
+    pub syns_due: bool,
     pub distill: Option<DistillOutput>,
-    pub embed_result: Option<String>,
-    pub continuity: Option<ContinuityOutcome>,
-    pub archive_retention_result: Option<String>,
+    pub syns_result: Option<String>,
 }
 
-type DistillCandidate = (crate::moon::archive::ArchiveRecord, String);
-type DistillSelection = (Vec<DistillCandidate>, Vec<String>);
+#[derive(Debug, Clone)]
+struct MdsDoc {
+    path: PathBuf,
+    mtime_epoch_secs: u64,
+}
+
+fn now_epoch_secs() -> Result<u64> {
+    if let Ok(raw) = std::env::var("MOON_WATCH_FAKE_NOW_EPOCH_SECS") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return trimmed
+                .parse::<u64>()
+                .context("invalid MOON_WATCH_FAKE_NOW_EPOCH_SECS");
+        }
+    }
+    crate::moon::util::now_epoch_secs()
+}
+
+fn mds_dir(paths: &MoonPaths) -> PathBuf {
+    paths.moon_home.join("mds")
+}
+
+fn path_epoch_secs(path: &Path) -> u64 {
+    let Ok(metadata) = fs::metadata(path) else {
+        return 0;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return 0;
+    };
+    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    duration.as_secs()
+}
+
+fn gather_mds_docs(root: &Path, out: &mut Vec<MdsDoc>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+
+    for entry in
+        fs::read_dir(root).with_context(|| format!("failed to read mds dir {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", root.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to stat {}", path.display()))?;
+        if file_type.is_dir() {
+            gather_mds_docs(&path, out)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("md"))
+        {
+            continue;
+        }
+        out.push(MdsDoc {
+            mtime_epoch_secs: path_epoch_secs(&path),
+            path,
+        });
+    }
+
+    Ok(())
+}
+
+fn list_mds_docs(paths: &MoonPaths) -> Result<Vec<MdsDoc>> {
+    let mut docs = Vec::new();
+    gather_mds_docs(&mds_dir(paths), &mut docs)?;
+    docs.sort_by(|a, b| {
+        a.mtime_epoch_secs
+            .cmp(&b.mtime_epoch_secs)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(docs)
+}
+
+fn pending_mds_docs(
+    paths: &MoonPaths,
+    state: &crate::moon::state::MoonState,
+) -> Result<Vec<MdsDoc>> {
+    Ok(list_mds_docs(paths)?
+        .into_iter()
+        .filter(|doc| {
+            let key = doc.path.display().to_string();
+            match state.distilled_archives.get(&key) {
+                None => true,
+                Some(last_distill) => doc.mtime_epoch_secs > *last_distill,
+            }
+        })
+        .collect())
+}
 
 fn residential_tz_name(cfg: &crate::moon::config::MoonConfig) -> String {
     let name = cfg.distill.residential_timezone.trim();
@@ -92,600 +150,67 @@ fn parse_residential_tz(cfg: &crate::moon::config::MoonConfig) -> Tz {
         .unwrap_or(chrono_tz::UTC)
 }
 
-fn is_l1_norm_lock_contention(err: &anyhow::Error) -> bool {
-    if err
-        .chain()
-        .any(|cause| matches!(cause.downcast_ref::<std::io::Error>(), Some(io_err) if io_err.kind() == ErrorKind::WouldBlock))
-    {
-        return true;
-    }
-    err.to_string()
-        .to_ascii_lowercase()
-        .contains("l1 normalisation lock is already held")
-}
-
 fn day_key_for_epoch_in_timezone(epoch_secs: u64, tz: Tz) -> String {
-    let dt = tz
-        .timestamp_opt(epoch_secs as i64, 0)
-        .single()
-        .unwrap_or_else(|| tz.from_utc_datetime(&Utc::now().naive_utc()));
+    let dt = match tz.timestamp_opt(epoch_secs as i64, 0) {
+        LocalResult::Single(v) => v,
+        _ => tz.from_utc_datetime(&chrono::Utc::now().naive_utc()),
+    };
     dt.format("%Y-%m-%d").to_string()
 }
 
 fn previous_day_key_for_epoch_in_timezone(epoch_secs: u64, tz: Tz) -> String {
-    let dt = tz
-        .timestamp_opt(epoch_secs as i64, 0)
-        .single()
-        .unwrap_or_else(|| tz.from_utc_datetime(&Utc::now().naive_utc()));
+    let dt = match tz.timestamp_opt(epoch_secs as i64, 0) {
+        LocalResult::Single(v) => v,
+        _ => tz.from_utc_datetime(&chrono::Utc::now().naive_utc()),
+    };
     let previous_day = dt.date_naive() - chrono::Duration::days(1);
     previous_day.format("%Y-%m-%d").to_string()
 }
 
-fn daily_memory_path_for_day_key(paths: &crate::moon::paths::MoonPaths, day_key: &str) -> String {
-    paths
-        .memory_dir
-        .join(format!("{day_key}.md"))
-        .display()
-        .to_string()
-}
-
-fn run_archive_if_needed(
-    paths: &crate::moon::paths::MoonPaths,
-    trigger_set: &[TriggerKind],
-    compaction_targets_present: bool,
-) -> Result<Option<ArchivePipelineOutcome>> {
-    // Compaction path already archives each target source before compacting.
-    if compaction_targets_present {
-        return Ok(None);
-    }
-
-    let needs_archive = trigger_set
-        .iter()
-        .any(|t| matches!(t, TriggerKind::Archive));
-    if !needs_archive {
-        return Ok(None);
-    }
-
-    let Some(source) = latest_session_file(&paths.openclaw_sessions_dir)? else {
-        anyhow::bail!("no source session file found in openclaw sessions dir");
+fn syns_due_now(state: &crate::moon::state::MoonState, now_epoch_secs: u64, tz: Tz) -> bool {
+    let now_local = match tz.timestamp_opt(now_epoch_secs as i64, 0) {
+        LocalResult::Single(v) => v,
+        _ => return false,
     };
-
-    let out = archive_and_index(paths, &source, "history")?;
-    Ok(Some(out))
-}
-
-fn is_compaction_channel_session(session_id: &str) -> bool {
-    session_id.contains(":discord:channel:") || session_id.contains(":whatsapp:")
-}
-
-fn is_cooldown_ready(last_epoch: Option<u64>, now_epoch: u64, cooldown_secs: u64) -> bool {
-    match last_epoch {
-        None => true,
-        Some(last) => now_epoch.saturating_sub(last) >= cooldown_secs,
-    }
-}
-
-fn unified_layer1_last_trigger_epoch(state: &crate::moon::state::MoonState) -> Option<u64> {
-    match (
-        state.last_archive_trigger_epoch_secs,
-        state.last_compaction_trigger_epoch_secs,
-    ) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(v), None) | (None, Some(v)) => Some(v),
-        (None, None) => None,
-    }
-}
-
-fn compaction_authority_name(policy: Option<&MoonContextConfig>) -> String {
-    match policy.map(|p| &p.compaction_authority) {
-        Some(MoonContextCompactionAuthority::Moon) => "moon".to_string(),
-        Some(MoonContextCompactionAuthority::Openclaw) => "openclaw".to_string(),
-        None => "legacy-moon".to_string(),
-    }
-}
-
-fn effective_compaction_start_ratio(
-    cfg: &crate::moon::config::MoonConfig,
-    policy: Option<&MoonContextConfig>,
-) -> f64 {
-    if let Some(policy) = policy
-        && matches!(
-            policy.compaction_authority,
-            MoonContextCompactionAuthority::Moon
-        )
-    {
-        return policy.compaction_start_ratio;
-    }
-    cfg.thresholds.trigger_ratio
-}
-
-fn resolve_session_file_from_id(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> {
-    if session_id.trim().is_empty() {
-        return None;
-    }
-    let jsonl = sessions_dir.join(format!("{session_id}.jsonl"));
-    if jsonl.exists() && jsonl.is_file() {
-        return Some(jsonl);
-    }
-
-    let json = sessions_dir.join(format!("{session_id}.json"));
-    if json.exists() && json.is_file() {
-        return Some(json);
-    }
-
-    None
-}
-
-fn load_session_source_map(sessions_dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
-    let store = sessions_dir.join("sessions.json");
-    if !store.exists() {
-        return Ok(BTreeMap::new());
-    }
-
-    let raw = fs::read_to_string(&store)
-        .with_context(|| format!("failed to read {}", store.display()))?;
-    let parsed: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", store.display()))?;
-    let object = parsed
-        .as_object()
-        .context("sessions.json should be an object map keyed by session key")?;
-
-    let mut out = BTreeMap::new();
-    for (key, entry) in object {
-        let Some(session_id) = entry
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .or_else(|| entry.get("id").and_then(Value::as_str))
-        else {
-            continue;
-        };
-        if let Some(source) = resolve_session_file_from_id(sessions_dir, session_id) {
-            out.insert(key.clone(), source);
-        }
-    }
-
-    Ok(out)
-}
-
-fn resolve_distill_source_path(
-    paths: &crate::moon::paths::MoonPaths,
-    record: &crate::moon::archive::ArchiveRecord,
-) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(path) = record.projection_path.as_deref() {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            candidates.push(PathBuf::from(trimmed));
-        }
-    }
-    candidates.push(projection_path_for_archive(&record.archive_path));
-
-    for candidate in candidates {
-        if !candidate.exists() {
-            continue;
-        }
-        let is_markdown = candidate
-            .extension()
-            .and_then(|v| v.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-        if !is_markdown {
-            continue;
-        }
-        let mlib_root = paths.archives_dir.join("mlib");
-        let normalized_candidate =
-            fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-        let normalized_mlib_root = fs::canonicalize(&mlib_root).unwrap_or(mlib_root);
-        let in_mlib = normalized_candidate.starts_with(normalized_mlib_root);
-        if in_mlib {
-            return Some(candidate);
-        }
-    }
-
-    None
-}
-
-fn is_distillable_archive_record(record: &crate::moon::archive::ArchiveRecord) -> bool {
-    let source_path = Path::new(&record.source_path);
-    let archive_path = Path::new(&record.archive_path);
-
-    let source_file = source_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let archive_file = archive_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let source_ext = source_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let archive_ext = archive_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    // `sessions.json` snapshots and lock artifacts are metadata/noise, not conversation history.
-    if source_file == "sessions.json" {
+    if now_local.hour() != 0 {
         return false;
     }
-    if source_ext == "lock"
-        || archive_ext == "lock"
-        || source_file.ends_with(".lock")
-        || archive_file.ends_with(".lock")
-    {
-        return false;
-    }
-    if archive_ext == "json" && archive_file.starts_with("sessions-") {
-        return false;
-    }
-
-    true
+    let today_key = now_local.format("%Y-%m-%d").to_string();
+    let last_key = state
+        .last_syns_trigger_epoch_secs
+        .map(|epoch| day_key_for_epoch_in_timezone(epoch, tz));
+    last_key.as_deref() != Some(today_key.as_str())
 }
 
-fn cleanup_expired_distilled_archives(
-    paths: &crate::moon::paths::MoonPaths,
-    state: &mut crate::moon::state::MoonState,
-    now_epoch_secs: u64,
-    retention: &MoonRetentionConfig,
-) -> Result<Option<String>> {
-    let ledger = match read_ledger_records(paths) {
-        Ok(records) => records,
-        Err(err) => {
-            warn::emit(WarnEvent {
-                code: "LEDGER_READ_FAILED",
-                stage: "archive-retention",
-                action: "read-ledger",
-                session: "na",
-                archive: "na",
-                source: "na",
-                retry: "retry-next-cycle",
-                reason: "ledger-read-failed",
-                err: &format!("{err:#}"),
-            });
-            return Ok(Some(format!(
-                "retention_active_days={} retention_warm_days={} retention_cold_days={} removed=0 missing=0 failed=1 map_removed=0 ledger_removed=0 qmd_updated=false reason=ledger-read-failed",
-                retention.active_days, retention.warm_days, retention.cold_days
-            )));
-        }
-    };
-    let ledger_by_archive = ledger
-        .into_iter()
-        .map(|r| (r.archive_path, r.created_at_epoch_secs))
-        .collect::<BTreeMap<_, _>>();
-
-    let seconds_per_day = 86_400u64;
-    let mut active_count = 0usize;
-    let mut warm_count = 0usize;
-    let mut cold_candidates = 0usize;
-    let mut purge_paths = BTreeSet::new();
-    let mut removed_files = 0usize;
-    let mut missing_files = 0usize;
-    let mut failed = 0usize;
-    let mut projection_removed = 0usize;
-    let mut projection_missing = 0usize;
-    let mut projection_failed = 0usize;
-
-    let candidates = state
-        .distilled_archives
-        .iter()
-        .map(|(k, v)| (k.clone(), *v))
-        .collect::<Vec<_>>();
-
-    for (archive_path, distilled_at) in candidates {
-        let Some(created_at) = ledger_by_archive.get(&archive_path).copied() else {
-            warn::emit(WarnEvent {
-                code: "LEDGER_READ_FAILED",
-                stage: "archive-retention",
-                action: "lookup-ledger-record",
-                session: "na",
-                archive: &archive_path,
-                source: "na",
-                retry: "skip-current-archive",
-                reason: "archive-path-missing-in-ledger",
-                err: "missing-ledger-record",
-            });
-            continue;
-        };
-
-        let age_days = now_epoch_secs
-            .saturating_sub(created_at)
-            .saturating_div(seconds_per_day);
-        if age_days <= retention.active_days {
-            active_count += 1;
-            continue;
-        }
-        if age_days <= retention.warm_days || age_days < retention.cold_days {
-            warm_count += 1;
-            continue;
-        }
-        cold_candidates += 1;
-
-        if now_epoch_secs.saturating_sub(distilled_at) < seconds_per_day {
-            // Require at least one day from distill marker before delete to reduce race risk.
-            continue;
-        }
-        let projection_path = projection_path_for_archive(&archive_path);
-        let projection_path_display = projection_path.display().to_string();
-
-        if Path::new(&archive_path).exists() {
-            match fs::remove_file(&archive_path) {
-                Ok(_) => {
-                    removed_files += 1;
-                    purge_paths.insert(archive_path.clone());
-                    state.distilled_archives.remove(&archive_path);
-                    match fs::remove_file(&projection_path) {
-                        Ok(_) => projection_removed += 1,
-                        Err(err) if err.kind() == ErrorKind::NotFound => {
-                            projection_missing += 1;
-                        }
-                        Err(err) => {
-                            projection_failed += 1;
-                            warn::emit(WarnEvent {
-                                code: "RETENTION_DELETE_FAILED",
-                                stage: "archive-retention",
-                                action: "delete-projection",
-                                session: "na",
-                                archive: &archive_path,
-                                source: &projection_path_display,
-                                retry: "retry-next-cycle",
-                                reason: "remove-projection-file-failed",
-                                err: &format!("{err:#}"),
-                            });
-                        }
-                    }
-                }
-                Err(err) => {
-                    failed += 1;
-                    warn::emit(WarnEvent {
-                        code: "RETENTION_DELETE_FAILED",
-                        stage: "archive-retention",
-                        action: "delete-archive",
-                        session: "na",
-                        archive: &archive_path,
-                        source: "na",
-                        retry: "retry-next-cycle",
-                        reason: "remove-file-failed",
-                        err: &format!("{err:#}"),
-                    });
-                }
-            }
-        } else {
-            missing_files += 1;
-            purge_paths.insert(archive_path.clone());
-            state.distilled_archives.remove(&archive_path);
-            match fs::remove_file(&projection_path) {
-                Ok(_) => projection_removed += 1,
-                Err(err) if err.kind() == ErrorKind::NotFound => {
-                    projection_missing += 1;
-                }
-                Err(err) => {
-                    projection_failed += 1;
-                    warn::emit(WarnEvent {
-                        code: "RETENTION_DELETE_FAILED",
-                        stage: "archive-retention",
-                        action: "delete-projection",
-                        session: "na",
-                        archive: &archive_path,
-                        source: &projection_path_display,
-                        retry: "retry-next-cycle",
-                        reason: "remove-projection-file-failed",
-                        err: &format!("{err:#}"),
-                    });
-                }
-            }
-        }
+fn lock_payload(paths: &MoonPaths, now_epoch_secs: u64) -> DaemonLockPayload {
+    DaemonLockPayload {
+        pid: std::process::id(),
+        started_at_epoch_secs: now_epoch_secs,
+        build_uuid: BUILD_UUID.to_string(),
+        moon_home: paths.moon_home.display().to_string(),
     }
-
-    if purge_paths.is_empty() && failed == 0 {
-        return Ok(None);
-    }
-
-    let map_removed = channel_archive_map::remove_by_archive_paths(paths, &purge_paths)?;
-    let ledger_removed = remove_ledger_records(paths, &purge_paths)?;
-    let qmd_updated = if !purge_paths.is_empty() {
-        qmd::update(&paths.qmd_bin).is_ok()
-    } else {
-        false
-    };
-
-    Ok(Some(format!(
-        "retention_active_days={} retention_warm_days={} retention_cold_days={} active={} warm={} cold_candidates={} removed={} missing={} failed={} projection_removed={} projection_missing={} projection_failed={} map_removed={} ledger_removed={} qmd_updated={}",
-        retention.active_days,
-        retention.warm_days,
-        retention.cold_days,
-        active_count,
-        warm_count,
-        cold_candidates,
-        removed_files,
-        missing_files,
-        failed,
-        projection_removed,
-        projection_missing,
-        projection_failed,
-        map_removed,
-        ledger_removed,
-        qmd_updated
-    )))
 }
 
-fn select_pending_distill_candidates(
-    paths: &crate::moon::paths::MoonPaths,
-    state: &crate::moon::state::MoonState,
-    max_per_cycle: u64,
-) -> Result<DistillSelection> {
-    let mut notes = Vec::new();
-    let mut distill_candidates = Vec::<(crate::moon::archive::ArchiveRecord, String)>::new();
-
-    let mut ledger = read_ledger_records(paths)?;
-    if ledger.is_empty() {
-        notes.push("skipped reason=no-archives".to_string());
-        return Ok((distill_candidates, notes));
-    }
-
-    ledger.sort_by_key(|r| r.created_at_epoch_secs);
-    let mut pending = Vec::new();
-    let mut skipped_non_distillable = 0usize;
-    for record in ledger {
-        if !record.indexed || state.distilled_archives.contains_key(&record.archive_path) {
-            continue;
-        }
-
-        if !is_distillable_archive_record(&record) {
-            skipped_non_distillable = skipped_non_distillable.saturating_add(1);
-            continue;
-        }
-
-        let Some(distill_source_path) = resolve_distill_source_path(paths, &record) else {
-            warn::emit(WarnEvent {
-                code: "DISTILL_SOURCE_MISSING",
-                stage: "distill-selection",
-                action: "resolve-distill-source",
-                session: &record.session_id,
-                archive: &record.archive_path,
-                source: &record.source_path,
-                retry: "retry-next-cycle",
-                reason: "projection-md-missing",
-                err: "projection-md-not-found",
-            });
-            continue;
-        };
-        pending.push((record, distill_source_path.display().to_string()));
-    }
-
-    if pending.is_empty() {
-        notes.push("skipped reason=no-undistilled-archives".to_string());
-        if skipped_non_distillable > 0 {
-            notes.push(format!(
-                "skipped_non_distillable_archives={}",
-                skipped_non_distillable
-            ));
-        }
-        return Ok((distill_candidates, notes));
-    }
-
-    if !pending.is_empty() {
-        for (record, distill_source_path) in pending {
-            distill_candidates.push((record, distill_source_path));
-            if distill_candidates.len() >= max_per_cycle as usize {
-                break;
-            }
-        }
-        notes.push(format!(
-            "selected={} max_per_cycle={} source=archives/mlib/*.md",
-            distill_candidates.len(),
-            max_per_cycle
-        ));
-        if skipped_non_distillable > 0 {
-            notes.push(format!(
-                "skipped_non_distillable_archives={}",
-                skipped_non_distillable
-            ));
-        }
-    } else {
-        notes.push("skipped reason=no-undistilled-archives".to_string());
-    }
-
-    Ok((distill_candidates, notes))
-}
-
-fn acquire_daemon_lock() -> Result<File> {
-    let paths = resolve_paths()?;
+fn write_daemon_lock(paths: &MoonPaths, now_epoch_secs: u64) -> Result<PathBuf> {
     fs::create_dir_all(&paths.logs_dir)
         .with_context(|| format!("failed to create {}", paths.logs_dir.display()))?;
-
-    let lock_path = daemon_lock_path(&paths);
-    let mut lock_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open daemon lock {}", lock_path.display()))?;
-
-    let now = crate::moon::util::now_epoch_secs()?;
-
-    match lock_file.try_lock_exclusive() {
-        Ok(()) => {
-            // We got the lock. Write the payload.
-            let payload = DaemonLockPayload {
-                pid: std::process::id(),
-                started_at_epoch_secs: now,
-                build_uuid: BUILD_UUID.to_string(),
-                moon_home: paths.moon_home.display().to_string(),
-            };
-            lock_file.set_len(0)?;
-            lock_file.write_all(format!("{}\n", serde_json::to_string(&payload)?).as_bytes())?;
-            lock_file.flush()?;
-        }
-        Err(err) if err.kind() == ErrorKind::WouldBlock => {
-            // Lock is held. Check if it's stale or mismatched.
-            let raw = fs::read_to_string(&lock_path).ok();
-            let payload: Option<DaemonLockPayload> =
-                raw.as_deref().and_then(parse_daemon_lock_payload);
-
-            if let Some(p) = payload {
-                let pid_alive = crate::moon::util::pid_alive(p.pid);
-
-                if !pid_alive || p.build_uuid != BUILD_UUID {
-                    // Stale or mismatched. We should ideally auto-remediate if !pid_alive.
-                    // But for now, just report the mismatch as per MIP.
-                    if p.build_uuid != BUILD_UUID {
-                        anyhow::bail!(
-                            "moon watcher binary mismatch (running: {}, disk: {}). Please restart the daemon.",
-                            p.build_uuid,
-                            BUILD_UUID
-                        );
-                    }
-                }
-            }
-
-            anyhow::bail!(
-                "moon watcher daemon already running (lock: {})",
-                lock_path.display()
-            );
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to lock daemon file {}", lock_path.display()));
-        }
-    }
-
-    Ok(lock_file)
+    let lock_path = daemon_lock_path(paths);
+    let payload = lock_payload(paths, now_epoch_secs);
+    fs::write(
+        &lock_path,
+        format!("{}\n", serde_json::to_string(&payload)?),
+    )
+    .with_context(|| format!("failed to write {}", lock_path.display()))?;
+    Ok(lock_path)
 }
 
-fn extract_key_decisions(summary: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in summary.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let normalized = trimmed
-            .trim_start_matches("- ")
-            .trim_start_matches("* ")
-            .trim();
-        if normalized.is_empty() {
-            continue;
-        }
-        let lower = normalized.to_ascii_lowercase();
-        if lower.contains("decision")
-            || lower.contains("rule")
-            || lower.contains("milestone")
-            || lower.contains("next")
-        {
-            out.push(normalized.to_string());
-        }
-        if out.len() >= 8 {
-            break;
-        }
+fn remove_daemon_lock(paths: &MoonPaths) {
+    let lock_path = daemon_lock_path(paths);
+    match fs::remove_file(&lock_path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(_) => {}
     }
-    out
 }
 
 pub fn run_once() -> Result<WatchCycleOutcome> {
@@ -696,879 +221,128 @@ pub fn run_once_with_options(run_opts: WatchRunOptions) -> Result<WatchCycleOutc
     let paths = resolve_paths()?;
     let cfg = load_config()?;
     let mut state = load(&paths)?;
-    // Legacy field retained for backward-compatible state parsing; no longer used
-    // for compaction trigger decisions.
-    state.compaction_hysteresis_active.clear();
-    let inbound_watch = if run_opts.dry_run {
-        InboundWatchOutcome {
-            enabled: cfg.inbound_watch.enabled,
-            watched_paths: cfg.inbound_watch.watch_paths.clone(),
-            ..InboundWatchOutcome::default()
-        }
-    } else {
-        inbound_watch::process(&paths, &cfg, &mut state)?
-    };
+    let now_epoch = now_epoch_secs()?;
+    let tz = parse_residential_tz(&cfg);
 
-    let mut usage_batch_note = None;
-    let usage_batch = match collect_openclaw_usage_batch() {
-        Ok(batch) => Some(batch),
-        Err(err) => {
-            usage_batch_note = Some(format!("batch-scan failed: {err:#}"));
-            None
-        }
-    };
-    let usage = match &usage_batch {
-        Some(batch) => batch.current.clone(),
-        None => collect_usage(&paths)?,
-    };
-    state.last_heartbeat_epoch_secs = usage.captured_at_epoch_secs;
-    state.last_session_id = Some(usage.session_id.clone());
-    state.last_usage_ratio = Some(usage.usage_ratio);
-    state.last_provider = Some(usage.provider.clone());
+    let pending_docs = pending_mds_docs(&paths, &state)?;
+    let pending_count = pending_docs.len();
+    let mut last_distill = None;
+    let mut distill_runs = 0usize;
 
-    let context_policy = cfg.context.as_ref();
-    let effective_trigger_threshold = effective_compaction_start_ratio(&cfg, context_policy);
-    let compaction_authority = compaction_authority_name(context_policy);
-
-    let triggers = if let Some(policy) = context_policy {
-        match policy.compaction_authority {
-            MoonContextCompactionAuthority::Moon => {
-                if usage.usage_ratio >= policy.compaction_start_ratio
-                    && (is_cooldown_ready(
-                        unified_layer1_last_trigger_epoch(&state),
-                        usage.captured_at_epoch_secs,
-                        cfg.watcher.cooldown_secs,
-                    ) || usage.usage_ratio >= policy.compaction_emergency_ratio)
-                {
-                    vec![TriggerKind::Archive, TriggerKind::Compaction]
-                } else {
-                    Vec::new()
-                }
-            }
-            MoonContextCompactionAuthority::Openclaw => Vec::new(),
-        }
-    } else {
-        evaluate(&cfg, &state, &usage)
-    };
-    let trigger_names = triggers
-        .iter()
-        .map(|t| match t {
-            TriggerKind::Archive => "archive".to_string(),
-            TriggerKind::Compaction => "compaction".to_string(),
-        })
-        .collect::<Vec<_>>();
-
-    let mut archive_out = None;
-    let mut compaction_result = None;
-    let mut distill_out = None;
-    let mut embed_result: Option<String> = None;
-    let mut continuity_out = None;
-    let mut archive_retention_result = None;
-    let compaction_cooldown_ready = is_cooldown_ready(
-        unified_layer1_last_trigger_epoch(&state),
-        usage.captured_at_epoch_secs,
-        cfg.watcher.cooldown_secs,
-    );
-
-    let mut compaction_targets = Vec::<SessionUsageSnapshot>::new();
-    let mut compaction_notes = Vec::<String>::new();
-    let mut compaction_has_archivable_targets = false;
-    let mut cooldown_gate_handled_during_selection = false;
-
-    if let Some(note) = usage_batch_note {
-        compaction_notes.push(note);
-    }
-
-    if let Some(policy) = context_policy {
-        if matches!(
-            policy.compaction_authority,
-            MoonContextCompactionAuthority::Openclaw
-        ) {
-            compaction_result = Some("skipped reason=authority-openclaw".to_string());
-        } else {
-            cooldown_gate_handled_during_selection = true;
-            let mut candidate_sessions = Vec::<SessionUsageSnapshot>::new();
-            if usage.provider == "openclaw" {
-                if let Some(batch) = &usage_batch {
-                    candidate_sessions = batch
-                        .sessions
-                        .iter()
-                        .filter(|s| is_compaction_channel_session(&s.session_id))
-                        .cloned()
-                        .collect();
-                } else if is_compaction_channel_session(&usage.session_id) {
-                    candidate_sessions.push(usage.clone());
-                }
-            } else if is_compaction_channel_session(&usage.session_id) {
-                candidate_sessions.push(usage.clone());
-            }
-
-            let mut blocked_cooldown = 0usize;
-            let mut bypassed_cooldown = 0usize;
-            for candidate in candidate_sessions {
-                let decision = evaluate_context_compaction_candidate(
-                    candidate.usage_ratio,
-                    policy.compaction_start_ratio,
-                    policy.compaction_emergency_ratio,
-                    compaction_cooldown_ready,
-                );
-                if decision.should_compact {
-                    if decision.bypassed_cooldown {
-                        bypassed_cooldown += 1;
-                    }
-                    compaction_targets.push(candidate);
-                    continue;
-                }
-                if candidate.usage_ratio >= policy.compaction_start_ratio
-                    && !compaction_cooldown_ready
-                {
-                    blocked_cooldown += 1;
-                }
-            }
-            compaction_notes.push(format!(
-                "policy=start_ratio={:.4} emergency_ratio={:.4}",
-                policy.compaction_start_ratio, policy.compaction_emergency_ratio,
-            ));
-            if blocked_cooldown > 0 {
-                compaction_notes.push(format!("cooldown_blocked={blocked_cooldown}"));
-            }
-            if bypassed_cooldown > 0 {
-                compaction_notes.push(format!("cooldown_bypassed={bypassed_cooldown}"));
-            }
-        }
-    } else if usage.provider == "openclaw" {
-        if let Some(batch) = &usage_batch {
-            compaction_targets = batch
-                .sessions
-                .iter()
-                .filter(|s| {
-                    is_compaction_channel_session(&s.session_id)
-                        && s.usage_ratio >= cfg.thresholds.trigger_ratio
-                })
-                .cloned()
-                .collect();
-        } else if usage.usage_ratio >= cfg.thresholds.trigger_ratio
-            && is_compaction_channel_session(&usage.session_id)
+    if !run_opts.dry_run {
+        for doc in pending_docs
+            .into_iter()
+            .take(cfg.distill.max_per_cycle as usize)
         {
-            compaction_targets.push(usage.clone());
-        }
-    } else if usage.usage_ratio >= cfg.thresholds.trigger_ratio
-        && is_compaction_channel_session(&usage.session_id)
-    {
-        compaction_targets.push(usage.clone());
-    }
-
-    let mut compaction_source_map = BTreeMap::new();
-    if !compaction_targets.is_empty() {
-        match load_session_source_map(&paths.openclaw_sessions_dir) {
-            Ok(map) => {
-                compaction_source_map = map;
-                compaction_has_archivable_targets = compaction_targets
-                    .iter()
-                    .any(|target| compaction_source_map.contains_key(&target.session_id));
-            }
-            Err(err) => compaction_notes.push(format!("source_map failed: {err:#}")),
-        }
-    }
-
-    if run_opts.dry_run {
-        if compaction_result.is_none() {
-            compaction_result = if compaction_targets.is_empty() {
-                Some("dry-run: no compaction targets selected".to_string())
-            } else {
-                Some(format!(
-                    "dry-run: would run compaction for {} target(s)",
-                    compaction_targets.len()
-                ))
-            };
-        } else if let Some(existing) = compaction_result.take() {
-            compaction_result = Some(format!("dry-run: {existing}"));
-        }
-
-        embed_result = Some("dry-run: embed skipped".to_string());
-        archive_retention_result = Some("dry-run: archive retention skipped".to_string());
-        let state_file = state_file_path(&paths);
-
-        return Ok(WatchCycleOutcome {
-            state_file: state_file.display().to_string(),
-            heartbeat_epoch_secs: state.last_heartbeat_epoch_secs,
-            poll_interval_secs: cfg.watcher.poll_interval_secs,
-            trigger_threshold: effective_trigger_threshold,
-            compaction_authority,
-            compaction_emergency_ratio: context_policy
-                .map(|policy| policy.compaction_emergency_ratio),
-            compaction_recover_ratio: context_policy.map(|policy| policy.compaction_recover_ratio),
-            distill_max_per_cycle: cfg.distill.max_per_cycle,
-            embed_mode: cfg.embed.mode.clone(),
-            embed_idle_secs: cfg.embed.idle_secs,
-            embed_max_docs_per_cycle: cfg.embed.max_docs_per_cycle,
-            retention_active_days: cfg.retention.active_days,
-            retention_warm_days: cfg.retention.warm_days,
-            retention_cold_days: cfg.retention.cold_days,
-            usage,
-            triggers: trigger_names,
-            inbound_watch,
-            archive: None,
-            compaction_result,
-            distill: None,
-            embed_result,
-            continuity: None,
-            archive_retention_result,
-        });
-    }
-
-    if let Some(archive) =
-        run_archive_if_needed(&paths, &triggers, compaction_has_archivable_targets)?
-    {
-        state.last_archive_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-        archive_out = Some(archive);
-    }
-
-    if !compaction_targets.is_empty()
-        && !compaction_cooldown_ready
-        && !cooldown_gate_handled_during_selection
-    {
-        let skip_note = format!(
-            "skipped reason=cooldown targets={} cooldown_secs={}",
-            compaction_targets.len(),
-            cfg.watcher.cooldown_secs
-        );
-        compaction_result = Some(skip_note);
-    } else if !compaction_targets.is_empty() {
-        state.last_compaction_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-        state.last_archive_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-        let mut outcomes = Vec::new();
-        let mut failed = 0usize;
-        let mut succeeded = 0usize;
-
-        for note in &compaction_notes {
-            outcomes.push(format!("note={note}"));
-        }
-
-        for target in &compaction_targets {
-            let Some(source_path) = compaction_source_map.get(&target.session_id) else {
-                failed += 1;
-                outcomes.push(format!(
-                    "failed key={} ratio={:.4} used={} max={} reason=archive-source-not-found",
-                    target.session_id, target.usage_ratio, target.used_tokens, target.max_tokens
-                ));
-                continue;
-            };
-
-            let archived = match archive_and_index(&paths, source_path, "history") {
-                Ok(out) => out,
-                Err(err) => {
-                    failed += 1;
-                    outcomes.push(format!(
-                        "failed key={} ratio={:.4} used={} max={} reason=archive-failed error={err:#}",
-                        target.session_id, target.usage_ratio, target.used_tokens, target.max_tokens
-                    ));
-                    continue;
-                }
-            };
-
-            if !archived.record.indexed {
-                failed += 1;
-                outcomes.push(format!(
-                    "failed key={} ratio={:.4} used={} max={} reason=index-failed archive={}",
-                    target.session_id,
-                    target.usage_ratio,
-                    target.used_tokens,
-                    target.max_tokens,
-                    archived.record.archive_path
-                ));
-                continue;
-            }
-            let mapped = match channel_archive_map::upsert(
+            let session_id = doc
+                .path
+                .file_stem()
+                .and_then(|v| v.to_str())
+                .unwrap_or("session")
+                .to_string();
+            let out = run_distillation(
                 &paths,
-                &target.session_id,
-                &archived.record.source_path,
-                &archived.record.archive_path,
-            ) {
-                Ok(record) => record,
-                Err(err) => {
-                    failed += 1;
-                    outcomes.push(format!(
-                        "failed key={} ratio={:.4} used={} max={} reason=channel-archive-map-failed archive={} error={err:#}",
-                        target.session_id,
-                        target.usage_ratio,
-                        target.used_tokens,
-                        target.max_tokens,
-                        archived.record.archive_path
-                    ));
-                    continue;
-                }
-            };
-
-            let line = match gateway::run_sessions_compact(&target.session_id) {
-                Ok(summary) => {
-                    succeeded += 1;
-                    let index_note = match gateway::run_sessions_index_note(
-                        &target.session_id,
-                        &mapped.archive_path,
-                        archived.record.projection_path.as_deref(),
-                        &archived.record.source_path,
-                        &archived.record.content_hash,
-                        &archived.record.indexed_collection,
-                    ) {
-                        Ok(note) => note,
-                        Err(err) => {
-                            warn::emit(WarnEvent {
-                                code: "INDEX_NOTE_FAILED",
-                                stage: "compaction",
-                                action: "write-index-note",
-                                session: &target.session_id,
-                                archive: &mapped.archive_path,
-                                source: &archived.record.source_path,
-                                retry: "retry-next-cycle",
-                                reason: "chat-send-index-note-failed",
-                                err: &format!("{err:#}"),
-                            });
-                            format!("index_note_failed error={err:#}")
-                        }
-                    };
-                    format!(
-                        "ok key={} ratio={:.4} used={} max={} archived={} {} {}",
-                        target.session_id,
-                        target.usage_ratio,
-                        target.used_tokens,
-                        target.max_tokens,
-                        mapped.archive_path,
-                        summary,
-                        index_note
-                    )
-                }
-                Err(err) => {
-                    failed += 1;
-                    format!(
-                        "failed key={} ratio={:.4} used={} max={} archived={} error={err:#}",
-                        target.session_id,
-                        target.usage_ratio,
-                        target.used_tokens,
-                        target.max_tokens,
-                        mapped.archive_path
-                    )
-                }
-            };
-            outcomes.push(line);
-        }
-
-        let compact_result = format!(
-            "targets={} succeeded={} failed={} {}",
-            compaction_targets.len(),
-            succeeded,
-            failed,
-            outcomes.join(" | ")
-        );
-
-        let status = if failed > 0 { "degraded" } else { "ok" };
-
-        audit::append_event(&paths, "compaction", status, &compact_result)?;
-        compaction_result = Some(compact_result);
-    } else if compaction_result.is_none() && !compaction_notes.is_empty() {
-        compaction_result = Some(format!(
-            "skipped reason=no-targets {}",
-            compaction_notes.join(" | ")
-        ));
-    }
-
-    let mut distill_notes = Vec::<String>::new();
-    let mut distill_candidates = Vec::<(crate::moon::archive::ArchiveRecord, String)>::new();
-
-    let residential_tz = parse_residential_tz(&cfg);
-    let current_day_key =
-        day_key_for_epoch_in_timezone(usage.captured_at_epoch_secs, residential_tz);
-    let last_syns_day_key = state
-        .last_syns_trigger_epoch_secs
-        .map(|epoch| day_key_for_epoch_in_timezone(epoch, residential_tz));
-    let should_select_distill = if run_opts.force_distill_now {
-        distill_notes.push("manual_trigger=true".to_string());
-        true
-    } else if !is_cooldown_ready(
-        state.last_distill_trigger_epoch_secs,
-        usage.captured_at_epoch_secs,
-        cfg.watcher.cooldown_secs,
-    ) {
-        distill_notes.push(format!(
-            "skipped reason=cooldown cooldown_secs={}",
-            cfg.watcher.cooldown_secs
-        ));
-        false
-    } else {
-        true
-    };
-
-    if should_select_distill {
-        match select_pending_distill_candidates(&paths, &state, cfg.distill.max_per_cycle) {
-            Ok((candidates, notes)) => {
-                distill_candidates = candidates;
-                distill_notes.extend(notes);
-            }
-            Err(err) => {
-                warn::emit(WarnEvent {
-                    code: "LEDGER_READ_FAILED",
-                    stage: "distill-selection",
-                    action: "read-ledger",
-                    session: "na",
-                    archive: "na",
-                    source: "na",
-                    retry: "retry-next-cycle",
-                    reason: "ledger-read-failed",
-                    err: &format!("{err:#}"),
-                });
-                distill_notes.push(format!("skipped reason=ledger-read-failed error={err:#}"));
-            }
-        }
-    }
-
-    if !distill_candidates.is_empty() {
-        if !distill_notes.is_empty() {
-            let selection_status = if distill_notes.iter().any(|note| {
-                note.contains("archive-too-large") || note.contains("archive-stat-failed")
-            }) {
-                "degraded"
-            } else {
-                "ok"
-            };
-            audit::append_event(
-                &paths,
-                "distill",
-                selection_status,
-                &format!("selection {}", distill_notes.join(" | ")),
+                &DistillInput {
+                    session_id,
+                    archive_path: doc.path.display().to_string(),
+                    archive_text: String::new(),
+                    archive_epoch_secs: Some(doc.mtime_epoch_secs),
+                },
             )?;
-        }
-
-        for (record, distill_source_path) in distill_candidates {
-            let archive_path = record.archive_path.clone();
-            let input = DistillInput {
-                session_id: record.session_id.clone(),
-                archive_path: distill_source_path.clone(),
-                archive_text: String::new(),
-                archive_epoch_secs: Some(record.created_at_epoch_secs),
-            };
-
-            match run_distillation(&paths, &input) {
-                Ok(distill) => {
-                    state.last_distill_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-                    state
-                        .distilled_archives
-                        .insert(archive_path.clone(), usage.captured_at_epoch_secs);
-
-                    match build_continuity(
-                        &paths,
-                        &record.session_id,
-                        &record.archive_path,
-                        &distill.summary_path,
-                        extract_key_decisions(&distill.summary),
-                    ) {
-                        Ok(outcome) => {
-                            continuity_out = Some(outcome);
-                        }
-                        Err(err) => {
-                            warn::emit(WarnEvent {
-                                code: "CONTINUITY_FAILED",
-                                stage: "continuity",
-                                action: "build-continuity",
-                                session: &record.session_id,
-                                archive: &record.archive_path,
-                                source: &record.source_path,
-                                retry: "retry-next-cycle",
-                                reason: "continuity-build-failed",
-                                err: &format!("{err:#}"),
-                            });
-                        }
-                    }
-                    distill_out = Some(distill);
-                }
-                Err(err) => {
-                    if is_l1_norm_lock_contention(&err) {
-                        warn::emit(WarnEvent {
-                            code: "DISTILL_LOCKED",
-                            stage: "distill",
-                            action: "acquire-lock",
-                            session: &record.session_id,
-                            archive: &record.archive_path,
-                            source: &record.source_path,
-                            retry: "retry-next-cycle",
-                            reason: "l1-normalisation-lock-active",
-                            err: "l1-normalisation-lock-active",
-                        });
-                        audit::append_event(
-                            &paths,
-                            "distill",
-                            "degraded",
-                            &format!(
-                                "skipped reason=lock-active archive={} distill_source={} source={} session={}",
-                                record.archive_path,
-                                distill_source_path,
-                                record.source_path,
-                                record.session_id
-                            ),
-                        )?;
-                        break;
-                    }
-                    warn::emit(WarnEvent {
-                        code: "DISTILL_FAILED",
-                        stage: "distill",
-                        action: "run-distill",
-                        session: &record.session_id,
-                        archive: &record.archive_path,
-                        source: &record.source_path,
-                        retry: "retry-next-cycle",
-                        reason: "distillation-failed",
-                        err: &format!("{err:#}"),
-                    });
-                    audit::append_event(
-                        &paths,
-                        "distill",
-                        "degraded",
-                        &format!(
-                            "archive={} distill_source={} source={} session={} error={err:#}",
-                            record.archive_path,
-                            distill_source_path,
-                            record.source_path,
-                            record.session_id
-                        ),
-                    )?;
-                }
+            state
+                .distilled_archives
+                .insert(doc.path.display().to_string(), now_epoch);
+            state.last_distill_trigger_epoch_secs = Some(now_epoch);
+            distill_runs += 1;
+            last_distill = Some(out);
+            if !run_opts.force_distill_now && distill_runs >= cfg.distill.max_per_cycle as usize {
+                break;
             }
         }
     }
 
-    let embed_started = Instant::now();
-    let embed_run_opts = EmbedRunOptions {
-        collection_name: "history".to_string(),
-        max_docs: cfg.embed.max_docs_per_cycle as usize,
-        dry_run: false,
-        caller: EmbedCaller::Watcher,
-        max_cycle_secs: Some(cfg.embed.max_cycle_secs),
-    };
-    match embed::run(&paths, &mut state, &cfg.embed, &embed_run_opts) {
-        Ok(summary) => {
-            // Only log when something meaningful happened: work was done, a real skip
-            // reason occurred (cooldown / locked / capability-missing), or degraded.
-            // skip_reason="none" with embedded_docs=0 is a pure no-op — suppress the noise.
-            let is_noop = summary.skip_reason == "none" && summary.embedded_docs == 0;
-            if !is_noop || summary.degraded {
-                let line = format!(
-                    "mode={} capability={} selected={} embedded={} pending_before={} pending_after={} degraded={} skip_reason={}",
-                    summary.mode,
-                    summary.capability,
-                    summary.selected_docs,
-                    summary.embedded_docs,
-                    summary.pending_before,
-                    summary.pending_after,
-                    summary.degraded,
-                    summary.skip_reason
-                );
-                let status = if summary.degraded { "degraded" } else { "ok" };
-                let _ = audit::append_event(&paths, "embed", status, &line);
-                embed_result = Some(line);
-            }
-
-            if summary.skip_reason == "locked" {
-                warn::emit(WarnEvent {
-                    code: "EMBED_LOCKED",
-                    stage: "embed",
-                    action: "acquire-lock",
-                    session: &usage.session_id,
-                    archive: "na",
-                    source: "na",
-                    retry: "retry-next-cycle",
-                    reason: "embed-lock-active",
-                    err: "embed-lock-active",
-                });
-            } else if summary.skip_reason == "capability-missing" {
-                warn::emit(WarnEvent {
-                    code: "EMBED_CAPABILITY_MISSING",
-                    stage: "embed",
-                    action: "check-capability",
-                    session: &usage.session_id,
-                    archive: "na",
-                    source: "na",
-                    retry: "retry-next-cycle",
-                    reason: "embed-capability-missing",
-                    err: "qmd-embed-capability-missing",
-                });
-            }
-        }
-        Err(err) => {
-            let (code, action, reason) = match &err {
-                EmbedRunError::CapabilityMissing(_) => (
-                    "EMBED_CAPABILITY_MISSING",
-                    "check-capability",
-                    "capability-missing",
-                ),
-                EmbedRunError::Locked(_) => ("EMBED_LOCKED", "acquire-lock", "embed-lock-active"),
-                EmbedRunError::StatusFailed(_) => {
-                    ("EMBED_STATUS_FAILED", "run-embed", "embed-status-failed")
-                }
-                EmbedRunError::Failed(_) => ("EMBED_FAILED", "run-embed", "embed-failed"),
-            };
-            warn::emit(WarnEvent {
-                code,
-                stage: "embed",
-                action,
-                session: &usage.session_id,
-                archive: "na",
-                source: "na",
-                retry: "retry-next-cycle",
-                reason,
-                err: &format!("{err}"),
-            });
-            let line = format!("failed error={err}");
-            let _ = audit::append_event(&paths, "embed", "degraded", &line);
-            embed_result = Some(line);
-        }
-    }
-
-    if embed_started.elapsed().as_secs() > cfg.embed.max_cycle_secs {
-        warn::emit(WarnEvent {
-            code: "EMBED_FAILED",
-            stage: "embed",
-            action: "run-embed",
-            session: &usage.session_id,
-            archive: "na",
-            source: "na",
-            retry: "retry-next-cycle",
-            reason: "timeout",
-            err: "embed-run-exceeded-max-cycle-secs",
-        });
-        let timeout_note = format!("timeout max_cycle_secs={}", cfg.embed.max_cycle_secs);
-        let _ = audit::append_event(&paths, "embed", "degraded", &timeout_note);
-        if let Some(current) = embed_result.take() {
-            embed_result = Some(format!("{current} {timeout_note}"));
+    let syns_due = syns_due_now(&state, now_epoch, tz);
+    let mut syns_result = None;
+    if syns_due {
+        let yesterday_key = previous_day_key_for_epoch_in_timezone(now_epoch, tz);
+        let yesterday_source = paths.memory_dir.join(format!("{yesterday_key}.md"));
+        let sources = if yesterday_source.exists() {
+            vec![
+                yesterday_source.display().to_string(),
+                paths.memory_file.display().to_string(),
+            ]
         } else {
-            embed_result = Some(timeout_note);
-        }
-    }
-
-    // Run L2 synthesis once per residential day (first watcher cycle after midnight),
-    // after embed stage. Sources: yesterday daily memory + current memory.md (if present).
-    if last_syns_day_key.as_deref() != Some(current_day_key.as_str()) {
-        let syns_source_day_key =
-            previous_day_key_for_epoch_in_timezone(usage.captured_at_epoch_secs, residential_tz);
-        let mut syns_sources = vec![daily_memory_path_for_day_key(&paths, &syns_source_day_key)];
-        if paths.memory_file.exists() {
-            syns_sources.push(paths.memory_file.display().to_string());
-        }
-        match run_wisdom_distillation(
-            &paths,
-            &WisdomDistillInput {
-                trigger: "watcher".to_string(),
-                day_epoch_secs: Some(usage.captured_at_epoch_secs),
-                source_paths: syns_sources,
-                dry_run: false,
-            },
-        ) {
-            Ok(wisdom) => {
-                state.last_syns_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-                distill_out = Some(wisdom);
-            }
-            Err(err) => {
-                state.last_syns_trigger_epoch_secs = Some(usage.captured_at_epoch_secs);
-                warn::emit(WarnEvent {
-                    code: "WISDOM_DISTILL_FAILED",
-                    stage: "distill",
-                    action: "run-wisdom-distill",
-                    session: &usage.session_id,
-                    archive: "na",
-                    source: "na",
-                    retry: "retry-next-cycle",
-                    reason: "wisdom-distillation-failed",
-                    err: &format!("{err:#}"),
-                });
-                let _ = audit::append_event(
-                    &paths,
-                    "distill",
-                    "degraded",
-                    &format!(
-                        "mode=syns trigger=watcher error={err:#} fix=configure-primary-wisdom-model"
-                    ),
-                );
-            }
-        }
-    }
-
-    if let Some(summary) = cleanup_expired_distilled_archives(
-        &paths,
-        &mut state,
-        usage.captured_at_epoch_secs,
-        &cfg.retention,
-    )? {
-        let status = if summary.contains("failed=") && !summary.contains("failed=0") {
-            "degraded"
-        } else {
-            "ok"
+            Vec::new()
         };
-        audit::append_event(&paths, "archive-retention", status, &summary)?;
-        archive_retention_result = Some(summary);
+
+        if run_opts.dry_run {
+            syns_result = Some(format!(
+                "dry-run trigger=watch-midnight sources={}",
+                sources.join(",")
+            ));
+        } else {
+            let out = run_wisdom_distillation(
+                &paths,
+                &WisdomDistillInput {
+                    trigger: "watch-midnight".to_string(),
+                    day_epoch_secs: Some(now_epoch),
+                    source_paths: sources,
+                    dry_run: false,
+                },
+            )?;
+            state.last_syns_trigger_epoch_secs = Some(now_epoch);
+            syns_result = Some(format!(
+                "provider={} summary_path={}",
+                out.provider, out.summary_path
+            ));
+        }
     }
 
-    let file = save(&paths, &state)?;
+    state.last_heartbeat_epoch_secs = now_epoch;
+    let state_file = if run_opts.dry_run {
+        state_file_path(&paths)
+    } else {
+        save(&paths, &state)?
+    };
 
     Ok(WatchCycleOutcome {
-        state_file: file.display().to_string(),
-        heartbeat_epoch_secs: state.last_heartbeat_epoch_secs,
+        state_file: state_file.display().to_string(),
+        heartbeat_epoch_secs: now_epoch,
         poll_interval_secs: cfg.watcher.poll_interval_secs,
-        trigger_threshold: effective_trigger_threshold,
-        compaction_authority,
-        compaction_emergency_ratio: context_policy.map(|policy| policy.compaction_emergency_ratio),
-        compaction_recover_ratio: context_policy.map(|policy| policy.compaction_recover_ratio),
         distill_max_per_cycle: cfg.distill.max_per_cycle,
-        embed_mode: cfg.embed.mode.clone(),
-        embed_idle_secs: cfg.embed.idle_secs,
-        embed_max_docs_per_cycle: cfg.embed.max_docs_per_cycle,
-        retention_active_days: cfg.retention.active_days,
-        retention_warm_days: cfg.retention.warm_days,
-        retention_cold_days: cfg.retention.cold_days,
-        usage,
-        triggers: trigger_names,
-        inbound_watch,
-        archive: archive_out,
-        compaction_result,
-        distill: distill_out,
-        embed_result,
-        continuity: continuity_out,
-        archive_retention_result,
+        pending_mds_docs: pending_count,
+        distill_runs,
+        syns_due,
+        distill: last_distill,
+        syns_result,
     })
 }
 
 pub fn run_daemon() -> Result<()> {
-    let _daemon_lock = acquire_daemon_lock().map_err(|err| {
-        if let Ok(paths) = resolve_paths() {
-            let _ = audit::append_event(
-                &paths,
-                "daemon",
-                "failed",
-                &format!(
-                    "code={} reason=lock-acquisition-failed err={err:#}",
-                    crate::error::MoonErrorCode::E001Locked.as_str()
-                ),
-            );
-        }
-        anyhow::anyhow!("failed to acquire lock: {err:#}")
-    })?;
+    let paths = resolve_paths()?;
+    let cfg = load_config()?;
+    let now_epoch = now_epoch_secs()?;
+    let _lock_path = write_daemon_lock(&paths, now_epoch)?;
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let r = shutdown.clone();
-    ctrlc::set_handler(move || {
-        r.store(true, Ordering::SeqCst);
-        eprintln!("\nmoon: shutdown signal received, finishing current cycle...");
-    })
-    .with_context(|| "failed to set shutdown signal handler")?;
+    let keep_running = Arc::new(AtomicBool::new(true));
+    {
+        let keep_running = Arc::clone(&keep_running);
+        ctrlc::set_handler(move || {
+            keep_running.store(false, Ordering::SeqCst);
+        })
+        .context("failed to install ctrl-c handler")?;
+    }
 
-    let mut consecutive_failures = 0u32;
-    let mut consecutive_panics = 0u32;
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let cycle_result =
-            std::panic::catch_unwind(|| run_once_with_options(WatchRunOptions::default()));
-
-        match cycle_result {
-            Ok(Ok(cycle)) => {
-                consecutive_failures = 0;
-                consecutive_panics = 0;
-                let sleep_for_secs = cycle.poll_interval_secs.max(1);
-
-                // Responsive sleep: check shutdown flag every second.
-                for _ in 0..sleep_for_secs {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs(1));
-                }
+    while keep_running.load(Ordering::SeqCst) {
+        let _ = run_once();
+        for _ in 0..cfg.watcher.poll_interval_secs {
+            if !keep_running.load(Ordering::SeqCst) {
+                break;
             }
-            Ok(Err(err)) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                consecutive_panics = 0;
-                let base_secs = load_config()
-                    .map(|cfg| cfg.watcher.poll_interval_secs.max(1))
-                    .unwrap_or(30);
-                let exponent = consecutive_failures.saturating_sub(1).min(4);
-                let multiplier = 1u64 << exponent;
-                let retry_in_secs = base_secs.saturating_mul(multiplier).min(300);
-
-                if let Ok(paths) = resolve_paths() {
-                    let _ = audit::append_event(
-                        &paths,
-                        "watcher",
-                        "degraded",
-                        &format!(
-                            "daemon cycle failed retry_in_secs={} consecutive_failures={} error={err:#}",
-                            retry_in_secs, consecutive_failures
-                        ),
-                    );
-                }
-
-                eprintln!(
-                    "moon watcher cycle failed; retrying in {}s: {err:#}",
-                    retry_in_secs
-                );
-
-                for _ in 0..retry_in_secs {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
-            Err(panic_err) => {
-                consecutive_panics = consecutive_panics.saturating_add(1);
-                consecutive_failures = 0;
-
-                let panic_msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_err.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown-panic-payload".to_string()
-                };
-
-                if let Ok(paths) = resolve_paths() {
-                    let _ = audit::append_event(
-                        &paths,
-                        "watcher",
-                        "alert",
-                        &format!(
-                            "DAEMON_PANIC consecutive_panics={} error={}",
-                            consecutive_panics, panic_msg
-                        ),
-                    );
-                }
-
-                eprintln!(
-                    "moon watcher panicked (count: {}); error: {}",
-                    consecutive_panics, panic_msg
-                );
-
-                if consecutive_panics >= 3 {
-                    if let Ok(paths) = resolve_paths() {
-                        let _ = audit::append_event(
-                            &paths,
-                            "watcher",
-                            "alert",
-                            "DAEMON_PANIC_HALT after 3 consecutive panics",
-                        );
-                    }
-                    anyhow::bail!("DAEMON_PANIC_HALT: consecutive panic threshold reached");
-                }
-
-                // Wait a bit before retrying after a panic (responsive).
-                for _ in 0..30 {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs(1));
-                }
-            }
+            thread::sleep(Duration::from_secs(1));
         }
     }
 
-    eprintln!("moon: graceful shutdown complete.");
+    remove_daemon_lock(&paths);
     Ok(())
 }

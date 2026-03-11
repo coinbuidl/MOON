@@ -1,15 +1,13 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::commands::CommandReport;
-use crate::moon::archive::{ArchiveRecord, projection_path_for_archive, read_ledger_records};
 use crate::moon::distill::{
     DistillInput, WisdomDistillInput, archive_file_size, run_distillation, run_wisdom_distillation,
 };
 use crate::moon::paths::{MoonPaths, resolve_paths};
-use crate::moon::state::load;
+use crate::moon::state::{load, save};
 
 #[derive(Debug, Clone)]
 pub struct MoonDistillOptions {
@@ -20,124 +18,22 @@ pub struct MoonDistillOptions {
     pub dry_run: bool,
 }
 
-fn is_distillable_archive_record(record: &ArchiveRecord) -> bool {
-    let source_path = Path::new(&record.source_path);
-    let archive_path = Path::new(&record.archive_path);
-
-    let source_file = source_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let archive_file = archive_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let source_ext = source_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let archive_ext = archive_path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if source_file == "sessions.json" {
-        return false;
-    }
-    if source_ext == "lock"
-        || archive_ext == "lock"
-        || source_file.ends_with(".lock")
-        || archive_file.ends_with(".lock")
-    {
-        return false;
-    }
-    if archive_ext == "json" && archive_file.starts_with("sessions-") {
-        return false;
-    }
-
-    true
-}
-
-fn resolve_norm_projection_path(paths: &MoonPaths, record: &ArchiveRecord) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(path) = record.projection_path.as_deref() {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            candidates.push(PathBuf::from(trimmed));
-        }
-    }
-    candidates.push(projection_path_for_archive(&record.archive_path));
-
-    for candidate in candidates {
-        if !candidate.exists() {
-            continue;
-        }
-        let is_markdown = candidate
-            .extension()
-            .and_then(|v| v.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-        if !is_markdown {
-            continue;
-        }
-        let mlib_root = paths.archives_dir.join("mlib");
-        let normalized_candidate =
-            fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-        let normalized_mlib_root = fs::canonicalize(&mlib_root).unwrap_or(mlib_root);
-        let in_mlib = normalized_candidate.starts_with(normalized_mlib_root);
-        if in_mlib {
-            return Some(candidate);
-        }
-    }
-
-    None
-}
-
 fn normalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn resolve_pending_manual_norm_target(
-    paths: &MoonPaths,
-    archive_path: &Path,
-) -> Result<(ArchiveRecord, String)> {
-    let state = load(paths)?;
-    let requested = normalize_path(archive_path);
+fn mds_root(paths: &MoonPaths) -> PathBuf {
+    paths.moon_home.join("mds")
+}
 
-    let mut matched: Option<(ArchiveRecord, String)> = None;
-    for record in read_ledger_records(paths)? {
-        if !record.indexed || state.distilled_archives.contains_key(&record.archive_path) {
-            continue;
-        }
-        if !is_distillable_archive_record(&record) {
-            continue;
-        }
-        let Some(projection_path) = resolve_norm_projection_path(paths, &record) else {
-            continue;
-        };
-        if normalize_path(&projection_path) != requested {
-            continue;
-        }
-
-        let projection_display = projection_path.display().to_string();
-        match &matched {
-            Some((current, _)) if current.created_at_epoch_secs <= record.created_at_epoch_secs => {
-            }
-            _ => matched = Some((record, projection_display)),
-        }
-    }
-
-    match matched {
-        Some(found) => Ok(found),
-        None => {
-            anyhow::bail!(
-                "norm source is not pending: no matching undistilled archives/mlib/*.md found in ledger"
-            )
-        }
-    }
+fn is_mds_doc(paths: &MoonPaths, path: &Path) -> bool {
+    let normalized_path = normalize_path(path);
+    let normalized_root = normalize_path(&mds_root(paths));
+    normalized_path.starts_with(normalized_root)
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
 pub fn run(opts: &MoonDistillOptions) -> Result<CommandReport> {
@@ -205,12 +101,8 @@ pub fn run(opts: &MoonDistillOptions) -> Result<CommandReport> {
     };
 
     let archive_file = Path::new(archive_path);
-    let is_projection_md = archive_file
-        .extension()
-        .and_then(|v| v.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-    if !is_projection_md {
-        anyhow::bail!("norm mode requires -archive <archives/mlib/*.md>");
+    if !is_mds_doc(&paths, archive_file) {
+        anyhow::bail!("norm mode requires -archive <$MOON_HOME/mds/*.md>");
     }
     if !archive_file.is_file() {
         anyhow::bail!("norm archive path is not a readable file: {}", archive_path);
@@ -220,13 +112,21 @@ pub fn run(opts: &MoonDistillOptions) -> Result<CommandReport> {
     let archive_size = archive_file_size(archive_path)
         .with_context(|| format!("failed to stat {}", archive_path))?;
 
-    let (pending_record, pending_projection_path) =
-        resolve_pending_manual_norm_target(&paths, archive_file)?;
-    let session_id = opts
-        .session_id
-        .clone()
-        .unwrap_or_else(|| pending_record.session_id.clone());
-    let archive_epoch_secs = Some(pending_record.created_at_epoch_secs);
+    let archive_epoch_secs = Some(
+        fs::metadata(archive_file)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|v| v.as_secs())
+            .unwrap_or(0),
+    );
+    let session_id = opts.session_id.clone().unwrap_or_else(|| {
+        archive_file
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .unwrap_or("session")
+            .to_string()
+    });
 
     if opts.dry_run {
         report.detail("distill.dry_run=true".to_string());
@@ -239,13 +139,21 @@ pub fn run(opts: &MoonDistillOptions) -> Result<CommandReport> {
         &paths,
         &DistillInput {
             session_id,
-            archive_path: pending_projection_path,
+            archive_path: archive_path.to_string(),
             archive_text: String::new(),
             archive_epoch_secs,
         },
     )?;
-    report.detail("distill.mode=norm".to_string());
 
+    let mut state = load(&paths)?;
+    state.distilled_archives.insert(
+        archive_file.display().to_string(),
+        crate::moon::util::now_epoch_secs()?,
+    );
+    state.last_distill_trigger_epoch_secs = Some(crate::moon::util::now_epoch_secs()?);
+    let _ = save(&paths, &state)?;
+
+    report.detail("distill.mode=norm".to_string());
     report.detail(format!("provider={}", out.provider));
     report.detail(format!("summary_path={}", out.summary_path));
     report.detail(format!("audit_log_path={}", out.audit_log_path));
