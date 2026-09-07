@@ -30,7 +30,8 @@ For each agent turn:
    durable memories.
 10. Deterministic confidence, importance, exact-quote, numeric-entailment, and
     correction checks run before SQLite accepts a proposal.
-11. Valid proposals are sent in one bounded batch.
+11. Valid proposals are sent in one bounded, atomic batch. A rejected proposal
+    leaves all memories from that batch unchanged.
 12. Moon drains a bounded local-embedding batch. Active memories are processed
     before references; raw evidence is excluded.
 
@@ -43,16 +44,23 @@ cargo test --locked --all-targets --all-features
 cargo build --locked --release
 deno fmt --check assets/openclaw-plugin tools
 deno lint assets/openclaw-plugin tools
-deno test --node-modules-dir=none \
-  --allow-read --allow-write --allow-env --allow-run \
-  assets/openclaw-plugin/index.test.ts
+sh tools/test-openclaw-adapter.sh "$PWD/target/release/moon"
 ```
+
+The helper creates and removes a temporary synthetic corpus, requires the real
+binary retrieval and SQLite retry tests, and checks that ambient Moon
+environment overrides cannot redirect storage. CI runs the same helper against
+its Linux release artifact. It makes no provider or OpenClaw gateway calls.
+Without an explicit test binary and home, direct Deno runs mark those two
+integration tests as ignored; `MOON_REQUIRE_REAL_BINARY=1` makes missing
+configuration a failure.
 
 For a real-binary adapter test, point the test at an existing isolated runtime:
 
 ```bash
 MOON_TEST_BINARY="$PWD/target/release/moon" \
 MOON_TEST_HOME="/path/to/isolated/moon-home" \
+MOON_REQUIRE_REAL_BINARY=1 \
 MOON_TEST_MODE="hybrid" \
 MOON_TEST_QUERY="What model should Moon use for fast work and deep work?" \
 MOON_TEST_EXPECTED="gpt-5.6-luna|gpt-5.6-sol" \

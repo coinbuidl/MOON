@@ -19,10 +19,15 @@ process with the retired legacy implementation.
 ## Memory lifecycle
 
 Completed sessions are recorded as immutable, secret-scrubbed evidence.
-Distillation creates a smaller canonical claim linked to an exact evidence byte
-and line range. Repeated claims confirm the existing memory; changed claims
-require explicit supersession. The old claim remains auditable but is excluded
-from normal retrieval.
+Scrubbing also covers sensitive quoted keys in JSON embedded in prose or code
+fences. Distillation creates a smaller canonical claim linked to an exact
+evidence byte and line range. Repeated claims confirm the existing memory;
+changed claims require explicit supersession. The old claim remains auditable
+but is excluded from normal retrieval.
+
+`distill-batch` commits all proposals in one SQLite transaction. A later invalid
+quote or conflicting head rolls back earlier creations, confirmations and
+supersessions, so a failed batch leaves no partial memory changes.
 
 Context assembly selects pinned summaries and relevant active memories, dedupes
 chunk hits by memory, attaches bounded citations, and fits the result to an
@@ -34,8 +39,8 @@ untrusted data rather than agent instructions.
 
 The OpenClaw adapter records one immutable evidence document per completed turn,
 using a stable parent-session and content fingerprint. It keeps the user request
-and final answer and omits intermediate tool traffic. A conservative Luna-medium
-curator may propose at most three memories. Deterministic validation requires an
+and final answer and omits intermediate tool traffic. The configured curator
+model may propose at most three memories. Deterministic validation requires an
 exact supporting quote, complete numeric support, sufficient term overlap,
 minimum confidence and importance, and explicit correction intent before
 supersession.

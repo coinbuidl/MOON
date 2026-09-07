@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -199,11 +200,7 @@ function resolveSettings(api) {
 }
 
 function contextArguments(settings, query) {
-  const argv = [settings.moonPath];
-  if (settings.moonHome) {
-    argv.push("--home", settings.moonHome);
-  }
-  argv.push("--dimensions", String(settings.dimensions));
+  const argv = baseMoonArguments(settings);
   argv.push(
     "context",
     "--query",
@@ -277,7 +274,13 @@ function runtimeMetricArguments(settings, metric) {
 function baseMoonArguments(settings, json = false) {
   const argv = [settings.moonPath];
   if (settings.moonHome) {
-    argv.push("--home", settings.moonHome);
+    // An explicitly selected home must override an inherited MOON_DATABASE.
+    argv.push(
+      "--home",
+      settings.moonHome,
+      "--database",
+      join(settings.moonHome, "state", "moon.sqlite"),
+    );
   }
   argv.push("--dimensions", String(settings.dimensions));
   if (json) {
@@ -741,11 +744,32 @@ function parseJsonObject(value) {
   return JSON.parse(text.slice(first, last + 1));
 }
 
+function normalizeNumericEvidence(value) {
+  const numbers = new Set();
+  const text = value.toLowerCase().replace(
+    /[+\-−]?(?:\d+(?:[.,:/+\-−]\d+)*|\.\d+)(?:e[+\-−]?\d+)?/g,
+    (token) => {
+      // Keep identifiers and date/time/version sequences intact. Only an
+      // ordinary number with complete three-digit groups permits comma removal.
+      let normalized = token.replaceAll("−", "-");
+      if (
+        /^[+-]?[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?(?:e[+-]?\d+)?$/
+          .test(normalized)
+      ) {
+        normalized = normalized.replaceAll(",", "");
+      }
+      numbers.add(normalized);
+      return normalized;
+    },
+  );
+  return { text, numbers };
+}
+
 function evidenceSupportsContent(content, evidenceQuote) {
-  const normalizedQuote = evidenceQuote.toLowerCase();
-  const numbers = [...content.matchAll(/\d+(?:[.:]\d+)?/g)]
-    .map((match) => match[0]);
-  if (numbers.some((number) => !normalizedQuote.includes(number))) {
+  const claim = normalizeNumericEvidence(content);
+  const evidence = normalizeNumericEvidence(evidenceQuote);
+  const normalizedQuote = evidence.text;
+  if ([...claim.numbers].some((number) => !evidence.numbers.has(number))) {
     return false;
   }
   const stopWords = new Set([
@@ -767,8 +791,7 @@ function evidenceSupportsContent(content, evidenceQuote) {
     "using",
     "with",
   ]);
-  const terms = content
-    .toLowerCase()
+  const terms = claim.text
     .split(/[^\p{L}\p{N}._+-]+/u)
     .filter((term) => term.length >= 4 && !stopWords.has(term));
   const uniqueTerms = [...new Set(terms)];
@@ -911,6 +934,7 @@ class MoonStdioClient {
     this.buffer = "";
     this.nextId = 1;
     this.pending = new Map();
+    this.childClosures = new Map();
   }
 
   start() {
@@ -922,11 +946,23 @@ class MoonStdioClient {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
+    this.childClosures.set(
+      child,
+      new Promise((resolve) => {
+        child.once("close", () => {
+          this.childClosures.delete(child);
+          resolve();
+        });
+      }),
+    );
     child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => this.onData(chunk));
-    child.on("error", (error) => this.onExit(error));
+    child.stdout.on("data", (chunk) => this.onData(child, chunk));
+    child.stdout.on("error", (error) => this.onExit(child, error));
+    child.stdin.on("error", (error) => this.onExit(child, error));
+    child.on("error", (error) => this.onExit(child, error));
     child.on("exit", (code, signal) => {
       this.onExit(
+        child,
         new Error(
           `moon worker exited code=${String(code)} signal=${String(signal)}`,
         ),
@@ -934,7 +970,8 @@ class MoonStdioClient {
     });
   }
 
-  onData(chunk) {
+  onData(child, chunk) {
+    if (child !== this.child) return;
     this.buffer += chunk;
     while (true) {
       const newline = this.buffer.indexOf("\n");
@@ -947,7 +984,7 @@ class MoonStdioClient {
       try {
         response = JSON.parse(line);
       } catch {
-        this.onExit(new Error("moon worker returned invalid JSON"));
+        this.onExit(child, new Error("moon worker returned invalid JSON"));
         return;
       }
       const pending = this.pending.get(response?.id);
@@ -970,8 +1007,8 @@ class MoonStdioClient {
     }
   }
 
-  onExit(error) {
-    const child = this.child;
+  onExit(child, error) {
+    if (child !== this.child) return;
     this.child = null;
     this.buffer = "";
     for (const pending of this.pending.values()) {
@@ -986,28 +1023,32 @@ class MoonStdioClient {
 
   request(operation, timeoutMs) {
     this.start();
+    const child = this.child;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(
+        this.onExit(
+          child,
           new Error(`moon worker request timed out after ${timeoutMs}ms`),
         );
-        this.dispose();
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.child.stdin.write(`${JSON.stringify({ id, ...operation })}\n`);
+      try {
+        child.stdin.write(`${JSON.stringify({ id, ...operation })}\n`);
+      } catch (error) {
+        this.onExit(child, error);
+      }
     });
   }
 
   dispose() {
     const child = this.child;
-    if (!child) {
-      return Promise.resolve();
+    if (child) {
+      this.onExit(child, new Error("moon worker disposed"));
     }
-    const closed = new Promise((resolve) => child.once("close", resolve));
-    this.onExit(new Error("moon worker disposed"));
-    return closed;
+    // A replacement may already exist while a timed-out predecessor is still
+    // closing. Service shutdown waits for both without killing either twice.
+    return Promise.all([...this.childClosures.values()]).then(() => {});
   }
 }
 
@@ -1368,7 +1409,7 @@ function createMoonContextEngine(api, sharedWorkerState = null) {
     info: {
       id: "moon",
       name: "Moon SQLite Context Engine",
-      version: "2.5.3",
+      version: "2.5.4",
       ownsCompaction: false,
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
@@ -1549,6 +1590,7 @@ export default {
 };
 
 export const __moonTest = {
+  MoonStdioClient,
   acceptedTurnFromParams,
   contextArguments,
   compactionPrompt,

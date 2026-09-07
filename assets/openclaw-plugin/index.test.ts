@@ -1,6 +1,29 @@
 import moonPlugin, { __moonTest } from "./index.js";
+import { EventEmitter } from "node:events";
+import type { spawn } from "node:child_process";
 
 const METRIC_REQUEST_ID = "0123456789abcdef0123456789abcdef";
+
+async function optionalTestEnv(name: string) {
+  const permission = await Deno.permissions.query({
+    name: "env",
+    variable: name,
+  });
+  return permission.state === "granted" ? Deno.env.get(name) : undefined;
+}
+
+const realMoonBinary = await optionalTestEnv("MOON_TEST_BINARY");
+const realMoonHome = await optionalTestEnv("MOON_TEST_HOME");
+const requireRealMoon =
+  await optionalTestEnv("MOON_REQUIRE_REAL_BINARY") === "1";
+if (requireRealMoon && (!realMoonBinary || !realMoonHome)) {
+  throw new Error(
+    "required real-binary tests need MOON_TEST_BINARY and MOON_TEST_HOME",
+  );
+}
+const realMoonConfig = realMoonBinary && realMoonHome
+  ? { binary: realMoonBinary, home: realMoonHome }
+  : null;
 
 function acceptedParams(messages: Array<Record<string, unknown>>) {
   const admission = {
@@ -122,11 +145,13 @@ Deno.test("adapter retrieves and injects context before the latest user message"
   const result = await engine.assemble({ messages });
   assertEquals(calls.length, 2);
   assertEquals(
-    calls[0].argv.slice(0, 7),
+    calls[0].argv.slice(0, 9),
     [
       "/tmp/bin/moon",
       "--home",
       "/tmp/moon-home",
+      "--database",
+      "/tmp/moon-home/state/moon.sqlite",
       "--dimensions",
       "384",
       "context",
@@ -445,6 +470,8 @@ Deno.test("hybrid mode uses the private local stdio worker", () => {
       "/tmp/bin/moon",
       "--home",
       "/tmp/moon-home",
+      "--database",
+      "/tmp/moon-home/state/moon.sqlite",
       "--dimensions",
       "384",
       "serve",
@@ -470,6 +497,182 @@ Deno.test("hybrid mode uses the private local stdio worker", () => {
     ).observe,
     true,
   );
+});
+
+Deno.test("adapter commands pin every explicit home to its own database", () => {
+  const settings = __moonTest.resolveSettings(createApi(
+    { code: 0, stdout: "", stderr: "" },
+    [],
+    { moonHome: "/tmp/moon isolated home/", mode: "hybrid" },
+  ));
+  const turn = {
+    evidenceSessionId: "isolated-turn",
+    completedAtMs: 100,
+    metadata: {},
+  };
+  for (
+    const argv of [
+      __moonTest.contextArguments(settings, "query"),
+      __moonTest.stdioWorkerArguments(settings),
+      __moonTest.recordArguments(settings, turn),
+      __moonTest.distillBatchArguments(settings, turn.evidenceSessionId),
+      __moonTest.metricInjectionArguments(settings, METRIC_REQUEST_ID, true),
+      __moonTest.runtimeMetricArguments(settings, {
+        event_kind: "learning",
+        status: "ok",
+        duration_us: 0,
+      }),
+    ]
+  ) {
+    const databaseFlag = argv.indexOf("--database");
+    assert(databaseFlag > 0, "explicit --home must override MOON_DATABASE");
+    assertEquals(
+      argv[databaseFlag + 1],
+      "/tmp/moon isolated home/state/moon.sqlite",
+    );
+  }
+  const implicit = { ...settings, moonHome: null };
+  assert(
+    !__moonTest.contextArguments(implicit, "query").includes("--database"),
+  );
+  assert(!__moonTest.stdioWorkerArguments(implicit).includes("--database"));
+});
+
+function fakeMoonWorker() {
+  const written: string[] = [];
+  return Object.assign(new EventEmitter(), {
+    stdout: Object.assign(new EventEmitter(), { setEncoding() {} }),
+    stdin: Object.assign(new EventEmitter(), {
+      write(value: string) {
+        written.push(value);
+        return true;
+      },
+    }),
+    written,
+    killed: false,
+    killCount: 0,
+    kill() {
+      this.killed = true;
+      this.killCount += 1;
+      return true;
+    },
+  });
+}
+
+function fakeMoonSpawner(children: ReturnType<typeof fakeMoonWorker>[]) {
+  // The injected child implements only the stdio/process events used by Moon.
+  return (() => {
+    const child = fakeMoonWorker();
+    children.push(child);
+    return child;
+  }) as unknown as typeof spawn;
+}
+
+Deno.test("worker timeout recovery ignores retired output errors and exit", async () => {
+  const children: ReturnType<typeof fakeMoonWorker>[] = [];
+  const settings = __moonTest.resolveSettings(createApi(
+    { code: 0, stdout: "", stderr: "" },
+    [],
+  ));
+  const client = new __moonTest.MoonStdioClient(
+    settings,
+    fakeMoonSpawner(children),
+  );
+  const timedOut = await client.request({ op: "context" }, 1).catch(
+    (error: Error) => error.message,
+  );
+  assertEquals(timedOut, "moon worker request timed out after 1ms");
+  const retired = children[0];
+  const replacement = client.request({ op: "context" }, 1_000);
+  const active = children[1];
+  const { id } = JSON.parse(active.written[0]);
+  active.stdout.emit("data", `{"id":${id},"ok":true,"result":`);
+  retired.stdout.emit("data", "invalid retired output\n");
+  retired.emit("error", new Error("retired process error"));
+  retired.stdout.emit("error", new Error("retired stdout error"));
+  retired.stdin.emit("error", new Error("retired stdin error"));
+  retired.emit("exit", null, "SIGTERM");
+  retired.emit("close", null, "SIGTERM");
+  active.stdout.emit("data", '"recovered"}\n');
+  assertEquals(await replacement, "recovered");
+  assertEquals(active.killCount, 0);
+  assert(Object.is(client.child, active));
+  assertEquals(retired.killCount, 1);
+  const disposed = client.dispose();
+  active.emit("exit", null, "SIGTERM");
+  active.emit("close", null, "SIGTERM");
+  await disposed;
+});
+
+Deno.test("worker disposal waits for retiring children and is idempotent", async () => {
+  const children: ReturnType<typeof fakeMoonWorker>[] = [];
+  const settings = __moonTest.resolveSettings(createApi(
+    { code: 0, stdout: "", stderr: "" },
+    [],
+  ));
+  const client = new __moonTest.MoonStdioClient(
+    settings,
+    fakeMoonSpawner(children),
+  );
+  const timedOut = client.request({ op: "context" }, 1).catch(() => {});
+  await timedOut;
+  const replacement = client.request({ op: "context" }, 1_000).catch(
+    (error: Error) => error.message,
+  );
+  let disposed = false;
+  const first = client.dispose().then(() => {
+    disposed = true;
+  });
+  const repeated = client.dispose();
+  assertEquals(await replacement, "moon worker disposed");
+  assertEquals(children.map((child) => child.killCount), [1, 1]);
+  children[1].emit("close", null, "SIGTERM");
+  await Promise.resolve();
+  assertEquals(disposed, false);
+  children[0].emit("close", null, "SIGTERM");
+  await Promise.all([first, repeated]);
+  assertEquals(disposed, true);
+  assertEquals(client.pending.size, 0);
+  assertEquals(client.childClosures.size, 0);
+  await client.dispose();
+  assertEquals(children.map((child) => child.killCount), [1, 1]);
+});
+
+Deno.test("worker pipe failures reject pending work and clear request timers", async () => {
+  const settings = __moonTest.resolveSettings(createApi(
+    { code: 0, stdout: "", stderr: "" },
+    [],
+  ));
+  for (const failure of ["write", "stdin", "stdout"] as const) {
+    const children: ReturnType<typeof fakeMoonWorker>[] = [];
+    const client = new __moonTest.MoonStdioClient(
+      settings,
+      fakeMoonSpawner(children),
+    );
+    client.start();
+    const child = children[0];
+    if (failure === "write") {
+      child.stdin.write = () => {
+        throw new Error("pipe failed");
+      };
+    }
+    const request = client.request({ op: "context" }, 1_000).catch(
+      (error: Error) => error.message,
+    );
+    if (failure !== "write") {
+      child[failure].emit(
+        "error",
+        new Error("pipe failed"),
+      );
+    }
+    assertEquals(await request, "pipe failed");
+    assertEquals(client.pending.size, 0);
+    assertEquals(client.child, null);
+    assertEquals(child.killCount, 1);
+    const disposed = client.dispose();
+    child.emit("close", null, "SIGTERM");
+    await disposed;
+  }
 });
 
 Deno.test("plugin manifest is a strict context-engine manifest", async () => {
@@ -1014,6 +1217,108 @@ Deno.test("learning evidence must support every numeric claim", () => {
   );
 });
 
+Deno.test("learning numeric grounding compares complete values without precision loss", () => {
+  for (
+    const [claim, quote] of [
+      ["100", "1000"],
+      ["10", "10.5"],
+      ["-100", "100"],
+      ["100", "-100"],
+      ["+100", "-100"],
+      ["0.5", ".5"],
+      ["5", ".5"],
+      ["1", "1e3"],
+      ["1e3", "1e30"],
+      ["2026-09-07", "2026-09-07-01"],
+      ["2026", "2026-09-07"],
+      ["11:30", "11:30:59"],
+      ["2.5", "2.5.3"],
+      ["1/2", "1/20"],
+      ["100", "1,000"],
+      ["1000", "10,00"],
+      ["1000", "1,0000"],
+      ["1234567", "12,34,567"],
+      ["1000", "1,000.00"],
+      ["9007199254740992", "9007199254740993"],
+      ["123456789012345678901", "1234567890123456789010"],
+    ]
+  ) {
+    assert(
+      !__moonTest.evidenceSupportsContent(
+        `The recorded value is ${claim}.`,
+        `The recorded value is ${quote}.`,
+      ),
+      `${JSON.stringify(claim)} must not be supported by ${
+        JSON.stringify(quote)
+      }`,
+    );
+  }
+  for (
+    const [claim, quote] of [
+      ["100", "100"],
+      ["-100", "-100"],
+      ["+100", "+100"],
+      ["-100", "−100"],
+      [".5", ".5"],
+      ["-.5", "−.5"],
+      ["10.5", "10.5"],
+      ["1e-3", "1E-3"],
+      ["2026-09-07", "2026-09-07"],
+      ["11:30:59", "11:30:59"],
+      ["2.5.3", "2.5.3"],
+      ["1/2", "1/2"],
+      ["1000", "1,000"],
+      ["1,000", "1000"],
+      ["1000.50", "1,000.50"],
+      ["-1000.50", "-1,000.50"],
+      ["+1000", "+1,000"],
+      ["1234567", "1,234,567"],
+      ["123456789012345678901", "123456789012345678901"],
+      ["123456789012345678901", "123,456,789,012,345,678,901"],
+    ]
+  ) {
+    assert(
+      __moonTest.evidenceSupportsContent(
+        `The recorded value is ${claim}.`,
+        `The recorded value is ${quote}.`,
+      ),
+      `${JSON.stringify(claim)} should be supported by ${
+        JSON.stringify(quote)
+      }`,
+    );
+  }
+});
+
+Deno.test("learning proposals reject a truncated amount and accept a complete grouped amount", () => {
+  const settings = __moonTest.resolveSettings(createApi(
+    { code: 0, stdout: "", stderr: "" },
+    [],
+  ));
+  const quote = "The budget is 1,000 dollars.";
+  const raw = {
+    canonical_key: "project:budget",
+    kind: "fact",
+    title: "Project budget",
+    content: "The budget is 100 dollars.",
+    evidence_quote: quote,
+    importance: 0.9,
+    confidence: 0.99,
+    supersedes_document_id: null,
+  };
+  const turn = { userText: quote, transcript: `User:\n${quote}` };
+  assertEquals(
+    __moonTest.normalizeProposal(raw, turn, settings, new Set()),
+    null,
+  );
+  const valid = __moonTest.normalizeProposal(
+    { ...raw, content: "The budget is 1000 dollars." },
+    turn,
+    settings,
+    new Set(),
+  );
+  assertEquals(valid?.content, "The budget is 1000 dollars.");
+});
+
 Deno.test("automatic supersession requires an explicit correction and active head", () => {
   const settings = __moonTest.resolveSettings(createApi(
     { code: 0, stdout: "", stderr: "" },
@@ -1133,90 +1438,77 @@ Deno.test("model routing does not expose provider error bodies", async () => {
   assertEquals(calls.length, 0);
 });
 
-Deno.test("adapter invokes a real Moon binary when configured", async () => {
-  const binaryPermission = await Deno.permissions.query({
-    name: "env",
-    variable: "MOON_TEST_BINARY",
-  });
-  const homePermission = await Deno.permissions.query({
-    name: "env",
-    variable: "MOON_TEST_HOME",
-  });
-  if (
-    binaryPermission.state !== "granted" ||
-    homePermission.state !== "granted"
-  ) {
-    return;
-  }
-  const binary = Deno.env.get("MOON_TEST_BINARY");
-  const home = Deno.env.get("MOON_TEST_HOME");
-  if (!binary || !home) {
-    return;
-  }
-  const mode = Deno.env.get("MOON_TEST_MODE") ?? "lexical";
-  const query = Deno.env.get("MOON_TEST_QUERY") ??
-    "roomKey redemptionKey participant reenter";
-  const expected = Deno.env.get("MOON_TEST_EXPECTED");
-  const api = {
-    pluginConfig: {
-      moonPath: binary,
-      moonHome: home,
-      mode,
-      embeddingEnabled: false,
-      maxChars: 6_000,
-    },
-    resolvePath(value: string) {
-      return value;
-    },
-    runtime: {
-      system: {
-        async runCommandWithTimeout(argv: string[]) {
-          const output = await new Deno.Command(argv[0], {
-            args: argv.slice(1),
-            stdout: "piped",
-            stderr: "piped",
-          }).output();
-          return {
-            code: output.code,
-            stdout: new TextDecoder().decode(output.stdout),
-            stderr: new TextDecoder().decode(output.stderr),
-          };
+Deno.test({
+  name: "adapter invokes a real Moon binary when configured",
+  ignore: !realMoonConfig,
+  fn: async () => {
+    assert(realMoonConfig);
+    const { binary, home } = realMoonConfig;
+    const mode = Deno.env.get("MOON_TEST_MODE") ?? "lexical";
+    const query = Deno.env.get("MOON_TEST_QUERY") ??
+      "roomKey redemptionKey participant reenter";
+    const expected = Deno.env.get("MOON_TEST_EXPECTED");
+    const api = {
+      pluginConfig: {
+        moonPath: binary,
+        moonHome: home,
+        mode,
+        embeddingEnabled: false,
+        maxChars: 6_000,
+      },
+      resolvePath(value: string) {
+        return value;
+      },
+      runtime: {
+        system: {
+          async runCommandWithTimeout(argv: string[]) {
+            const output = await new Deno.Command(argv[0], {
+              args: argv.slice(1),
+              stdout: "piped",
+              stderr: "piped",
+            }).output();
+            return {
+              code: output.code,
+              stdout: new TextDecoder().decode(output.stdout),
+              stderr: new TextDecoder().decode(output.stderr),
+            };
+          },
         },
       },
-    },
-    logger: {
-      error() {},
-    },
-  };
-  const engine = __moonTest.createMoonContextEngine(api);
-  const result = await engine.assemble({
-    prompt: query,
-    messages: [{
-      role: "user",
-      content: [{
-        type: "text",
-        text: "Recall the participant reentry design",
+      logger: {
+        error() {},
+      },
+    };
+    const engine = __moonTest.createMoonContextEngine(api);
+    const result = await engine.assemble({
+      prompt: query,
+      messages: [{
+        role: "user",
+        content: [{
+          type: "text",
+          text: "Recall the participant reentry design",
+        }],
       }],
-    }],
-  });
-  await engine.dispose();
-  assertEquals(result.messages.length, 2);
-  const packet = result.messages[0].content[0].text;
-  assert(packet.startsWith("# Moon Context"));
-  if (mode === "lexical") {
-    assert(packet.includes("## Retrieved references"));
-    assert(packet.includes("legacy://"));
-  } else {
-    assert(packet.includes("## Canonical memories"));
-  }
-  if (expected) {
-    for (const phrase of expected.split("|")) {
-      assert(
-        packet.includes(phrase),
-        `expected real Moon packet to include ${JSON.stringify(phrase)}`,
-      );
+    });
+    await engine.dispose();
+    assertEquals(result.messages.length, 2);
+    const packet = result.messages[0].content[0].text;
+    assert(packet.startsWith("# Moon Context"));
+    if (mode === "lexical") {
+      assert(packet.includes("## Retrieved references"));
+      assert(packet.includes("legacy://"));
+    } else {
+      assert(packet.includes("## Canonical memories"));
     }
-  }
+    if (expected) {
+      for (const phrase of expected.split("|")) {
+        assert(
+          packet.includes(phrase),
+          `expected real Moon packet to include ${JSON.stringify(phrase)}`,
+        );
+      }
+    }
+  },
 });
 
 Deno.test("durable commits declare host fencing and use the accepted range only", () => {
@@ -1339,83 +1631,81 @@ Deno.test("heartbeat and disabled-learning commits have no durable side effects"
   }
 });
 
-Deno.test("durable commit survives a lost acknowledgement with real SQLite", async () => {
-  const permission = await Deno.permissions.query({
-    name: "env",
-    variable: "MOON_TEST_BINARY",
-  });
-  if (permission.state !== "granted") return;
-  const binary = Deno.env.get("MOON_TEST_BINARY");
-  const home = Deno.env.get("MOON_TEST_HOME");
-  if (!binary || !home) return;
-  const params = acceptedParams([
-    { role: "user", content: "Hello", timestamp: 100 },
-    { role: "assistant", content: "Hello there", timestamp: 200 },
-  ]);
-  params.advancementKey = `real-sqlite-${crypto.randomUUID()}`;
-  let loseAcknowledgement = true;
-  const api = createApi({ code: 0, stdout: "", stderr: "" }, [], {
-    moonPath: binary,
-    moonHome: home,
-    failOpen: true,
-  });
-  api.runtime.system.runCommandWithTimeout = async (argv, options) => {
-    const child = new Deno.Command(argv[0], {
-      args: argv.slice(1),
-      stdin: "piped",
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
-    const writer = child.stdin.getWriter();
-    await writer.write(new TextEncoder().encode(options.input ?? ""));
-    await writer.close();
-    const output = await child.output();
-    if (loseAcknowledgement && output.code === 0 && argv.includes("record")) {
-      loseAcknowledgement = false;
-      throw new Error("simulated lost acknowledgement after SQLite commit");
-    }
-    return {
-      code: output.code,
-      stdout: new TextDecoder().decode(output.stdout),
-      stderr: new TextDecoder().decode(output.stderr),
+Deno.test({
+  name: "durable commit survives a lost acknowledgement with real SQLite",
+  ignore: !realMoonConfig,
+  fn: async () => {
+    assert(realMoonConfig);
+    const { binary, home } = realMoonConfig;
+    const params = acceptedParams([
+      { role: "user", content: "Hello", timestamp: 100 },
+      { role: "assistant", content: "Hello there", timestamp: 200 },
+    ]);
+    params.advancementKey = `real-sqlite-${crypto.randomUUID()}`;
+    let loseAcknowledgement = true;
+    const api = createApi({ code: 0, stdout: "", stderr: "" }, [], {
+      moonPath: binary,
+      moonHome: home,
+      failOpen: true,
+    });
+    api.runtime.system.runCommandWithTimeout = async (argv, options) => {
+      const child = new Deno.Command(argv[0], {
+        args: argv.slice(1),
+        stdin: "piped",
+        stdout: "piped",
+        stderr: "piped",
+      }).spawn();
+      const writer = child.stdin.getWriter();
+      await writer.write(new TextEncoder().encode(options.input ?? ""));
+      await writer.close();
+      const output = await child.output();
+      if (loseAcknowledgement && output.code === 0 && argv.includes("record")) {
+        loseAcknowledgement = false;
+        throw new Error("simulated lost acknowledgement after SQLite commit");
+      }
+      return {
+        code: output.code,
+        stdout: new TextDecoder().decode(output.stdout),
+        stderr: new TextDecoder().decode(output.stderr),
+      };
     };
-  };
-  let rejected = false;
-  try {
-    await __moonTest.createMoonContextEngine(api).commitTurn(params);
-  } catch {
-    rejected = true;
-  }
-  assert(rejected);
-  const replay = __moonTest.createMoonContextEngine(api);
-  assertEquals(await replay.commitTurn(params), { status: "duplicate" });
-  const changed = {
-    ...params,
-    messages: [params.messages[0], {
-      role: "assistant",
-      content: "Conflicting answer",
-      timestamp: 200,
-    }],
-  };
-  let conflict = false;
-  try {
-    await replay.commitTurn(changed);
-  } catch {
-    conflict = true;
-  }
-  assert(conflict);
-  const next = {
-    ...params,
-    advancementKey: `${params.advancementKey}-concurrent`,
-  };
-  const outcomes = await Promise.all([
-    __moonTest.createMoonContextEngine(api).commitTurn(next),
-    __moonTest.createMoonContextEngine(api).commitTurn(next),
-  ]);
-  assertEquals(outcomes.map((result) => result.status).sort(), [
-    "committed",
-    "duplicate",
-  ]);
+    let rejected = false;
+    try {
+      await __moonTest.createMoonContextEngine(api).commitTurn(params);
+    } catch {
+      rejected = true;
+    }
+    assert(rejected);
+    const replay = __moonTest.createMoonContextEngine(api);
+    assertEquals(await replay.commitTurn(params), { status: "duplicate" });
+    const changed = {
+      ...params,
+      messages: [params.messages[0], {
+        role: "assistant",
+        content: "Conflicting answer",
+        timestamp: 200,
+      }],
+    };
+    let conflict = false;
+    try {
+      await replay.commitTurn(changed);
+    } catch {
+      conflict = true;
+    }
+    assert(conflict);
+    const next = {
+      ...params,
+      advancementKey: `${params.advancementKey}-concurrent`,
+    };
+    const outcomes = await Promise.all([
+      __moonTest.createMoonContextEngine(api).commitTurn(next),
+      __moonTest.createMoonContextEngine(api).commitTurn(next),
+    ]);
+    assertEquals(outcomes.map((result) => result.status).sort(), [
+      "committed",
+      "duplicate",
+    ]);
+  },
 });
 
 Deno.test("optional extraction failure does not undo an accepted evidence commit", async () => {

@@ -39,6 +39,11 @@ command is harmless. Reusing the session id with changed content or metadata is
 rejected instead of silently rewriting history. Document creation and evidence
 identity are committed in one transaction.
 
+Scrubbing includes quoted credential fields in JSON embedded in conversation
+text. Redaction improvements apply to new writes; they do not silently rewrite
+historical evidence or its citations. Replaying old content whose sanitised form
+has changed can therefore produce an immutable-evidence conflict.
+
 OpenClaw calls the hook only after the turn has finished. Heartbeats and turns
 without both a user request and final answer are skipped. Evidence can include
 ordinary turns, but only durable candidates proceed to distillation.

@@ -10,8 +10,10 @@ pub struct Redacted<T> {
 }
 
 pub fn redact_text(input: &str) -> Redacted<String> {
-    let mut value = input.to_string();
-    let mut count = 0;
+    let Redacted {
+        mut value,
+        mut count,
+    } = redact_quoted_assignments(input);
 
     for (pattern, replacement) in [
         (private_key_pattern(), "<redacted-private-key>"),
@@ -29,6 +31,83 @@ pub fn redact_text(input: &str) -> Redacted<String> {
     }
 
     Redacted { value, count }
+}
+
+fn redact_quoted_assignments(input: &str) -> Redacted<String> {
+    let mut value = String::with_capacity(input.len());
+    let mut copied_until = 0;
+    let mut count = 0;
+    for captures in quoted_assignment_pattern().captures_iter(input) {
+        let assignment = captures.get(0).expect("matched assignment");
+        if assignment.start() < copied_until {
+            continue;
+        }
+        let raw_key = captures.name("key").expect("matched key").as_str();
+        let key = if raw_key.starts_with('"') {
+            serde_json::from_str::<String>(raw_key).unwrap_or_default()
+        } else {
+            raw_key[1..raw_key.len() - 1]
+                .replace("\\'", "'")
+                .replace("\\\\", "\\")
+        };
+        if !is_sensitive_key(&key) {
+            continue;
+        }
+
+        let tail = &input[assignment.end()..];
+        let value_bytes = assignment_value_bytes(tail);
+        if value_bytes == 0 {
+            continue;
+        }
+        value.push_str(&input[copied_until..assignment.end()]);
+        if tail.starts_with('\'') {
+            value.push_str("'<redacted>'");
+        } else {
+            value.push_str("\"<redacted>\"");
+        }
+        copied_until = assignment.end() + value_bytes;
+        count += 1;
+    }
+    value.push_str(&input[copied_until..]);
+    Redacted { value, count }
+}
+
+fn assignment_value_bytes(input: &str) -> usize {
+    // Parse a complete JSON value so escapes and credential objects cannot
+    // leave a suffix of the secret behind in a transcript or code fence.
+    let mut values = serde_json::Deserializer::from_str(input).into_iter::<Value>();
+    if matches!(values.next(), Some(Ok(_))) {
+        return values.byte_offset();
+    }
+    if let Some(quote @ ('\'' | '"')) = input.chars().next() {
+        let mut escaped = false;
+        for (offset, character) in input.char_indices().skip(1) {
+            if matches!(character, '\r' | '\n') {
+                return offset;
+            }
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == quote {
+                return offset + character.len_utf8();
+            }
+        }
+        return input.len();
+    }
+    input
+        .find(|character: char| {
+            character.is_whitespace() || matches!(character, ',' | ';' | '}' | ']')
+        })
+        .unwrap_or(input.len())
+}
+
+fn quoted_assignment_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r#"(?P<key>"(?:\\[^\r\n]|[^"\\\r\n])*"|'(?:\\[^\r\n]|[^'\\\r\n])*')\s*[:=]\s*"#)
+            .expect("valid quoted assignment regex")
+    })
 }
 
 pub fn redact_json(raw: &str) -> Result<Redacted<String>> {
@@ -100,7 +179,7 @@ fn assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
     PATTERN.get_or_init(|| {
         Regex::new(
-            r#"(?im)(?P<label>\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|slack[_-]?bot[_-]?token|database[_-]?url|connection[_-]?string|session[_-]?(?:cookie|id)|webhook[_-]?url|secret|password|private[_-]?key)\b)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)"#,
+            r#"(?im)(?P<label>\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|slack[_-]?bot[_-]?token|database[_-]?url|connection[_-]?string|session[_-]?(?:cookie|id)|webhook[_-]?url|secret|password|private[_-]?key)\b)\s*[:=]\s*(?:"(?:\\[^\r\n]|[^"\\\r\n])*"|'(?:\\[^\r\n]|[^'\\\r\n])*'|[^\s,;]+)"#,
         )
         .expect("valid assignment regex")
     })
@@ -194,6 +273,63 @@ mod tests {
         assert_eq!(redacted.count, 2);
         assert!(redacted.value.contains(r#""token":"<redacted>""#));
         assert!(!redacted.value.contains("secret-token"));
+    }
+
+    #[test]
+    fn redacts_quoted_credentials_inside_prose_and_code_fences() {
+        let input = r#"The configuration was:
+```json
+{"password":"synthetic-prefix\"synthetic-suffix\\synthetic-end", "API-Key":"synthetic-api", "note":"keep this note"}
+```
+The next example has {"accessToken":"synthetic-access", "pass\u0077ord":"synthetic-unicode"}.
+{'client_secret': 'synthetic-single\'synthetic-tail\\synthetic-last', 'enabled': true}
+{"credentials":{"first":"synthetic-nested", "second":["synthetic-array"]},"ok":true}
+password="synthetic-unquoted\"synthetic-remainder"
+"#;
+        let redacted = redact_text(input);
+        assert_eq!(redacted.count, 7);
+        assert!(!redacted.value.contains("synthetic-"));
+        assert!(redacted.value.contains(r#""note":"keep this note""#));
+        assert!(redacted.value.contains("'enabled': true"));
+        assert!(redacted.value.contains(r#""ok":true"#));
+        assert!(redacted.value.contains("```json"));
+        assert_eq!(redact_text(&redacted.value).value, redacted.value);
+    }
+
+    #[test]
+    fn quoted_credentials_use_the_metadata_sensitive_key_policy() {
+        for key in [
+            "api_key",
+            "access-token",
+            "refreshToken",
+            "token",
+            "secret",
+            "Password",
+            "credential",
+            "credentials",
+            "Authorization",
+            "Cookie",
+            "Set-Cookie",
+            "session_cookie",
+            "sessionId",
+            "clientSecret",
+            "private_key",
+            "databaseUrl",
+            "connection_string",
+            "aws_secret_access_key",
+            "AWS_ACCESS_KEY_ID",
+            "slack_bot_token",
+            "webhook-url",
+        ] {
+            let input = serde_json::json!({key: "synthetic-credential"}).to_string();
+            let redacted = redact_text(&input);
+            assert_eq!(redacted.count, 1, "key {key}");
+            assert!(
+                !redacted.value.contains("synthetic-credential"),
+                "key {key}"
+            );
+            assert!(serde_json::from_str::<serde_json::Value>(&redacted.value).is_ok());
+        }
     }
 
     #[test]

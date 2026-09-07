@@ -575,9 +575,9 @@ fn run(cli: Cli) -> Result<()> {
             if proposals.len() > 32 {
                 anyhow::bail!("distillation batch may contain at most 32 proposals");
             }
-            let mut outcomes = Vec::with_capacity(proposals.len());
-            for proposal in proposals {
-                outcomes.push(store.distill_memory(DistillInput {
+            let inputs = proposals
+                .into_iter()
+                .map(|proposal| DistillInput {
                     canonical_key: proposal.canonical_key,
                     memory_kind: proposal.kind,
                     scope: args.scope.clone(),
@@ -589,8 +589,9 @@ fn run(cli: Cli) -> Result<()> {
                     evidence_session_id: args.session_id.clone(),
                     evidence_quote: proposal.evidence_quote,
                     supersedes: proposal.supersedes_document_id,
-                })?);
-            }
+                })
+                .collect();
+            let outcomes = store.distill_batch(inputs)?;
             emit(
                 &serde_json::json!({
                     "distilled": outcomes.len(),
@@ -906,6 +907,59 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn run_update(home: &Path, dimensions: usize, json: bool, args: &UpdateArgs) -> Result<()> {
+    // Recovery must remain available offline and when a partial installation
+    // would fail ordinary release preflight or appear already up to date.
+    if moon::update::has_incomplete_update(home)? {
+        if args.check || args.dry_run {
+            return emit(
+                &serde_json::json!({
+                    "ok": true,
+                    "changed": false,
+                    "recovery_required": true,
+                    "status": "recovery_required",
+                }),
+                json,
+            );
+        }
+        if !args.yes {
+            if json || !io::stdin().is_terminal() {
+                return moon::update::fail(
+                    "authorization_required",
+                    "recovering an interrupted update non-interactively requires --yes",
+                );
+            }
+            print!("Recover the interrupted Moon update and restart OpenClaw? [y/N] ");
+            io::stdout().flush()?;
+            let mut response = String::new();
+            io::stdin().read_line(&mut response)?;
+            if !matches!(response.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                return moon::update::fail(
+                    "update_cancelled",
+                    "recovery cancelled before mutation",
+                );
+            }
+        }
+        let context = moon::update::ApplyContext {
+            home: home.to_path_buf(),
+            dimensions,
+            identity: moon::version::VersionInfo::current_for_home(home)?,
+            openclaw: moon::update::inspect_openclaw_config()?,
+            skill_path: moon::update::default_skill_path()?,
+            allow_downgrade: args.allow_downgrade,
+        };
+        let openclaw = moon::update::SystemOpenClaw::discover()?;
+        let recovered = moon::update::recover_pending_update(&context, &openclaw)?;
+        return emit(
+            &serde_json::json!({
+                "ok": true,
+                "changed": recovered,
+                "recovered": recovered,
+                "retry_required": true,
+                "message": "Recovery checked; run the canonical moon update command again to check or apply a release.",
+            }),
+            json,
+        );
+    }
     let client = moon::update::ReleaseClient::production()?;
     let release = client.fetch_release(args.version.as_deref())?;
     let check =

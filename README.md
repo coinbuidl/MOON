@@ -43,6 +43,13 @@ and OpenClaw compatibility, then prints the exact plan without changing local
 state. Applying requires one interactive confirmation, or `--yes` for an
 explicit non-interactive invocation. Moon never updates in the background.
 
+Interrupted transactions are recovered before release checks or runtime
+preflight. `--check` and `--dry-run` report `recovery_required: true` without
+writing; an approved `moon update` performs recovery and returns
+`retry_required: true`. Run the canonical command again after recovery. Rollback
+snapshots are taken after OpenClaw's worker stops, and a retained inactive
+release can be reused only after its signed contents are verified.
+
 Moon 2.5.1 requires OpenClaw 2026.9.2 or newer. The signed update manifest
 checks this before installation.
 

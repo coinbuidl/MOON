@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 2.5.4 - 2026-09-07
+
+- Quiesce OpenClaw before taking the rollback database snapshot, and persist
+  switch intent before changing runtime paths or installing the skill.
+- Recover interrupted updates before release fetch, preflight or same-version
+  shortcuts. Preserve superseded historical journals and refuse ambiguous
+  recovery; retry using the restored canonical executable after recovery.
+- Reuse retained inactive releases only after verifying their signed contents.
+  Stage and validate database restoration without the release archive size cap,
+  preserving the candidate database and sidecars for inspection.
+- Pin updater and adapter storage commands to explicit database paths so ambient
+  environment overrides cannot redirect isolated checks or configured runtimes.
+- Scrub quoted credential fields and escaped values in embedded JSON and config
+  text. Historical evidence remains immutable and is not rewritten.
+- Commit learning batches atomically, including confirmations, supersessions,
+  citations, indexes and embedding work. Reject numeric substring matches and
+  compare complete values without rounding long identifiers.
+- Isolate worker callbacks by child process, survive delayed events after a
+  timeout, and clear pending requests after pipe failures.
+- Require real-binary retrieval and SQLite retry tests in CI using a synthetic
+  temporary runtime. Unconfigured local integration tests are explicitly
+  ignored.
+
 ## 2.5.3 - 2026-09-07
 
 - Implement OpenClaw 2026.9.2's fenced, durable accepted-turn contract so

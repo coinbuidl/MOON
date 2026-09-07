@@ -4,6 +4,10 @@ use serde_json::Value;
 
 fn moon(home: &std::path::Path) -> Command {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("moon"));
+    command
+        .env_remove("MOON_DATABASE")
+        .env_remove("MOON_HOME")
+        .env_remove("MOON_EMBEDDING_DIMENSIONS");
     command.args([
         "--home",
         home.to_str().expect("utf8 home"),

@@ -12,6 +12,8 @@ fn plain_version_is_one_offline_line_without_a_runtime() {
     let moon_home = temp.path().join("missing-moon-home");
 
     Command::new(assert_cmd::cargo::cargo_bin!("moon"))
+        .env_remove("MOON_DATABASE")
+        .env_remove("MOON_EMBEDDING_DIMENSIONS")
         .arg("--version")
         .env("MOON_HOME", &moon_home)
         .assert()
@@ -30,6 +32,8 @@ fn json_version_reports_build_and_executable_provenance_offline() {
     let temp = tempfile::tempdir().expect("tempdir");
     let moon_home = temp.path().join("missing-moon-home");
     let output = Command::new(assert_cmd::cargo::cargo_bin!("moon"))
+        .env_remove("MOON_DATABASE")
+        .env_remove("MOON_EMBEDDING_DIMENSIONS")
         .args(["--json", "--version"])
         .env("MOON_HOME", &moon_home)
         .output()
@@ -102,6 +106,8 @@ fn json_short_version_remains_offline_in_either_flag_order() {
     let moon_home = temp.path().join("missing-moon-home");
     for args in [["--json", "-V"], ["-V", "--json"]] {
         let output = Command::new(assert_cmd::cargo::cargo_bin!("moon"))
+            .env_remove("MOON_DATABASE")
+            .env_remove("MOON_EMBEDDING_DIMENSIONS")
             .args(args)
             .env("MOON_HOME", &moon_home)
             .output()
@@ -121,6 +127,8 @@ fn pinned_update_json_rejects_invalid_modes_before_network_or_storage() {
     let moon_home = temp.path().join("missing-moon-home");
     for invalid in ["--check", "--yes", "--unknown-option"] {
         let output = Command::new(assert_cmd::cargo::cargo_bin!("moon"))
+            .env_remove("MOON_DATABASE")
+            .env_remove("MOON_EMBEDDING_DIMENSIONS")
             .args([
                 "update",
                 "--version",
@@ -150,6 +158,8 @@ fn version_flag_strings_after_separator_are_argument_data() {
     let moon_home = temp.path().join("isolated-moon-home");
     for key in ["--version", "-V"] {
         let output = Command::new(assert_cmd::cargo::cargo_bin!("moon"))
+            .env_remove("MOON_DATABASE")
+            .env_remove("MOON_EMBEDDING_DIMENSIONS")
             .arg("--home")
             .arg(&moon_home)
             .args(["--dimensions", "64", "--json", "state", "get", "--", key])

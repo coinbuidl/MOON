@@ -626,6 +626,263 @@ fn completed_evidence_is_secret_scrubbed_idempotent_and_immutable() {
 }
 
 #[test]
+fn quoted_credentials_are_scrubbed_before_evidence_and_memory_persistence() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut store = open_store(&temp);
+    let content = r#"The configuration example is:
+```json
+{"password":"synthetic-password\"synthetic-suffix\\synthetic-tail","api_key":"synthetic-api","note":"keep the public note"}
+```
+{'access-token': 'synthetic-single\'synthetic-rest'}
+Moon keeps reviewed evidence in SQLite.
+"#;
+    let input = EvidenceInput {
+        session_id: "quoted-credentials".to_string(),
+        scope: "moon".to_string(),
+        title: Some(r#"Example {"token":"synthetic-title"}"#.to_string()),
+        content: content.to_string(),
+        completed_at_ms: 100,
+        metadata_json: serde_json::json!({
+            "note": "Configuration {\"client_secret\":\"synthetic-metadata\"}"
+        })
+        .to_string(),
+    };
+    let recorded = store.record_evidence(input.clone()).expect("record");
+    assert_eq!(recorded.redactions, 5);
+    assert!(!store.record_evidence(input).expect("repeat").changed);
+    store
+        .distill_memory(distill_input(
+            "quoted-credentials",
+            "audit:quoted-credentials",
+            content,
+            content.trim(),
+        ))
+        .expect("distill with a redacted exact citation");
+
+    let connection = rusqlite::Connection::open(store.path()).expect("inspect store");
+    for query in [
+        "SELECT body FROM documents",
+        "SELECT title FROM documents WHERE title IS NOT NULL",
+        "SELECT metadata_json FROM documents",
+        "SELECT metadata_json FROM evidence_sessions",
+        "SELECT content FROM chunks",
+        "SELECT content FROM chunk_fts",
+        "SELECT quote FROM memory_citations",
+    ] {
+        let stored = connection
+            .prepare(query)
+            .expect("prepare inspection")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("stored values")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("read stored values");
+        assert!(stored.iter().all(|value| !value.contains("synthetic-")));
+    }
+    let hits = store
+        .search(
+            &SearchRequest {
+                query: "public note".to_string(),
+                mode: SearchMode::Lexical,
+                limit: 8,
+                scope: Some("moon".to_string()),
+                source_kind: None,
+            },
+            None,
+        )
+        .expect("public text stays searchable");
+    assert_eq!(hits.len(), 2);
+    assert!(hits.iter().all(|hit| hit.content.contains("<redacted>")));
+    assert!(store.health().expect("health").ok);
+}
+
+#[test]
+fn distillation_batch_rolls_back_every_prior_change_and_can_be_retried() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut store = open_store(&temp);
+    record_session(
+        &mut store,
+        "batch-before",
+        "Alpha uses the old database. Stable uses SQLite. Queued uses the old model.",
+        100,
+    );
+    let alpha = store
+        .distill_memory(distill_input(
+            "batch-before",
+            "audit:alpha",
+            "Alpha uses the old database.",
+            "Alpha uses the old database.",
+        ))
+        .expect("alpha");
+    store
+        .distill_memory(DistillInput {
+            importance: 0.2,
+            confidence: 0.3,
+            ..distill_input(
+                "batch-before",
+                "audit:stable",
+                "Stable uses SQLite.",
+                "Stable uses SQLite.",
+            )
+        })
+        .expect("stable");
+    let provider = HashEmbedding::new(64);
+    assert_eq!(
+        store.embed_pending(&provider, 100).expect("embed").embedded,
+        2
+    );
+    let queued = store
+        .distill_memory(distill_input(
+            "batch-before",
+            "audit:queued",
+            "Queued uses the old model.",
+            "Queued uses the old model.",
+        ))
+        .expect("queued");
+    record_session(
+        &mut store,
+        "batch-after",
+        "Alpha now uses SQLite. Queued now uses the new model. Stable still uses SQLite. New memory stores reviewed claims.",
+        200,
+    );
+    let mut proposals = vec![
+        distill_input(
+            "batch-after",
+            "audit:new",
+            "New memory stores reviewed claims.",
+            "New memory stores reviewed claims.",
+        ),
+        DistillInput {
+            pinned: true,
+            ..distill_input(
+                "batch-after",
+                "audit:stable",
+                "Stable uses SQLite.",
+                "Stable still uses SQLite.",
+            )
+        },
+        DistillInput {
+            supersedes: Some(alpha.document_id),
+            ..distill_input(
+                "batch-after",
+                "audit:alpha",
+                "Alpha now uses SQLite.",
+                "Alpha now uses SQLite.",
+            )
+        },
+        DistillInput {
+            supersedes: Some(queued.document_id),
+            ..distill_input(
+                "batch-after",
+                "audit:queued",
+                "Queued now uses the new model.",
+                "Queued now uses the new model.",
+            )
+        },
+        distill_input(
+            "batch-after",
+            "audit:invalid",
+            "An unsupported claim.",
+            "This quote is not in the evidence.",
+        ),
+    ];
+    let before = distillation_table_snapshot(&store);
+    for _ in 0..2 {
+        let error = store
+            .distill_batch(proposals.clone())
+            .expect_err("reject batch");
+        assert!(error.to_string().contains("not found exactly"));
+        assert_eq!(distillation_table_snapshot(&store), before);
+        assert!(store.health().expect("health after rollback").ok);
+    }
+    proposals.pop();
+    let outcomes = store.distill_batch(proposals).expect("retry valid batch");
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.action)
+            .collect::<Vec<_>>(),
+        vec![
+            DistillAction::Created,
+            DistillAction::Confirmed,
+            DistillAction::Superseded,
+            DistillAction::Superseded
+        ],
+    );
+    let health = store.health().expect("health after success");
+    assert!(health.ok);
+    assert_eq!(health.active_memories, 4);
+    assert_eq!(health.active_memory_vectors, 1);
+    assert_eq!(health.pending_embeddings, 3);
+}
+
+#[test]
+fn distillation_batch_enforces_its_library_limit_without_mutation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut store = open_store(&temp);
+    record_session(
+        &mut store,
+        "batch-limit",
+        "Moon stores reviewed claims.",
+        100,
+    );
+    let input = distill_input(
+        "batch-limit",
+        "audit:limit",
+        "Moon stores reviewed claims.",
+        "Moon stores reviewed claims.",
+    );
+    let before = distillation_table_snapshot(&store);
+    let error = store
+        .distill_batch(vec![input.clone(); 33])
+        .expect_err("limit");
+    assert!(error.to_string().contains("at most 32"));
+    assert_eq!(distillation_table_snapshot(&store), before);
+    assert!(
+        store
+            .distill_batch(Vec::new())
+            .expect("empty batch")
+            .is_empty()
+    );
+    assert_eq!(distillation_table_snapshot(&store), before);
+    let outcomes = store.distill_batch(vec![input; 32]).expect("maximum batch");
+    assert_eq!(outcomes.len(), 32);
+    assert_eq!(outcomes[0].action, DistillAction::Created);
+    assert!(
+        outcomes[1..]
+            .iter()
+            .all(|outcome| outcome.action == DistillAction::Confirmed)
+    );
+    assert!(store.health().expect("health").ok);
+}
+
+fn distillation_table_snapshot(store: &Store) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    let connection = rusqlite::Connection::open(store.path()).expect("inspect database");
+    [
+        "SELECT * FROM documents ORDER BY id",
+        "SELECT * FROM chunks ORDER BY id",
+        "SELECT * FROM memory_items ORDER BY document_id",
+        "SELECT * FROM memory_heads ORDER BY canonical_key",
+        "SELECT * FROM memory_citations ORDER BY id",
+        "SELECT * FROM evidence_sessions ORDER BY id",
+        "SELECT * FROM embedding_queue ORDER BY chunk_id",
+        "SELECT rowid, * FROM chunk_fts ORDER BY rowid",
+        "SELECT rowid, embedding, source_kind, scope FROM chunk_vectors ORDER BY rowid",
+        "SELECT * FROM metadata ORDER BY key",
+    ]
+    .iter()
+    .map(|query| {
+        let mut statement = connection.prepare(query).expect("snapshot query");
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .expect("snapshot rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("snapshot values")
+    })
+    .collect()
+}
+
+#[test]
 fn distillation_confirms_matching_claims_and_requires_explicit_supersession() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut store = open_store(&temp);

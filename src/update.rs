@@ -680,8 +680,8 @@ pub enum UpdatePhase {
     Preflight,
     FetchVerified,
     CandidateValidated,
-    RollbackReady,
     Quiesced,
+    RollbackReady,
     Switched,
     Migrated,
     PostSwitchVerified,
@@ -1108,23 +1108,17 @@ fn apply_update_inner(
     openclaw: &dyn OpenClawControl,
     crash_after: Option<UpdatePhase>,
 ) -> Result<UpdateResult> {
+    validate_updater_identity(context)?;
+    if recover_pending_update(context, openclaw)? {
+        return fail(
+            "interrupted_update_recovered",
+            "the interrupted update was recovered; rerun the canonical Moon command to update the restored runtime",
+        );
+    }
     let plan = preflight_update(context, release, archive_bytes, openclaw)?;
-    if !context.identity.canonical {
-        return fail(
-            "shadowed_executable",
-            format!(
-                "updates must run through the canonical executable {}",
-                context.identity.canonical_executable
-            ),
-        );
-    }
-    if context.identity.git_dirty != Some(false) {
-        return fail(
-            "version_identity_failed",
-            "the running updater does not have clean release provenance",
-        );
-    }
     if plan.from_version == plan.to_version {
+        openclaw.wait_ready(Duration::from_secs(60))?;
+        openclaw.validate(&plan.to_version, &context.openclaw)?;
         return Ok(UpdateResult {
             ok: true,
             changed: false,
@@ -1144,7 +1138,15 @@ fn apply_update_inner(
     let asset = release.asset_for_current_target()?;
 
     let mut lock = UpdateLock::acquire(&context.home)?;
-    recover_incomplete_update(context, openclaw)?;
+    // Another process may have failed between the first recovery check and lock acquisition.
+    if has_incomplete_update(&context.home)? {
+        recover_incomplete_update(context, openclaw)?;
+        lock.release()?;
+        return fail(
+            "interrupted_update_recovered",
+            "the interrupted update was recovered; rerun the canonical Moon command to update the restored runtime",
+        );
+    }
     let transaction_id = lock.transaction_id.clone();
     let journal_path = context
         .home
@@ -1155,7 +1157,7 @@ fn apply_update_inner(
         schema_version: UPDATE_SCHEMA,
         transaction_id: transaction_id.clone(),
         pid: std::process::id(),
-        started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         from_version: plan.from_version.clone(),
         to_version: plan.to_version.clone(),
         target: plan.target.clone(),
@@ -1196,12 +1198,29 @@ fn apply_update_inner(
             code: "candidate_failed",
             message: format!("isolated candidate validation failed: {error:#}"),
         })?;
+        let target_release = materialize_release(context, &stage, asset)?;
+        journal.target_release = Some(target_release.clone());
         journal.phase = UpdatePhase::CandidateValidated;
         persist_journal(&journal_path, &journal)?;
         inject_crash(crash_after, journal.phase)?;
 
         let prior_release = ensure_prior_release(context, &transaction_id)?;
         journal.prior_release = Some(prior_release.clone());
+        // Record restart intent before stopping: shutdown may succeed even when
+        // the command or the subsequent worker-quiescence check fails.
+        journal.gateway_stopped = true;
+        persist_journal(&journal_path, &journal)?;
+        openclaw.stop()?;
+        journal.phase = UpdatePhase::Quiesced;
+        persist_journal(&journal_path, &journal)?;
+        inject_crash(crash_after, journal.phase)?;
+
+        // The restoration snapshot must include every write accepted before shutdown.
+        let health_before = healthy_runtime(context)?;
+        ensure!(
+            health_before.leased_embeddings == 0,
+            "active embedding leases block an update"
+        );
         let backup =
             create_rollback_bundle(context, release, &plan, &health_before, &transaction_id)
                 .map_err(|error| UpdateFailure {
@@ -1213,25 +1232,17 @@ fn apply_update_inner(
         persist_journal(&journal_path, &journal)?;
         inject_crash(crash_after, journal.phase)?;
 
-        // Persist restart intent before the stop: service shutdown can succeed
-        // even if the command or subsequent worker-quiescence check fails.
-        journal.gateway_stopped = true;
+        // This is intent, not just a completion marker: switching several paths
+        // and installing the skill can fail after the first pointer changes.
+        journal.current_switched = true;
+        journal.changed = true;
         persist_journal(&journal_path, &journal)?;
-        openclaw.stop()?;
-        journal.phase = UpdatePhase::Quiesced;
-        persist_journal(&journal_path, &journal)?;
-        inject_crash(crash_after, journal.phase)?;
-
-        let target_release = materialize_release(context, &stage, &plan.to_version)?;
-        journal.target_release = Some(target_release.clone());
         switch_current(context, &target_release, &transaction_id)?;
         install_skill(
             &target_release.join("skill/SKILL.md"),
             &context.skill_path,
             &transaction_id,
         )?;
-        journal.current_switched = true;
-        journal.changed = true;
         journal.phase = UpdatePhase::Switched;
         persist_journal(&journal_path, &journal)?;
         inject_crash(crash_after, journal.phase)?;
@@ -1297,7 +1308,7 @@ fn apply_update_inner(
             let original_code = error_code(&error).unwrap_or("operation_failed");
             journal.error_code = Some(original_code.to_owned());
             if journal.gateway_stopped || journal.current_switched {
-                match rollback_update(context, &journal, openclaw) {
+                match rollback_update(context, &mut journal, &journal_path, openclaw) {
                     Ok(()) => {
                         journal.phase = UpdatePhase::RolledBack;
                         journal.gateway_stopped = false;
@@ -1321,12 +1332,32 @@ fn apply_update_inner(
                     }
                 }
             } else {
+                journal.phase = UpdatePhase::RolledBack;
                 persist_journal(&journal_path, &journal)?;
                 lock.release()?;
                 Err(error)
             }
         }
     }
+}
+
+fn validate_updater_identity(context: &ApplyContext) -> Result<()> {
+    if !context.identity.canonical {
+        return fail(
+            "shadowed_executable",
+            format!(
+                "updates must run through the canonical executable {}",
+                context.identity.canonical_executable
+            ),
+        );
+    }
+    if context.identity.git_dirty != Some(false) {
+        return fail(
+            "version_identity_failed",
+            "the running updater does not have clean release provenance",
+        );
+    }
+    Ok(())
 }
 
 fn inject_crash(requested: Option<UpdatePhase>, current: UpdatePhase) -> Result<()> {
@@ -1376,7 +1407,7 @@ impl UpdateLock {
             schema_version: UPDATE_SCHEMA,
             transaction_id: transaction_id.clone(),
             pid: std::process::id(),
-            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         };
         write_new_file(&path, &serde_json::to_vec(&document)?, 0o600)?;
         Ok(Self {
@@ -1415,26 +1446,112 @@ fn persist_journal(path: &Path, journal: &UpdateJournal) -> Result<()> {
     sync_parent(path)
 }
 
-fn recover_incomplete_update(context: &ApplyContext, openclaw: &dyn OpenClawControl) -> Result<()> {
-    let directory = context.home.join("update/journals");
+fn incomplete_journals(home: &Path) -> Result<Vec<(PathBuf, UpdateJournal)>> {
+    let directory = home.join("update/journals");
     if !directory.is_dir() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut paths = fs::read_dir(&directory)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|value| value == "json"))
         .collect::<Vec<_>>();
     paths.sort();
+    let mut journals = Vec::new();
     for path in paths {
         let bytes = read_bounded_file(&path, 128 * 1024)?;
-        let mut journal: UpdateJournal = serde_json::from_slice(&bytes)
+        let journal: UpdateJournal = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid update journal {}", path.display()))?;
+        ensure!(
+            journal.schema_version == UPDATE_SCHEMA,
+            "unsupported update journal schema"
+        );
+        journals.push((path, journal));
+    }
+    let current = fs::canonicalize(home.join("current")).ok();
+    let completed_at = journals
+        .iter()
+        .filter_map(|(_, journal)| {
+            let version = match journal.phase {
+                UpdatePhase::Committed => &journal.to_version,
+                UpdatePhase::RolledBack => &journal.from_version,
+                _ => return None,
+            };
+            let release = fs::canonicalize(home.join("releases").join(version)).ok()?;
+            if current.as_ref() != Some(&release) {
+                return None;
+            }
+            chrono::DateTime::parse_from_rfc3339(&journal.started_at).ok()
+        })
+        .max();
+    let mut incomplete = Vec::new();
+    for (path, journal) in journals {
         if matches!(
             journal.phase,
-            UpdatePhase::Committed | UpdatePhase::RolledBack | UpdatePhase::RollbackFailed
+            UpdatePhase::Committed | UpdatePhase::RolledBack
         ) {
             continue;
         }
+        let started = chrono::DateTime::parse_from_rfc3339(&journal.started_at)?;
+        // A later completed transaction that owns current supersedes old
+        // recovery evidence. Restoring that old snapshot would lose new data.
+        if completed_at.is_some_and(|completed| started < completed) {
+            continue;
+        }
+        if completed_at == Some(started) {
+            return fail(
+                "recovery_ambiguous",
+                "completed and incomplete updates have the same timestamp; refusing ambiguous recovery",
+            );
+        }
+        incomplete.push((path, journal));
+    }
+    Ok(incomplete)
+}
+
+pub fn has_incomplete_update(home: &Path) -> Result<bool> {
+    Ok(!incomplete_journals(home)?.is_empty())
+}
+
+/// Recover only after the operator has authorised gateway downtime and restoration.
+/// The caller must restart the canonical command afterwards, since recovery may
+/// switch away from the executable and schema of the current process.
+pub fn recover_pending_update(
+    context: &ApplyContext,
+    openclaw: &dyn OpenClawControl,
+) -> Result<bool> {
+    validate_updater_identity(context)?;
+    if !has_incomplete_update(&context.home)? {
+        return Ok(false);
+    }
+    let mut lock = UpdateLock::acquire(&context.home)?;
+    recover_incomplete_update(context, openclaw)?;
+    lock.release()?;
+    Ok(true)
+}
+
+fn recover_incomplete_update(context: &ApplyContext, openclaw: &dyn OpenClawControl) -> Result<()> {
+    let journals = incomplete_journals(&context.home)?;
+    let current = fs::canonicalize(context.home.join("current")).ok();
+    let owners = journals
+        .iter()
+        .filter(|(_, journal)| {
+            journal.gateway_stopped
+                || journal.current_switched
+                || current.as_ref().is_some_and(|current| {
+                    fs::canonicalize(context.home.join("releases").join(&journal.to_version))
+                        .ok()
+                        .as_ref()
+                        == Some(current)
+                })
+        })
+        .count();
+    if owners > 1 {
+        return fail(
+            "recovery_ambiguous",
+            "multiple incomplete updates may own the runtime; refusing ambiguous recovery",
+        );
+    }
+    for (path, mut journal) in journals {
         if journal.pid != std::process::id() && pid_is_alive(journal.pid) {
             return fail(
                 "update_locked",
@@ -1444,13 +1561,72 @@ fn recover_incomplete_update(context: &ApplyContext, openclaw: &dyn OpenClawCont
                 ),
             );
         }
+        if (journal.gateway_stopped || journal.current_switched)
+            && let Ok(current) = fs::canonicalize(context.home.join("current"))
+        {
+            let owned = [&journal.from_version, &journal.to_version]
+                .iter()
+                .any(|version| {
+                    fs::canonicalize(context.home.join("releases").join(version))
+                        .ok()
+                        .as_ref()
+                        == Some(&current)
+                });
+            ensure!(
+                owned,
+                "incomplete update does not own the current release; refusing ambiguous recovery"
+            );
+        }
+        // Older journals wrote the switch flag after changing current. Infer
+        // that narrow case only when the pointer names this journal's target.
+        let target = context.home.join("releases").join(&journal.to_version);
+        if !journal.current_switched
+            && !journal.changed
+            && journal.from_version != journal.to_version
+            && fs::canonicalize(context.home.join("current"))
+                .ok()
+                .zip(fs::canonicalize(&target).ok())
+                .is_some_and(|(current, target)| current == target)
+        {
+            ensure!(
+                journal.prior_release.is_some() && journal.backup_path.is_some(),
+                "switched runtime has no complete rollback evidence"
+            );
+            journal.current_switched = true;
+            journal.target_release = Some(target);
+            persist_journal(&path, &journal)?;
+        }
+        if journal.current_switched
+            && journal.phase != UpdatePhase::RollbackReady
+            && journal.prior_release.as_deref().is_some_and(|prior| {
+                fs::canonicalize(context.home.join("current"))
+                    .ok()
+                    .zip(fs::canonicalize(prior).ok())
+                    .is_some_and(|(current, prior)| current == prior)
+            })
+        {
+            return fail(
+                "recovery_ambiguous",
+                "the prior release is already selected but rollback completion was not recorded; preserve the database and inspect recovery evidence before proceeding",
+            );
+        }
         if journal.gateway_stopped || journal.current_switched {
-            rollback_update(context, &journal, openclaw).map_err(|error| UpdateFailure {
-                code: "rollback_failed",
-                message: format!(
-                    "failed to recover incomplete update {}: {error:#}",
-                    journal.transaction_id
-                ),
+            let mut recovery_context = context.clone();
+            if let Some(backup) = &journal.backup_path {
+                let bytes =
+                    read_bounded_file(&backup.join("openclaw-moon.json"), MAX_CONFIG_BYTES)?;
+                recovery_context.openclaw = serde_json::from_slice(&bytes)
+                    .context("rollback integration snapshot is invalid")?;
+                validate_openclaw_snapshot(&recovery_context)?;
+            }
+            rollback_update(&recovery_context, &mut journal, &path, openclaw).map_err(|error| {
+                UpdateFailure {
+                    code: "rollback_failed",
+                    message: format!(
+                        "failed to recover incomplete update {}: {error:#}",
+                        journal.transaction_id
+                    ),
+                }
             })?;
         }
         journal.phase = UpdatePhase::RolledBack;
@@ -1488,14 +1664,24 @@ struct InstalledHealthReport {
 }
 
 fn healthy_installed_runtime(context: &ApplyContext) -> Result<InstalledHealthReport> {
+    healthy_installed_database(context, &context.home.join("state/moon.sqlite"))
+}
+
+fn healthy_installed_database(
+    context: &ApplyContext,
+    database: &Path,
+) -> Result<InstalledHealthReport> {
     let binary = context.home.join("bin/moon");
     let home = context.home.to_string_lossy().into_owned();
+    let database = database.to_string_lossy().into_owned();
     let dimensions = context.dimensions.to_string();
     let output = run_bounded(
         &binary,
         &[
             "--home",
             &home,
+            "--database",
+            &database,
             "--dimensions",
             &dimensions,
             "--json",
@@ -1542,12 +1728,19 @@ fn validate_candidate(context: &ApplyContext, stage: &Path, asset: &ReleaseAsset
         .prefix("candidate-")
         .tempdir_in(&isolated_parent)?;
     let home = isolated.path().to_string_lossy().into_owned();
+    let database = isolated
+        .path()
+        .join("state/moon.sqlite")
+        .to_string_lossy()
+        .into_owned();
     let dimensions = context.dimensions.to_string();
     run_bounded(
         &binary,
         &[
             "--home",
             &home,
+            "--database",
+            &database,
             "--dimensions",
             &dimensions,
             "--json",
@@ -1560,6 +1753,8 @@ fn validate_candidate(context: &ApplyContext, stage: &Path, asset: &ReleaseAsset
         &[
             "--home",
             &home,
+            "--database",
+            &database,
             "--dimensions",
             &dimensions,
             "--json",
@@ -1577,6 +1772,8 @@ fn validate_candidate(context: &ApplyContext, stage: &Path, asset: &ReleaseAsset
         &[
             "--home",
             &home,
+            "--database",
+            &database,
             "--dimensions",
             &dimensions,
             "--json",
@@ -1593,6 +1790,8 @@ fn validate_candidate(context: &ApplyContext, stage: &Path, asset: &ReleaseAsset
         &[
             "--home",
             &home,
+            "--database",
+            &database,
             "--dimensions",
             &dimensions,
             "--json",
@@ -1735,16 +1934,29 @@ fn create_rollback_bundle(
     Ok(backup)
 }
 
-fn materialize_release(context: &ApplyContext, stage: &Path, version: &str) -> Result<PathBuf> {
-    let destination = context.home.join("releases").join(version);
+fn materialize_release(
+    context: &ApplyContext,
+    stage: &Path,
+    asset: &ReleaseAsset,
+) -> Result<PathBuf> {
+    let destination = context
+        .home
+        .join("releases")
+        .join(&asset.bundle.moon_version);
     if destination.exists() {
-        return fail(
-            "candidate_failed",
-            format!(
-                "target release directory already exists: {}",
-                destination.display()
-            ),
+        ensure!(
+            fs::symlink_metadata(&destination)?.file_type().is_dir(),
+            "retained release is not a regular directory"
         );
+        ensure!(
+            !paths_match(&destination, &context.home.join("current")),
+            "refusing to reuse the active release"
+        );
+        verify_release_files(&destination, asset).context(
+            "retained release does not match the verified candidate; preserve it for inspection",
+        )?;
+        fs::remove_dir_all(stage).context("failed to remove redundant verified staging")?;
+        return Ok(destination);
     }
     create_private_dir_all(destination.parent().expect("release parent"))?;
     fs::rename(stage, &destination).context("failed to materialize target release")?;
@@ -1775,30 +1987,30 @@ fn switch_current(
                 .file_name()
                 .context("release directory has no version name")?,
         );
-        let temporary = context.home.join(format!(".current-{transaction_id}"));
+        let attempt = format!("{transaction_id}-{:032x}", rand::random::<u128>());
+        let temporary = context.home.join(format!(".current-{attempt}"));
         symlink(&relative, &temporary)?;
         fs::rename(&temporary, context.home.join("current"))?;
 
         let bin = context.home.join("bin");
         create_private_dir_all(&bin)?;
-        let moon_temp = bin.join(format!(".moon-{transaction_id}"));
+        let moon_temp = bin.join(format!(".moon-{attempt}"));
         symlink("../current/bin/moon", &moon_temp)?;
         fs::rename(&moon_temp, bin.join("moon"))?;
+        sync_parent(&bin.join("moon"))?;
 
         let plugin = context.home.join("openclaw-plugin");
-        if !fs::symlink_metadata(&plugin).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        if fs::symlink_metadata(&plugin).is_ok_and(|metadata| !metadata.file_type().is_symlink()) {
             let retired = context
                 .home
                 .join("update/retired")
-                .join(format!("{transaction_id}-openclaw-plugin"));
+                .join(format!("{attempt}-openclaw-plugin"));
             create_private_dir_all(retired.parent().expect("retired parent"))?;
             fs::rename(&plugin, &retired).context("failed to retain prior adapter directory")?;
-            let plugin_temp = context
-                .home
-                .join(format!(".openclaw-plugin-{transaction_id}"));
-            symlink("current/openclaw-plugin", &plugin_temp)?;
-            fs::rename(&plugin_temp, &plugin)?;
         }
+        let plugin_temp = context.home.join(format!(".openclaw-plugin-{attempt}"));
+        symlink("current/openclaw-plugin", &plugin_temp)?;
+        fs::rename(&plugin_temp, &plugin)?;
         sync_parent(&context.home.join("current"))
     }
 }
@@ -1819,12 +2031,19 @@ fn install_skill(source: &Path, destination: &Path, transaction_id: &str) -> Res
 fn run_migration(context: &ApplyContext) -> Result<()> {
     let binary = context.home.join("bin/moon");
     let home = context.home.to_string_lossy().into_owned();
+    let database = context
+        .home
+        .join("state/moon.sqlite")
+        .to_string_lossy()
+        .into_owned();
     let dimensions = context.dimensions.to_string();
     run_bounded(
         &binary,
         &[
             "--home",
             &home,
+            "--database",
+            &database,
             "--dimensions",
             &dimensions,
             "--json",
@@ -1854,6 +2073,37 @@ fn verify_installed_identity(context: &ApplyContext, asset: &ReleaseAsset) -> Re
         "installed Moon identity does not match the signed manifest"
     );
     let release_root = fs::canonicalize(context.home.join("current"))?;
+    verify_release_files(&release_root, asset)
+}
+
+fn verify_release_files(release_root: &Path, asset: &ReleaseAsset) -> Result<()> {
+    let manifest = read_bounded_file(
+        &release_root.join("bundle-manifest.json"),
+        MAX_MANIFEST_BYTES as u64,
+    )?;
+    asset.verify_bundle_manifest_bytes(&manifest)?;
+    let expected = asset
+        .bundle
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .chain(std::iter::once("bundle-manifest.json"))
+        .collect::<BTreeSet<_>>();
+    for entry in walkdir::WalkDir::new(release_root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        ensure!(
+            entry.file_type().is_file(),
+            "retained release contains a non-file entry"
+        );
+        let relative = entry.path().strip_prefix(release_root)?.to_string_lossy();
+        ensure!(
+            expected.contains(relative.as_ref()),
+            "retained release contains an unexpected file"
+        );
+    }
     for file in &asset.bundle.files {
         let installed = release_root.join(&file.path);
         let bytes = read_bounded_file(&installed, MAX_ARCHIVE_BYTES)?;
@@ -1867,12 +2117,19 @@ fn verify_installed_identity(context: &ApplyContext, asset: &ReleaseAsset) -> Re
 fn run_local_canary(context: &ApplyContext) -> Result<()> {
     let binary = context.home.join("bin/moon");
     let home = context.home.to_string_lossy().into_owned();
+    let database = context
+        .home
+        .join("state/moon.sqlite")
+        .to_string_lossy()
+        .into_owned();
     let dimensions = context.dimensions.to_string();
     run_bounded(
         &binary,
         &[
             "--home",
             &home,
+            "--database",
+            &database,
             "--dimensions",
             &dimensions,
             "--json",
@@ -1900,10 +2157,20 @@ fn run_local_canary(context: &ApplyContext) -> Result<()> {
 
 fn rollback_update(
     context: &ApplyContext,
-    journal: &UpdateJournal,
+    journal: &mut UpdateJournal,
+    journal_path: &Path,
     openclaw: &dyn OpenClawControl,
 ) -> Result<()> {
-    if journal.current_switched {
+    if journal.changed && !journal.current_switched {
+        let prior = journal
+            .prior_release
+            .as_deref()
+            .context("journal has no prior release")?;
+        ensure!(
+            fs::canonicalize(context.home.join("current"))? == fs::canonicalize(prior)?,
+            "restored rollback no longer owns the current release"
+        );
+    } else if journal.current_switched {
         // The candidate gateway may already be running. Quiesce its worker
         // before changing the release or restoring SQLite and its sidecars.
         openclaw.stop()?;
@@ -1933,13 +2200,19 @@ fn rollback_update(
             &backup.join("moon.sqlite"),
             &journal.transaction_id,
         )?;
+        // Once the prior gateway starts it can accept new writes. Make later
+        // recovery availability-only before allowing that gateway to run.
+        journal.current_switched = false;
+        journal.changed = true;
+        journal.gateway_stopped = true;
+        persist_journal(journal_path, journal)?;
     }
     if journal.gateway_stopped || journal.current_switched {
         openclaw.start()?;
         openclaw.wait_ready(Duration::from_secs(60))?;
         openclaw.validate(&journal.from_version, &context.openclaw)?;
     }
-    let health = healthy_runtime(context)?;
+    let health = healthy_installed_runtime(context)?;
     ensure!(
         journal
             .schema_before
@@ -1950,23 +2223,46 @@ fn rollback_update(
 }
 
 fn restore_database(context: &ApplyContext, backup: &Path, transaction_id: &str) -> Result<()> {
-    ensure!(backup.is_file(), "rollback database is missing");
+    ensure!(
+        fs::symlink_metadata(backup)?.file_type().is_file(),
+        "rollback database is not a regular file"
+    );
     let state = context.home.join("state");
     let database = state.join("moon.sqlite");
-    let failed = state.join(format!("moon.sqlite.failed-{transaction_id}"));
-    if database.exists() {
-        fs::rename(&database, &failed).context("failed to preserve failed database")?;
+    let staged = tempfile::Builder::new()
+        .prefix(".moon-restore-")
+        .tempdir_in(&state)?;
+    let staged_database = staged.path().join("moon.sqlite");
+    let mut source = File::open(backup)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = state.join(format!("moon.sqlite{suffix}"));
-        if sidecar.exists() {
-            fs::remove_file(&sidecar)?;
+    let mut destination = options.open(&staged_database)?;
+    std::io::copy(&mut source, &mut destination).context("failed to stage rollback database")?;
+    destination.sync_all()?;
+    drop(destination);
+    // Use the restored release's reader: its schema may differ from this updater.
+    healthy_installed_database(context, &staged_database)?;
+    let preserved = state.join(format!(
+        "moon.sqlite.failed-{transaction_id}-{:032x}",
+        rand::random::<u128>()
+    ));
+    create_private_dir(&preserved)?;
+    for name in ["moon.sqlite", "moon.sqlite-wal", "moon.sqlite-shm"] {
+        let path = state.join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            fs::rename(&path, preserved.join(name))
+                .context("failed to preserve candidate database files")?;
         }
     }
-    copy_regular_file(backup, &database, 0o600)?;
-    let health = crate::Store::open_existing(&database, context.dimensions)?.health()?;
-    ensure!(health.ok, "restored rollback database is unhealthy");
-    Ok(())
+    sync_parent(&preserved.join("moon.sqlite"))?;
+    fs::rename(&staged_database, &database)
+        .context("failed to install validated rollback database")?;
+    sync_parent(&database)
 }
 
 fn ensure_queue_preserved(
@@ -2750,6 +3046,7 @@ printf '%s\n' '{"action":"stop","ok":true}'
         stop_failure_call: Option<usize>,
         validation_failures: Mutex<usize>,
         ready_failures: Mutex<usize>,
+        check_rollback_marker: Option<PathBuf>,
     }
 
     impl OpenClawControl for MockOpenClaw {
@@ -2774,7 +3071,22 @@ printf '%s\n' '{"action":"stop","ok":true}'
         }
 
         fn start(&self) -> Result<()> {
-            self.events.lock().unwrap().push("start".to_owned());
+            let mut events = self.events.lock().unwrap();
+            events.push("start".to_owned());
+            if events
+                .iter()
+                .filter(|event| event.as_str() == "start")
+                .count()
+                == 2
+                && let Some(home) = &self.check_rollback_marker
+            {
+                let path = fs::read_dir(home.join("update/journals"))?
+                    .next()
+                    .context("missing journal")??
+                    .path();
+                let journal: UpdateJournal = serde_json::from_slice(&fs::read(path)?)?;
+                assert!(journal.changed && journal.gateway_stopped && !journal.current_switched);
+            }
             Ok(())
         }
 
@@ -2830,6 +3142,25 @@ printf '%s\n' '{"action":"stop","ok":true}'
         transaction_fixture_with_failures(fail_candidate, false)
     }
 
+    fn require_explicit_database(script: &str) -> String {
+        script.replacen(
+            "#!/bin/sh\n",
+            r#"#!/bin/sh
+# Every storage subprocess must override any ambient MOON_DATABASE.
+database_arg=
+version_arg=
+previous=
+for value in "$@"; do
+  if [ "$previous" = --database ]; then database_arg=$value; fi
+  if [ "$value" = --version ]; then version_arg=1; fi
+  previous=$value
+done
+if [ -z "$version_arg" ] && [ -z "$database_arg" ]; then exit 91; fi
+"#,
+            1,
+        )
+    }
+
     fn transaction_fixture_with_failures(
         fail_candidate: bool,
         fail_migration: bool,
@@ -2842,7 +3173,23 @@ printf '%s\n' '{"action":"stop","ok":true}'
             "#!/bin/sh\nprintf '%s\\n' '{{\"ok\":true,\"name\":\"moon\",\"version\":\"2.1.0\",\"git_commit\":\"{old_commit}\",\"git_dirty\":false,\"build_target\":\"{}\",\"build_profile\":\"release\",\"executable\":\"fixture-old\",\"canonical_executable\":\"fixture-old\",\"canonical\":true,\"bundle_format\":1}}'\n",
             current_target()
         );
-        fs::write(home.join("bin/moon"), old_script).expect("old binary");
+        let old_script = old_script.replacen(
+            "#!/bin/sh\n",
+            r#"#!/bin/sh
+for value in "$@"; do
+  if [ "$value" = health ]; then
+    printf '%s\n' '{"ok":true,"schema_version":7,"failed_embeddings":0,"dead_embeddings":0}'
+    exit 0
+  fi
+done
+"#,
+            1,
+        );
+        fs::write(
+            home.join("bin/moon"),
+            require_explicit_database(&old_script),
+        )
+        .expect("old binary");
         set_mode(&home.join("bin/moon"), 0o755).expect("mode");
         for (path, bytes) in [
             ("README.md", b"old adapter".as_slice()),
@@ -2913,8 +3260,8 @@ printf '%s\n' '{"action":"stop","ok":true}'
         let script = format!(
             "#!/bin/sh\nfor value in \"$@\"; do\n  if [ \"$value\" = \"--version\" ]; then\n    printf '%s\\n' '{{\"ok\":true,\"name\":\"moon\",\"version\":\"2.2.0\",\"git_commit\":\"{commit}\",\"git_dirty\":false,\"build_target\":\"{}\",\"build_profile\":\"release\",\"executable\":\"fixture\",\"canonical_executable\":\"fixture\",\"canonical\":true,\"bundle_format\":1}}'\n    exit 0\n  fi\n{migration_failure}done\n{migration_exit}for value in \"$@\"; do\n{candidate_failure}  if [ \"$value\" = \"health\" ]; then printf '%s\\n' '{{\"ok\":true,\"schema_version\":7,\"failed_embeddings\":0,\"dead_embeddings\":0}}'; exit 0; fi\n  if [ \"$value\" = \"search\" ]; then printf '%s\\n' '[{{\"content\":\"Moon isolated update canary\"}}]'; exit 0; fi\ndone\nprintf '%s\\n' '{{\"ok\":true}}'\n",
             current_target()
-        )
-        .into_bytes();
+        );
+        let script = require_explicit_database(&script).into_bytes();
         let payload = BTreeMap::from([
             ("bin/moon".to_owned(), (0o755, script)),
             (
@@ -3426,7 +3773,10 @@ printf '%s\n' '{"action":"stop","ok":true}'
         assert_eq!(result.verified_key_ids, ["test-release-key"]);
         assert!(result.rollback_bundle.is_none());
         assert!(!fixture.context.home.join("update").exists());
-        assert!(openclaw.events.lock().unwrap().is_empty());
+        assert_eq!(
+            openclaw.events.lock().unwrap().as_slice(),
+            ["ready", "validate:2.2.0"]
+        );
     }
 
     #[test]
@@ -3503,5 +3853,392 @@ printf '%s\n' '{"action":"stop","ok":true}'
                 );
             }
         }
+    }
+
+    fn dead_interrupted_fixture() -> (TransactionFixture, PathBuf, UpdateJournal) {
+        let fixture = transaction_fixture();
+        let error = apply_update_inner(
+            &fixture.context,
+            &fixture.release,
+            &fixture.archive,
+            &MockOpenClaw::default(),
+            Some(UpdatePhase::Switched),
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), Some("injected_crash"));
+        let path = fs::read_dir(fixture.context.home.join("update/journals"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut journal: UpdateJournal = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        journal.pid = i32::MAX as u32;
+        persist_journal(&path, &journal).unwrap();
+        let lock_path = fixture.context.home.join("update/update.lock");
+        let mut lock: LockDocument =
+            serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+        lock.pid = i32::MAX as u32;
+        fs::write(lock_path, serde_json::to_vec(&lock).unwrap()).unwrap();
+        (fixture, path, journal)
+    }
+
+    #[test]
+    fn skill_failure_after_switch_restores_the_prior_pointer() {
+        let fixture = transaction_fixture();
+        fs::remove_file(&fixture.context.skill_path).unwrap();
+        fs::create_dir(&fixture.context.skill_path).unwrap();
+        let error = apply_update(
+            &fixture.context,
+            &fixture.release,
+            &fixture.archive,
+            &MockOpenClaw::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), Some("rollback_completed"));
+        assert_eq!(
+            fs::canonicalize(fixture.context.home.join("current")).unwrap(),
+            fs::canonicalize(fixture.context.home.join("releases/2.1.0")).unwrap()
+        );
+        assert!(healthy_runtime(&fixture.context).unwrap().ok);
+    }
+
+    #[test]
+    fn retry_after_rollback_reuses_only_the_verified_inactive_release() {
+        let mut fixture = transaction_fixture();
+        let openclaw = MockOpenClaw {
+            validation_failures: Mutex::new(1),
+            ..MockOpenClaw::default()
+        };
+        let error = apply_update(
+            &fixture.context,
+            &fixture.release,
+            &fixture.archive,
+            &openclaw,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), Some("rollback_completed"));
+        fixture.context.identity.executable =
+            fs::canonicalize(fixture.context.home.join("bin/moon"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+        let result = apply_update(
+            &fixture.context,
+            &fixture.release,
+            &fixture.archive,
+            &openclaw,
+        )
+        .unwrap();
+        assert!(result.ok && result.changed);
+        assert_eq!(
+            fs::canonicalize(fixture.context.home.join("current")).unwrap(),
+            fs::canonicalize(fixture.context.home.join("releases/2.2.0")).unwrap()
+        );
+
+        let bad = transaction_fixture();
+        let retained = bad.context.home.join("releases/2.2.0");
+        fs::create_dir_all(&retained).unwrap();
+        fs::write(retained.join("unverified"), "preserve this evidence").unwrap();
+        let untouched = MockOpenClaw::default();
+        assert!(apply_update(&bad.context, &bad.release, &bad.archive, &untouched).is_err());
+        assert!(untouched.events.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(retained.join("unverified")).unwrap(),
+            "preserve this evidence"
+        );
+    }
+
+    #[test]
+    fn recovery_precedes_same_version_and_unhealthy_preflight() {
+        let (mut fixture, path, _) = dead_interrupted_fixture();
+        fixture.context.identity.version = "2.2.0".to_owned();
+        fixture.context.identity.git_commit = "b".repeat(40);
+        // A partial migration may be unreadable to normal preflight.
+        fs::write(
+            fixture.context.home.join("state/moon.sqlite"),
+            "interrupted migration",
+        )
+        .unwrap();
+        let openclaw = MockOpenClaw::default();
+        let error = apply_update(
+            &fixture.context,
+            &fixture.release,
+            &fixture.archive,
+            &openclaw,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), Some("interrupted_update_recovered"));
+        let journal: UpdateJournal = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(journal.phase, UpdatePhase::RolledBack);
+        assert!(healthy_runtime(&fixture.context).unwrap().ok);
+        assert_eq!(
+            openclaw.events.lock().unwrap().as_slice(),
+            ["stop", "start", "ready", "validate:2.1.0"]
+        );
+        assert!(!has_incomplete_update(&fixture.context.home).unwrap());
+    }
+
+    #[test]
+    fn recovery_recognises_legacy_switch_intent_and_failed_rollbacks() {
+        for legacy_flag in [false, true] {
+            let (fixture, path, mut journal) = dead_interrupted_fixture();
+            if legacy_flag {
+                journal.current_switched = false;
+                journal.changed = false;
+                journal.target_release = None;
+                journal.phase = UpdatePhase::Quiesced;
+            } else {
+                journal.phase = UpdatePhase::RollbackFailed;
+            }
+            persist_journal(&path, &journal).unwrap();
+            assert!(recover_pending_update(&fixture.context, &MockOpenClaw::default()).unwrap());
+            assert_eq!(
+                fs::canonicalize(fixture.context.home.join("current")).unwrap(),
+                fs::canonicalize(fixture.context.home.join("releases/2.1.0")).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn restored_rollback_readiness_failure_preserves_new_writes_on_retry() {
+        let fixture = transaction_fixture();
+        let openclaw = MockOpenClaw {
+            ready_failures: Mutex::new(2),
+            check_rollback_marker: Some(fixture.context.home.clone()),
+            ..MockOpenClaw::default()
+        };
+        let error = apply_update(
+            &fixture.context,
+            &fixture.release,
+            &fixture.archive,
+            &openclaw,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), Some("rollback_failed"));
+        let path = fs::read_dir(fixture.context.home.join("update/journals"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut journal: UpdateJournal = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(journal.changed && journal.gateway_stopped && !journal.current_switched);
+        let mut store =
+            crate::Store::open(fixture.context.home.join("state/moon.sqlite"), 64).unwrap();
+        store
+            .remember(crate::MemoryInput {
+                memory_kind: "fact".to_owned(),
+                scope: "test".to_owned(),
+                title: None,
+                content:
+                    "A new memory accepted by the restored gateway after the readiness probe failed"
+                        .to_owned(),
+                importance: 0.5,
+                confidence: 1.0,
+                pinned: false,
+            })
+            .unwrap();
+        drop(store);
+        journal.pid = i32::MAX as u32;
+        persist_journal(&path, &journal).unwrap();
+        let lock_path = fixture.context.home.join("update/update.lock");
+        let mut lock: LockDocument =
+            serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+        lock.pid = i32::MAX as u32;
+        fs::write(lock_path, serde_json::to_vec(&lock).unwrap()).unwrap();
+        let retry = MockOpenClaw::default();
+        assert!(recover_pending_update(&fixture.context, &retry).unwrap());
+        assert_eq!(
+            healthy_runtime(&fixture.context).unwrap().active_memories,
+            2
+        );
+        assert_eq!(
+            retry.events.lock().unwrap().as_slice(),
+            ["start", "ready", "validate:2.1.0"]
+        );
+        let completed: UpdateJournal = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(completed.phase, UpdatePhase::RolledBack);
+        assert!(!completed.current_switched);
+    }
+
+    #[test]
+    fn legacy_rollback_already_on_prior_release_requires_manual_inspection() {
+        let (fixture, path, mut journal) = dead_interrupted_fixture();
+        switch_current(
+            &fixture.context,
+            journal.prior_release.as_deref().unwrap(),
+            "legacy-restored",
+        )
+        .unwrap();
+        journal.phase = UpdatePhase::RollbackFailed;
+        persist_journal(&path, &journal).unwrap();
+        let before = fs::read(fixture.context.home.join("state/moon.sqlite")).unwrap();
+        let openclaw = MockOpenClaw::default();
+        let error = recover_pending_update(&fixture.context, &openclaw).unwrap_err();
+        assert_eq!(error_code(&error), Some("recovery_ambiguous"));
+        assert!(openclaw.events.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(fixture.context.home.join("state/moon.sqlite")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_superseded_journals_and_refuses_equal_timestamp_ambiguity() {
+        let (fixture, path, mut old) = dead_interrupted_fixture();
+        old.phase = UpdatePhase::RollbackFailed;
+        old.started_at = "2026-09-01T00:00:00Z".to_owned();
+        persist_journal(&path, &old).unwrap();
+        let mut committed = old.clone();
+        committed.transaction_id = "newer-completed".to_owned();
+        committed.phase = UpdatePhase::Committed;
+        committed.gateway_stopped = false;
+        committed.started_at = "2026-09-01T00:00:01Z".to_owned();
+        let committed_path = path.parent().unwrap().join("newer-completed.json");
+        persist_journal(&committed_path, &committed).unwrap();
+        let before = fs::read(fixture.context.home.join("state/moon.sqlite")).unwrap();
+        let openclaw = MockOpenClaw::default();
+        assert!(!recover_pending_update(&fixture.context, &openclaw).unwrap());
+        assert!(openclaw.events.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(fixture.context.home.join("state/moon.sqlite")).unwrap(),
+            before
+        );
+        let preserved: UpdateJournal = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(preserved.phase, UpdatePhase::RollbackFailed);
+        old.started_at = committed.started_at;
+        persist_journal(&path, &old).unwrap();
+        let error = recover_pending_update(&fixture.context, &openclaw).unwrap_err();
+        assert_eq!(error_code(&error), Some("recovery_ambiguous"));
+        assert!(openclaw.events.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(fixture.context.home.join("state/moon.sqlite")).unwrap(),
+            before
+        );
+        fs::remove_file(committed_path).unwrap();
+        let mut competing = old.clone();
+        competing.transaction_id = "competing-incomplete".to_owned();
+        competing.started_at = "2026-09-01T00:00:02Z".to_owned();
+        persist_journal(
+            &path.parent().unwrap().join("competing-incomplete.json"),
+            &competing,
+        )
+        .unwrap();
+        let error = recover_pending_update(&fixture.context, &openclaw).unwrap_err();
+        assert_eq!(error_code(&error), Some("recovery_ambiguous"));
+        assert!(openclaw.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rollback_snapshot_includes_writes_accepted_before_stop() {
+        struct WriteBeforeStop {
+            home: PathBuf,
+            calls: Mutex<usize>,
+            inner: MockOpenClaw,
+        }
+        impl OpenClawControl for WriteBeforeStop {
+            fn version(&self) -> Result<String> {
+                self.inner.version()
+            }
+            fn stop(&self) -> Result<()> {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    let mut store = crate::Store::open(self.home.join("state/moon.sqlite"), 64)?;
+                    store.remember(crate::MemoryInput {
+                        memory_kind: "fact".to_owned(),
+                        scope: "test".to_owned(),
+                        title: Some("before shutdown".to_owned()),
+                        content: "A memory committed immediately before shutdown".to_owned(),
+                        importance: 0.5,
+                        confidence: 1.0,
+                        pinned: false,
+                    })?;
+                    assert_eq!(store.health()?.active_memories, 2);
+                }
+                self.inner.stop()
+            }
+            fn start(&self) -> Result<()> {
+                self.inner.start()
+            }
+            fn validate(&self, v: &str, s: &MoonIntegrationSnapshot) -> Result<()> {
+                self.inner.validate(v, s)
+            }
+            fn wait_ready(&self, t: Duration) -> Result<()> {
+                self.inner.wait_ready(t)
+            }
+        }
+        let fixture = transaction_fixture();
+        let openclaw = WriteBeforeStop {
+            home: fixture.context.home.clone(),
+            calls: Mutex::new(0),
+            inner: MockOpenClaw {
+                validation_failures: Mutex::new(1),
+                ..MockOpenClaw::default()
+            },
+        };
+        let error = apply_update(
+            &fixture.context,
+            &fixture.release,
+            &fixture.archive,
+            &openclaw,
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&error), Some("rollback_completed"));
+        assert_eq!(
+            healthy_runtime(&fixture.context).unwrap().active_memories,
+            2
+        );
+    }
+
+    #[test]
+    fn database_restoration_is_staged_and_not_limited_by_release_archive_size() {
+        let fixture = transaction_fixture();
+        let database = fixture.context.home.join("state/moon.sqlite");
+        let backup = fixture._root.path().join("large-backup.sqlite");
+        crate::Store::open_existing(&database, 64)
+            .unwrap()
+            .backup_to(&backup)
+            .unwrap();
+        let file = OpenOptions::new().write(true).open(&backup).unwrap();
+        file.set_len(MAX_ARCHIVE_BYTES + 4096).unwrap();
+        drop(file);
+        assert!(
+            crate::Store::open_existing(&backup, 64)
+                .unwrap()
+                .health()
+                .unwrap()
+                .ok
+        );
+        restore_database(&fixture.context, &backup, "large").unwrap();
+        assert!(fs::metadata(&database).unwrap().len() > MAX_ARCHIVE_BYTES);
+        assert!(healthy_runtime(&fixture.context).unwrap().ok);
+
+        let rejected = transaction_fixture();
+        let database = rejected.context.home.join("state/moon.sqlite");
+        let backup = rejected._root.path().join("rejected.sqlite");
+        crate::Store::open_existing(&database, 64)
+            .unwrap()
+            .backup_to(&backup)
+            .unwrap();
+        let original = fs::read(&database).unwrap();
+        fs::write(
+            rejected.context.home.join("bin/moon"),
+            "#!/bin/sh\nexit 9\n",
+        )
+        .unwrap();
+        let error = restore_database(&rejected.context, &backup, "rejected").unwrap_err();
+        assert!(error.to_string().contains("health check failed"));
+        assert_eq!(fs::read(&database).unwrap(), original);
+        assert!(
+            fs::read_dir(database.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("failed-rejected"))
+        );
     }
 }

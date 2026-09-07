@@ -139,218 +139,27 @@ impl Store {
     }
 
     pub fn distill_memory(&mut self, input: DistillInput) -> Result<DistillOutcome> {
-        validate_canonical_key(&input.canonical_key)?;
-        validate_identifier("memory_kind", &input.memory_kind, 128)?;
-        validate_identifier("scope", &input.scope, 2_048)?;
-        validate_unit_interval("importance", input.importance)?;
-        validate_unit_interval("confidence", input.confidence)?;
-        if input.content.trim().is_empty() {
-            anyhow::bail!("memory content must not be empty");
-        }
-        if input.evidence_quote.trim().chars().count() < 8 {
-            anyhow::bail!("evidence_quote must contain at least 8 characters");
-        }
-        if input.evidence_quote.len() > MAX_EVIDENCE_QUOTE_BYTES {
-            anyhow::bail!(
-                "evidence_quote exceeds the maximum size of {MAX_EVIDENCE_QUOTE_BYTES} bytes"
-            );
-        }
-
-        let redacted_content = redact_text(&input.content);
-        let redacted_quote = redact_text(&input.evidence_quote);
-        let redacted_title = input.title.as_deref().map(redact_text);
-        let redactions = redacted_content.count
-            + redacted_quote.count
-            + redacted_title.as_ref().map_or(0, |redacted| redacted.count);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let evidence = load_evidence(&transaction, &input.evidence_session_id)?;
-        let citation = locate_citation(&evidence.body, redacted_quote.value.trim())?;
-        let content_hash = sha256_hex(&redacted_content.value);
-
-        let head = transaction
-            .query_row(
-                "SELECT h.document_id, d.content_hash
-                 FROM memory_heads h
-                 JOIN documents d ON d.id = h.document_id
-                 JOIN memory_items m ON m.document_id = h.document_id
-                 WHERE h.canonical_key = ?1
-                   AND d.active = 1
-                   AND m.superseded_by IS NULL",
-                [&input.canonical_key],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-
-        if let Some((document_id, existing_hash)) = head.as_ref()
-            && existing_hash == &content_hash
-        {
-            if input.supersedes.is_some() {
-                anyhow::bail!(
-                    "memory `{}` already has this content; omit supersedes to confirm it",
-                    input.canonical_key
-                );
-            }
-            transaction.execute(
-                "UPDATE memory_items
-                 SET importance = max(importance, ?2),
-                     confidence = max(confidence, ?3),
-                     pinned = max(pinned, ?4),
-                     last_confirmed_at_ms = ?5
-                 WHERE document_id = ?1",
-                params![
-                    document_id,
-                    input.importance,
-                    input.confidence,
-                    input.pinned,
-                    now_ms(),
-                ],
-            )?;
-            insert_citation(
-                &transaction,
-                *document_id,
-                &evidence,
-                &citation,
-                redacted_quote.value.trim(),
-            )?;
-            let evidence_count = citation_count(&transaction, *document_id)?;
-            transaction.commit()?;
-            return Ok(DistillOutcome {
-                document_id: *document_id,
-                canonical_key: input.canonical_key,
-                action: DistillAction::Confirmed,
-                superseded_document_id: None,
-                evidence_count,
-                redactions,
-            });
-        }
-
-        let superseded_document_id = match head {
-            Some((document_id, _)) => {
-                if input.supersedes != Some(document_id) {
-                    anyhow::bail!(
-                        "memory `{}` already has different active content in document {document_id}; pass --supersedes {document_id} after review",
-                        input.canonical_key
-                    );
-                }
-                Some(document_id)
-            }
-            None => {
-                if input.supersedes.is_some() {
-                    anyhow::bail!(
-                        "memory `{}` has no active head to supersede",
-                        input.canonical_key
-                    );
-                }
-                None
-            }
-        };
-
-        let key_hash = sha256_hex(&input.canonical_key);
-        let nonce = random_nonce(&transaction)?;
-        let prepared = prepare_ingest(IngestDocument {
-            source_uri: format!("memory://canonical/{}/revision/{}", &key_hash[..20], nonce),
-            source_kind: "memory".to_string(),
-            scope: input.scope,
-            title: redacted_title.map(|redacted| redacted.value),
-            content: redacted_content.value,
-            modified_at_ms: now_ms(),
-            metadata_json: serde_json::json!({
-                "canonical_key": input.canonical_key,
-                "evidence_session_id": input.evidence_session_id,
-            })
-            .to_string(),
-        })?;
-        let outcome = ingest_prepared(&transaction, prepared)?;
-        transaction.execute(
-            "INSERT INTO memory_items(
-                 document_id, memory_kind, importance, confidence, valid_from_ms, pinned,
-                 canonical_key, last_confirmed_at_ms
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL, ?5)",
-            params![
-                outcome.document_id,
-                input.memory_kind,
-                input.importance,
-                input.confidence,
-                now_ms(),
-                input.pinned,
-            ],
-        )?;
-        if let Some(previous_document_id) = superseded_document_id {
-            let updated = transaction.execute(
-                "UPDATE memory_items
-                 SET superseded_by = ?2, valid_until_ms = ?3
-                 WHERE document_id = ?1 AND superseded_by IS NULL",
-                params![previous_document_id, outcome.document_id, now_ms()],
-            )?;
-            if updated != 1 {
-                anyhow::bail!(
-                    "active memory changed during supersession; retry after reviewing the current head"
-                );
-            }
-            transaction.execute(
-                "DELETE FROM chunk_fts
-                 WHERE rowid IN (
-                     SELECT id FROM chunks WHERE document_id = ?1
-                 )",
-                [previous_document_id],
-            )?;
-            transaction.execute(
-                "DELETE FROM chunk_vectors
-                 WHERE rowid IN (
-                     SELECT id FROM chunks WHERE document_id = ?1
-                 )",
-                [previous_document_id],
-            )?;
-            transaction.execute(
-                "DELETE FROM embedding_queue
-                 WHERE chunk_id IN (
-                     SELECT id FROM chunks WHERE document_id = ?1
-                 )",
-                [previous_document_id],
-            )?;
-            transaction.execute(
-                "UPDATE chunks
-                 SET embedding_model = NULL, embedded_at_ms = NULL
-                 WHERE document_id = ?1",
-                [previous_document_id],
-            )?;
-        }
-        transaction.execute(
-            "UPDATE memory_items SET canonical_key = ?2 WHERE document_id = ?1",
-            params![outcome.document_id, input.canonical_key],
-        )?;
-        transaction.execute(
-            "INSERT INTO memory_heads(canonical_key, document_id, updated_at_ms)
-             VALUES(?1, ?2, ?3)
-             ON CONFLICT(canonical_key) DO UPDATE SET
-                 document_id = excluded.document_id,
-                 updated_at_ms = excluded.updated_at_ms",
-            params![input.canonical_key, outcome.document_id, now_ms()],
-        )?;
-        insert_citation(
-            &transaction,
-            outcome.document_id,
-            &evidence,
-            &citation,
-            redacted_quote.value.trim(),
-        )?;
-        let evidence_count = citation_count(&transaction, outcome.document_id)?;
+        let outcome = distill_in_transaction(&transaction, input)?;
         transaction.commit()?;
+        Ok(outcome)
+    }
 
-        Ok(DistillOutcome {
-            document_id: outcome.document_id,
-            canonical_key: input.canonical_key,
-            action: if superseded_document_id.is_some() {
-                DistillAction::Superseded
-            } else {
-                DistillAction::Created
-            },
-            superseded_document_id,
-            evidence_count,
-            redactions,
-        })
+    pub fn distill_batch(&mut self, inputs: Vec<DistillInput>) -> Result<Vec<DistillOutcome>> {
+        if inputs.len() > 32 {
+            anyhow::bail!("distillation batch may contain at most 32 proposals");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let outcomes = inputs
+            .into_iter()
+            .map(|input| distill_in_transaction(&transaction, input))
+            .collect::<Result<Vec<_>>>()?;
+        transaction.commit()?;
+        Ok(outcomes)
     }
 
     pub fn assemble_context(
@@ -680,6 +489,219 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
+}
+
+fn distill_in_transaction(
+    transaction: &Transaction<'_>,
+    input: DistillInput,
+) -> Result<DistillOutcome> {
+    validate_canonical_key(&input.canonical_key)?;
+    validate_identifier("memory_kind", &input.memory_kind, 128)?;
+    validate_identifier("scope", &input.scope, 2_048)?;
+    validate_unit_interval("importance", input.importance)?;
+    validate_unit_interval("confidence", input.confidence)?;
+    if input.content.trim().is_empty() {
+        anyhow::bail!("memory content must not be empty");
+    }
+    if input.evidence_quote.trim().chars().count() < 8 {
+        anyhow::bail!("evidence_quote must contain at least 8 characters");
+    }
+    if input.evidence_quote.len() > MAX_EVIDENCE_QUOTE_BYTES {
+        anyhow::bail!(
+            "evidence_quote exceeds the maximum size of {MAX_EVIDENCE_QUOTE_BYTES} bytes"
+        );
+    }
+
+    let redacted_content = redact_text(&input.content);
+    let redacted_quote = redact_text(&input.evidence_quote);
+    let redacted_title = input.title.as_deref().map(redact_text);
+    let redactions = redacted_content.count
+        + redacted_quote.count
+        + redacted_title.as_ref().map_or(0, |redacted| redacted.count);
+    let evidence = load_evidence(transaction, &input.evidence_session_id)?;
+    let citation = locate_citation(&evidence.body, redacted_quote.value.trim())?;
+    let content_hash = sha256_hex(&redacted_content.value);
+
+    let head = transaction
+        .query_row(
+            "SELECT h.document_id, d.content_hash
+             FROM memory_heads h
+             JOIN documents d ON d.id = h.document_id
+             JOIN memory_items m ON m.document_id = h.document_id
+             WHERE h.canonical_key = ?1
+               AND d.active = 1
+               AND m.superseded_by IS NULL",
+            [&input.canonical_key],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+
+    if let Some((document_id, existing_hash)) = head.as_ref()
+        && existing_hash == &content_hash
+    {
+        if input.supersedes.is_some() {
+            anyhow::bail!(
+                "memory `{}` already has this content; omit supersedes to confirm it",
+                input.canonical_key
+            );
+        }
+        transaction.execute(
+            "UPDATE memory_items
+             SET importance = max(importance, ?2),
+                 confidence = max(confidence, ?3),
+                 pinned = max(pinned, ?4),
+                 last_confirmed_at_ms = ?5
+             WHERE document_id = ?1",
+            params![
+                document_id,
+                input.importance,
+                input.confidence,
+                input.pinned,
+                now_ms(),
+            ],
+        )?;
+        insert_citation(
+            transaction,
+            *document_id,
+            &evidence,
+            &citation,
+            redacted_quote.value.trim(),
+        )?;
+        let evidence_count = citation_count(transaction, *document_id)?;
+        return Ok(DistillOutcome {
+            document_id: *document_id,
+            canonical_key: input.canonical_key,
+            action: DistillAction::Confirmed,
+            superseded_document_id: None,
+            evidence_count,
+            redactions,
+        });
+    }
+
+    let superseded_document_id = match head {
+        Some((document_id, _)) => {
+            if input.supersedes != Some(document_id) {
+                anyhow::bail!(
+                    "memory `{}` already has different active content in document {document_id}; pass --supersedes {document_id} after review",
+                    input.canonical_key
+                );
+            }
+            Some(document_id)
+        }
+        None => {
+            if input.supersedes.is_some() {
+                anyhow::bail!(
+                    "memory `{}` has no active head to supersede",
+                    input.canonical_key
+                );
+            }
+            None
+        }
+    };
+
+    let key_hash = sha256_hex(&input.canonical_key);
+    let nonce = random_nonce(transaction)?;
+    let prepared = prepare_ingest(IngestDocument {
+        source_uri: format!("memory://canonical/{}/revision/{}", &key_hash[..20], nonce),
+        source_kind: "memory".to_string(),
+        scope: input.scope,
+        title: redacted_title.map(|redacted| redacted.value),
+        content: redacted_content.value,
+        modified_at_ms: now_ms(),
+        metadata_json: serde_json::json!({
+            "canonical_key": input.canonical_key,
+            "evidence_session_id": input.evidence_session_id,
+        })
+        .to_string(),
+    })?;
+    let outcome = ingest_prepared(transaction, prepared)?;
+    transaction.execute(
+        "INSERT INTO memory_items(
+             document_id, memory_kind, importance, confidence, valid_from_ms, pinned,
+             canonical_key, last_confirmed_at_ms
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, NULL, ?5)",
+        params![
+            outcome.document_id,
+            input.memory_kind,
+            input.importance,
+            input.confidence,
+            now_ms(),
+            input.pinned,
+        ],
+    )?;
+    if let Some(previous_document_id) = superseded_document_id {
+        let updated = transaction.execute(
+            "UPDATE memory_items
+             SET superseded_by = ?2, valid_until_ms = ?3
+             WHERE document_id = ?1 AND superseded_by IS NULL",
+            params![previous_document_id, outcome.document_id, now_ms()],
+        )?;
+        if updated != 1 {
+            anyhow::bail!(
+                "active memory changed during supersession; retry after reviewing the current head"
+            );
+        }
+        transaction.execute(
+            "DELETE FROM chunk_fts
+             WHERE rowid IN (
+                 SELECT id FROM chunks WHERE document_id = ?1
+             )",
+            [previous_document_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM chunk_vectors
+             WHERE rowid IN (
+                 SELECT id FROM chunks WHERE document_id = ?1
+             )",
+            [previous_document_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM embedding_queue
+             WHERE chunk_id IN (
+                 SELECT id FROM chunks WHERE document_id = ?1
+             )",
+            [previous_document_id],
+        )?;
+        transaction.execute(
+            "UPDATE chunks
+             SET embedding_model = NULL, embedded_at_ms = NULL
+             WHERE document_id = ?1",
+            [previous_document_id],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE memory_items SET canonical_key = ?2 WHERE document_id = ?1",
+        params![outcome.document_id, input.canonical_key],
+    )?;
+    transaction.execute(
+        "INSERT INTO memory_heads(canonical_key, document_id, updated_at_ms)
+         VALUES(?1, ?2, ?3)
+         ON CONFLICT(canonical_key) DO UPDATE SET
+             document_id = excluded.document_id,
+             updated_at_ms = excluded.updated_at_ms",
+        params![input.canonical_key, outcome.document_id, now_ms()],
+    )?;
+    insert_citation(
+        transaction,
+        outcome.document_id,
+        &evidence,
+        &citation,
+        redacted_quote.value.trim(),
+    )?;
+    let evidence_count = citation_count(transaction, outcome.document_id)?;
+
+    Ok(DistillOutcome {
+        document_id: outcome.document_id,
+        canonical_key: input.canonical_key,
+        action: if superseded_document_id.is_some() {
+            DistillAction::Superseded
+        } else {
+            DistillAction::Created
+        },
+        superseded_document_id,
+        evidence_count,
+        redactions,
+    })
 }
 
 fn is_relevant_context_hit(query: &str, content: &str) -> bool {

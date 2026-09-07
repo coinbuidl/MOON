@@ -36,6 +36,63 @@ fn invalid_update_mode_is_rejected_before_network_or_storage() {
     assert!(!missing_home.exists());
 }
 
+#[test]
+fn pending_recovery_is_reported_before_network_preflight_and_requires_consent() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("incomplete-runtime");
+    let journals = home.join("update/journals");
+    std::fs::create_dir_all(&journals).unwrap();
+    let journal = moon::update::UpdateJournal {
+        schema_version: moon::update::UPDATE_SCHEMA,
+        transaction_id: "interrupted-fixture".into(),
+        pid: std::process::id(),
+        started_at: "2026-09-07T00:00:00Z".into(),
+        from_version: "2.5.2".into(),
+        to_version: "2.5.3".into(),
+        target: "fixture".into(),
+        manifest_sha256: "0".repeat(64),
+        verified_key_ids: vec![],
+        phase: moon::update::UpdatePhase::Switched,
+        changed: true,
+        gateway_stopped: true,
+        current_switched: true,
+        schema_before: Some(7),
+        schema_after: None,
+        prior_release: None,
+        target_release: None,
+        backup_path: None,
+        error_code: None,
+    };
+    let path = journals.join("interrupted.json");
+    let before = serde_json::to_vec(&journal).unwrap();
+    std::fs::write(&path, &before).unwrap();
+    for mode in [Some("--check"), Some("--dry-run"), None] {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("moon"));
+        command
+            .env_remove("MOON_DATABASE")
+            .env_remove("MOON_EMBEDDING_DIMENSIONS")
+            .arg("--home")
+            .arg(&home)
+            .args(["--json", "update"]);
+        if let Some(mode) = mode {
+            command
+                .arg(mode)
+                .assert()
+                .success()
+                .stdout(predicate::str::contains(r#""recovery_required":true"#))
+                .stdout(predicate::str::contains(r#""changed":false"#));
+        } else {
+            command
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("authorization_required"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!home.join("state").exists());
+        assert!(!home.join("update/update.lock").exists());
+    }
+}
+
 #[cfg(unix)]
 mod recovery_helper {
     use super::*;

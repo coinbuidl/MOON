@@ -28,7 +28,8 @@ Use this process for tagged public releases (for example `v2.2.0`).
      below
    - `deno fmt --check assets/openclaw-plugin tools docs README.md RELEASE.md SKILL.md CHANGELOG.md`
    - `deno lint assets/openclaw-plugin tools`
-   - `deno test --node-modules-dir=none --allow-read --allow-write --allow-env --allow-run assets/openclaw-plugin/index.test.ts`
+   - `sh tools/test-openclaw-adapter.sh "$PWD/target/release/moon"` (requires
+     both real-binary integration tests in a temporary synthetic runtime)
    - an isolated migration and real-binary adapter canary
    - a consistent live backup plus `moon --json health`
 

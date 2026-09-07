@@ -104,22 +104,27 @@ both an exact signed version and `--allow-downgrade`.
 
 The transaction performs these durable phases:
 
-1. Acquire an owner-only PID/transaction lock and recover any proven-dead prior
-   journal.
+1. Check for interrupted transactions before fetching a release or checking
+   runtime health. With approval, acquire the owner-only lock and recover a
+   proven-dead prior transaction. Recovery returns `retry_required: true`; run
+   the canonical command again so the restored binary handles the next update.
 2. Repeat read-only health, lease, platform, schema, OpenClaw, and disk-space
    preflight.
 3. Extract only the declared regular files into owner-only staging. Reject
    traversal, symlinks, special files, duplicates, unexpected paths, size
    excess, mode mismatch, or any hash mismatch.
-4. Run the staged binary against a new temporary home, including identity,
-   initialization, health, write, and lexical-recall canaries.
-5. Create and verify an owner-only rollback bundle containing a consistent
+4. Run the staged binary against an explicit temporary home and database,
+   including identity, initialization, health, write, and lexical-recall
+   canaries. An inherited `MOON_DATABASE` cannot redirect these checks. Verify
+   any inactive retained target before reusing it, or materialize the verified
+   release. Reject conflicting files before shutdown.
+5. Record restart intent, stop OpenClaw, confirm its Moon worker has exited,
+   then create and verify an owner-only rollback bundle containing a consistent
    SQLite backup, canonical memory export, current compatibility files and
    hashes, health, signed release inputs, plan, and only schema-selected
    non-secret Moon integration settings.
-6. Stop OpenClaw, confirm the Moon worker has exited, materialize the immutable
-   release directory, atomically switch `current`, install the skill, and run
-   numbered transactional migrations. Moon 2.5.1 forwards the approved restart
+6. Persist switch intent, atomically switch `current`, install the skill, and
+   run numbered transactional migrations. Moon forwards the approved restart
    plan as `gateway stop --force --json`, including when OpenClaw runs without
    interactive standard input.
 7. Verify installed identities and hashes, database/queue health, OpenClaw
@@ -138,11 +143,24 @@ cannot itself be proven, it returns `rollback_failed`, preserves the lock,
 journal, failed database, releases, and backup, and must not be reported as a
 safe failure.
 
+`moon update --check` and `moon update --dry-run` report
+`recovery_required: true` without changing an interrupted installation. Run
+`moon update` interactively, or `moon --json update --yes`, to authorise
+recovery. An already selected target version does not bypass recovery. Database
+restoration stages and validates the replacement before moving the active
+database, and is not subject to the release archive's 512 MiB limit.
+
 Moon records restart intent before requesting a stop, so a failed worker check
 after service shutdown still restores gateway availability. If the candidate
 gateway has already started, rollback stops it and waits for the Moon worker
 before restoring the old release or database. Failed rollback quiescence leaves
 the candidate files and database in place for recovery.
+
+After restoring the prior database, Moon records that completion before
+restarting the gateway. If the final readiness check fails, a later recovery
+retries availability and validation without overwriting newer memories. Older
+failed rollback journals without enough evidence stop with `recovery_ambiguous`;
+preserve their files for inspection instead of deleting the journal to retry.
 
 ## Recover an older updater on OpenClaw 2026.9.2
 
