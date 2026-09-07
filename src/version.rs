@@ -70,7 +70,7 @@ fn normalized_current_executable() -> Result<PathBuf> {
 fn canonical_executable(explicit_home: Option<&Path>) -> Result<PathBuf> {
     let home = explicit_home
         .map(Path::to_path_buf)
-        .or_else(dirs::home_dir)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".moon")))
         .context("home directory could not be resolved")?;
     Ok(home
         .join("bin")
@@ -89,8 +89,19 @@ fn same_file(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::same_file;
+    use super::{canonical_executable, same_file};
     use std::fs;
+
+    #[test]
+    fn default_canonical_executable_uses_the_moon_runtime_root() {
+        assert_eq!(
+            canonical_executable(None).unwrap(),
+            dirs::home_dir()
+                .unwrap()
+                .join(".moon/bin")
+                .join(format!("moon{}", std::env::consts::EXE_SUFFIX))
+        );
+    }
 
     #[test]
     fn missing_paths_are_never_the_same_file() {

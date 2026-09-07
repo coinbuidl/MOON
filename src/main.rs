@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use moon::redaction::redact_text;
 use moon::{
     ContextRequest, DistillInput, EmbeddingProvider, EvidenceInput, HashEmbedding, IngestDocument,
@@ -409,7 +409,7 @@ fn main() {
         Err(error) => {
             use clap::error::ErrorKind;
             if error.kind() == ErrorKind::DisplayVersion && wants_json {
-                match moon::version::VersionInfo::current() {
+                match json_version_info() {
                     Ok(version) => println!(
                         "{}",
                         serde_json::to_string(&version).expect("version identity is serializable")
@@ -474,6 +474,24 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+fn json_version_info() -> Result<moon::version::VersionInfo> {
+    // DisplayVersion stops parsing early; reparse it as a flag to resolve home
+    // with normal CLI/environment precedence, including arguments after it.
+    let matches = Cli::command()
+        .disable_version_flag(true)
+        .arg(
+            clap::Arg::new("version")
+                .long("version")
+                .short('V')
+                .action(clap::ArgAction::SetTrue),
+        )
+        .subcommand_required(false)
+        .arg_required_else_help(false)
+        .try_get_matches()?;
+    let home = resolve_home(matches.get_one::<PathBuf>("home").map(PathBuf::as_path))?;
+    moon::version::VersionInfo::current_for_home(&home)
 }
 
 fn run(cli: Cli) -> Result<()> {

@@ -110,7 +110,7 @@ jobs:
           test "${#archives[@]}" = 1
           install -d -m 700 "${RUNNER_TEMP}/moon-adapter-candidate"
           tar -xzf "${archives[0]}" -C "${RUNNER_TEMP}/moon-adapter-candidate"
-          sh tools/test-openclaw-adapter.sh "${RUNNER_TEMP}/moon-adapter-candidate/bin/moon"
+          sh tools/test-openclaw-adapter.sh "${RUNNER_TEMP}/moon-adapter-candidate/moon-release/bin/moon"
 
   security:
     runs-on: ubuntu-latest

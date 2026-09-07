@@ -14,6 +14,8 @@
   preserving the candidate database and sidecars for inspection.
 - Pin updater and adapter storage commands to explicit database paths so ambient
   environment overrides cannot redirect isolated checks or configured runtimes.
+- Report the correct default `~/.moon/bin/moon` canonical path in JSON version
+  diagnostics, and honour explicit `--home` paths ahead of `MOON_HOME`.
 - Scrub quoted credential fields and escaped values in embedded JSON and config
   text. Historical evidence remains immutable and is not rewritten.
 - Commit learning batches atomically, including confirmations, supersessions,

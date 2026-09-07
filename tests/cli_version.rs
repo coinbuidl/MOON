@@ -77,6 +77,64 @@ fn json_version_reports_build_and_executable_provenance_offline() {
 }
 
 #[test]
+fn json_version_without_home_override_uses_the_default_moon_runtime() {
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("moon"))
+        .env_remove("MOON_HOME")
+        .env_remove("MOON_DATABASE")
+        .env_remove("MOON_EMBEDDING_DIMENSIONS")
+        .args(["--json", "--version"])
+        .output()
+        .expect("run default version");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).expect("version JSON");
+    assert_eq!(
+        value["canonical_executable"],
+        dirs::home_dir()
+            .unwrap()
+            .join(".moon/bin/moon")
+            .to_string_lossy()
+            .as_ref()
+    );
+}
+
+#[test]
+fn json_version_explicit_home_overrides_environment_in_both_forms_and_orders() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let environment_home = temp.path().join("unused environment home");
+    let explicit_home = temp.path().join("missing explicit home");
+    let explicit_text = explicit_home.to_str().unwrap();
+    let equals_form = format!("--home={explicit_text}");
+    for args in [
+        vec!["--home", explicit_text, "--json", "--version"],
+        vec![equals_form.as_str(), "--version", "--json"],
+        vec!["--json", "--version", "--home", explicit_text],
+        vec!["--version", "--json", equals_form.as_str()],
+    ] {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("moon"))
+            .env("MOON_HOME", &environment_home)
+            .env_remove("MOON_DATABASE")
+            .env_remove("MOON_EMBEDDING_DIMENSIONS")
+            .args(args)
+            .output()
+            .expect("run explicit-home version");
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).expect("version JSON");
+        assert_eq!(
+            value["canonical_executable"],
+            explicit_home.join("bin/moon").to_string_lossy().as_ref()
+        );
+        assert_eq!(value["canonical"], false);
+    }
+    assert!(!explicit_home.exists(), "version must not create a runtime");
+    assert!(
+        !environment_home.exists(),
+        "version must not create a runtime"
+    );
+}
+
+#[test]
 fn json_version_recognizes_the_canonical_executable_by_file_identity() {
     let temp = tempfile::tempdir().expect("tempdir");
     let moon_home = temp.path().join("moon-home");
